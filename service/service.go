@@ -6,7 +6,6 @@ import (
 	"fs/models"
 	"fs/storage"
 	"io"
-	"strings"
 	"time"
 )
 
@@ -18,10 +17,7 @@ func NewObjectService(metadataHandler *metadata.MetadataHandler) *ObjectService 
 	return &ObjectService{metadataHandler: metadataHandler}
 }
 
-func (s *ObjectService) PutObject(uri string, contentType string, input io.Reader) (*models.ObjectManifest, error) {
-
-	bucket := strings.Split(uri, "/")[0]
-	key := strings.Join(strings.Split(uri, "/")[1:], "/")
+func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
 
 	chunks, size, etag, err := storage.IngestStream(input)
 	if err != nil {
@@ -54,7 +50,12 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	pr, pw := io.Pipe()
 
 	go func() {
-		defer pw.Close()
+		defer func(pw *io.PipeWriter) {
+			err := pw.Close()
+			if err != nil {
+
+			}
+		}(pw)
 
 		err := storage.AssembleStream(manifest.Chunks, pw)
 		if err != nil {

@@ -44,7 +44,7 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 func (h *MetadataHandler) GetManifest(bucket, key string) (*models.ObjectManifest, error) {
 	var manifest *models.ObjectManifest
 
-	h.db.View(func(tx *bbolt.Tx) error {
+	err := h.db.View(func(tx *bbolt.Tx) error {
 		metadataBucket := tx.Bucket([]byte(ManifestBucketName))
 		if metadataBucket == nil {
 			return fmt.Errorf("bucket %s not found", ManifestBucketName)
@@ -61,6 +61,9 @@ func (h *MetadataHandler) GetManifest(bucket, key string) (*models.ObjectManifes
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	return manifest, nil
 }

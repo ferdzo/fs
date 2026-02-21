@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,7 +22,7 @@ func IngestStream(stream io.Reader) ([]string, int64, string, error) {
 
 	for {
 		bytesRead, err := io.ReadFull(stream, buffer)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		if err != nil && err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, 0, "", err
 		}
 
@@ -40,7 +41,7 @@ func IngestStream(stream io.Reader) ([]string, int64, string, error) {
 			}
 			chunkIDs = append(chunkIDs, chunkID)
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
 			break
 		}
 		if err != nil {
@@ -48,7 +49,7 @@ func IngestStream(stream io.Reader) ([]string, int64, string, error) {
 		}
 
 	}
-	
+
 	etag := hex.EncodeToString(fullFileHasher.Sum(nil))
 	return chunkIDs, totalSize, etag, nil
 }
