@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"fs/models"
 	"regexp"
+	"strings"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -209,6 +210,9 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 			return fmt.Errorf("bucket %s not found", bucket)
 		}
 		err := _bucket.ForEach(func(k, v []byte) error {
+			if prefix != "" && !strings.HasPrefix(string(k), prefix) {
+				return nil
+			}
 			object := models.ObjectManifest{}
 			err := json.Unmarshal(v, &object)
 			if err != nil {

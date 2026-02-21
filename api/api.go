@@ -160,8 +160,7 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-yaml")
-	w.Header().Set("Content-Length", "0")
+	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
 	for _, bucket := range buckets {
 		w.Write([]byte(bucket))
@@ -172,18 +171,19 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 
 	if r.URL.Query().Get("list-type") == "2" {
-		h.handleListObjectsV2(w, r, bucket)
+		prefix := r.URL.Query().Get("prefix")
+		if prefix == "" {
+			prefix = ""
+		}
+		h.handleListObjectsV2(w, r, bucket, prefix)
 		return
 	}
-
-	if r.URL.Query().Has("location") {
-		return
-	}
+	http.Error(w, "NotImplemented", http.StatusNotImplemented)
 
 }
 
-func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
-	objects, err := h.svc.ListObjects(bucket, "")
+func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket, prefix string) {
+	objects, err := h.svc.ListObjects(bucket, prefix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
