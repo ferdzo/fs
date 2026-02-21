@@ -64,3 +64,11 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	}()
 	return pr, manifest, nil
 }
+
+func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, error) {
+	manifest, err := s.metadataHandler.GetManifest(bucket, key)
+	if err != nil {
+		return models.ObjectManifest{}, err
+	}
+	return *manifest, nil
+}

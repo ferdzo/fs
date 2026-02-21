@@ -34,6 +34,7 @@ func (h *Handler) setupRoutes() {
 	h.router.Get("/", h.handleWelcome)
 	h.router.Get("/*", h.handleGetObject)
 	h.router.Put("/*", h.handlePutObject)
+	h.router.Head("/*", h.handleHeadObject)
 }
 
 func (h *Handler) handleWelcome(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +87,23 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", manifest.ETag)
 	w.Header().Set("Content-Length", "0")
 
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
+	urlParams := chi.URLParam(r, "*")
+	bucket := strings.Split(urlParams, "/")[0]
+	key := strings.Join(strings.Split(urlParams, "/")[1:], "/")
+
+	manifest, err := h.svc.HeadObject(bucket, key)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("ETag", manifest.ETag)
+	w.Header().Set("Content-Length", "0")
+	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(time.RFC1123))
 	w.WriteHeader(http.StatusOK)
 }
 
