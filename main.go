@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
+	"fs/metadata"
+	"fs/service"
+	"io"
 	"os"
-
-	"fs/data"
 )
 
 func main() {
@@ -16,25 +17,38 @@ func main() {
 	}
 	defer imageStream.Close()
 
-	fmt.Fprint(imageStream)
+	metadataHandler, err := metadata.NewMetadataHandler("metadata.db")
+	if err != nil {
+		fmt.Printf("Error initializing metadata handler: %v\n", err)
+		return
+	}
 
-	manifest, err := data.IngestStream("test-bucket-ferdzo", "fer.jpg", "image/jpeg", imageStream)
+	objectService := service.NewObjectService(metadataHandler)
+
+	manifest, err := objectService.PutObject("test-bucket-ferdzo/fer.jpg", "image/jpeg", imageStream)
 	if err != nil {
 		fmt.Printf("Error ingesting stream: %v\n", err)
 		return
 	}
 	fmt.Printf("Manifest: %+v\n", manifest)
 
-	objectData, err := data.GetObject(manifest)
+	objectData, manifest2, err := objectService.GetObject("test-bucket-ferdzo", "fer.jpg")
 	if err != nil {
 		fmt.Printf("Error retrieving object: %v\n", err)
 		return
 	}
-	fmt.Printf("Retrieved object data length: %d\n", len(objectData))
-
-	err = os.WriteFile("recovered"+manifest.Key, objectData, 0644)
+	fmt.Printf("Retrieved manifest: %+v\n", manifest2)
+	recoveredFile, err := os.Create("recovered_" + manifest2.Key)
 	if err != nil {
-		fmt.Printf("Error writing recovered file: %v\n", err)
+		fmt.Printf("Error creating file: %v\n", err)
 		return
 	}
+	defer recoveredFile.Close()
+
+	bytesWritten, err := io.Copy(recoveredFile, objectData)
+	if err != nil {
+		fmt.Printf("Error streaming to recovered file: %v\n", err)
+		return
+	}
+	fmt.Printf("Successfully streamed %d bytes to disk!\n", bytesWritten)
 }

@@ -2,3 +2,4 @@
 .vscode/
 blobs/
 *.db
+.idea/
