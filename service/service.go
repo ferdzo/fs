@@ -72,3 +72,28 @@ func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, e
 	}
 	return *manifest, nil
 }
+
+func (s *ObjectService) DeleteObject(bucket, key string) error {
+	return nil
+}
+
+func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error) {
+	return s.metadataHandler.ListObjects(bucket, prefix)
+}
+
+func (s *ObjectService) CreateBucket(bucket string) error {
+	return s.metadataHandler.CreateBucket(bucket)
+}
+
+func (s *ObjectService) HeadBucket(bucket string) error {
+	_, err := s.metadataHandler.GetBucketManifest(bucket)
+	return err
+}
+
+func (s *ObjectService) DeleteBucket(bucket string) error {
+	return s.metadataHandler.DeleteBucket(bucket)
+}
+
+func (s *ObjectService) ListBuckets() ([]string, error) {
+	return s.metadataHandler.ListBuckets()
+}
