@@ -74,3 +74,45 @@ type InitiateMultipartUploadResult struct {
 	Key      string   `xml:"Key"`
 	UploadID string   `xml:"UploadId"`
 }
+type UploadedPart struct {
+	PartNumber int      `json:"part_number" xml:"PartNumber"`
+	ETag       string   `json:"etag" xml:"ETag"`
+	Size       int64    `json:"size" xml:"Size"`
+	Chunks     []string `json:"chunks"`
+	CreatedAt  int64    `json:"created_at"`
+}
+
+type CompletedPart struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type CompleteMultipartUploadRequest struct {
+	XMLName xml.Name        `xml:"CompleteMultipartUpload"`
+	Parts   []CompletedPart `xml:"Part"`
+}
+
+type CompleteMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+	Location string   `xml:"Location,omitempty"`
+}
+
+type ListPartsResult struct {
+	XMLName  xml.Name   `xml:"ListPartsResult"`
+	Xmlns    string     `xml:"xmlns,attr"`
+	Bucket   string     `xml:"Bucket"`
+	Key      string     `xml:"Key"`
+	UploadID string     `xml:"UploadId"`
+	Parts    []PartItem `xml:"Part"`
+}
+
+type PartItem struct {
+	PartNumber   int    `xml:"PartNumber"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
+}

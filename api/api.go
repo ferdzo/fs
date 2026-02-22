@@ -71,6 +71,11 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+		h.handleListMultipartParts(w, r, bucket, key, uploadID)
+		return
+	}
+
 	stream, manifest, err := h.svc.GetObject(bucket, key)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
@@ -94,6 +99,7 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
+	defer r.Body.Close()
 
 	if _, ok := r.URL.Query()["uploads"]; ok {
 		upload, err := h.svc.CreateMultipartUpload(bucket, key)
@@ -119,6 +125,39 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+		var req models.CompleteMultipartUploadRequest
+		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+			return
+		}
+
+		manifest, err := h.svc.CompleteMultipartUpload(bucket, key, uploadID, req.Parts)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		response := models.CompleteMultipartUploadResult{
+			Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+			Bucket:   bucket,
+			Key:      key,
+			ETag:     `"` + manifest.ETag + `"`,
+			Location: r.URL.Path,
+		}
+		payload, err := xml.MarshalIndent(response, "", "    ")
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(payload)
+		return
+	}
+
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 }
 
@@ -129,9 +168,31 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-	if r.URL.Query().Get("uploads") != "" {
-		if r.URL.Query().Get("partNumber") != "" {
+	defer r.Body.Close()
+
+	uploadID := r.URL.Query().Get("uploadId")
+	partNumberRaw := r.URL.Query().Get("partNumber")
+	if uploadID != "" || partNumberRaw != "" {
+		if uploadID == "" || partNumberRaw == "" {
+			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
 		}
+
+		partNumber, err := strconv.Atoi(partNumberRaw)
+		if err != nil {
+			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
+		}
+
+		etag, err := h.svc.UploadPart(bucket, key, uploadID, partNumber, r.Body)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		w.Header().Set("ETag", `"`+etag+`"`)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
 	contentType := r.Header.Get("Content-Type")
@@ -140,7 +201,6 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	manifest, err := h.svc.PutObject(bucket, key, contentType, r.Body)
-	defer r.Body.Close()
 
 	if err != nil {
 		writeMappedS3Error(w, r, err)
@@ -151,6 +211,41 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", "0")
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+	parts, err := h.svc.ListMultipartParts(bucket, key, uploadID)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	response := models.ListPartsResult{
+		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:   bucket,
+		Key:      key,
+		UploadID: uploadID,
+		Parts:    make([]models.PartItem, 0, len(parts)),
+	}
+	for _, part := range parts {
+		response.Parts = append(response.Parts, models.PartItem{
+			PartNumber:   part.PartNumber,
+			LastModified: time.Unix(part.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
+			ETag:         `"` + part.ETag + `"`,
+			Size:         part.Size,
+		})
+	}
+
+	payload, err := xml.MarshalIndent(response, "", "    ")
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(payload)
 }
 
 func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +293,15 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-
+	if uploadId := r.URL.Query().Get("uploadId"); uploadId != "" {
+		err := h.svc.AbortMultipartUpload(bucket, key, uploadId)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	err := h.svc.DeleteObject(bucket, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrObjectNotFound) {
