@@ -74,7 +74,7 @@ func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, e
 }
 
 func (s *ObjectService) DeleteObject(bucket, key string) error {
-	return nil
+	return s.metadataHandler.DeleteManifest(bucket, key)
 }
 
 func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error) {

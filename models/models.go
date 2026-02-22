@@ -24,6 +24,15 @@ type BucketManifest struct {
 	PublicAccessBlock bool      `json:"public_access_block"`
 }
 
+type S3ErrorResponse struct {
+	XMLName   xml.Name `xml:"Error"`
+	Code      string   `xml:"Code"`
+	Message   string   `xml:"Message"`
+	Resource  string   `xml:"Resource,omitempty"`
+	RequestID string   `xml:"RequestId,omitempty"`
+	HostID    string   `xml:"HostId,omitempty"`
+}
+
 type ListBucketResult struct {
 	XMLName xml.Name `xml:"ListBucketResult"`
 	Xmlns   string   `xml:"xmlns,attr"`

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"errors"
 	"fmt"
+	"fs/metadata"
 	"fs/service"
 	"fs/utils"
 	"io"
@@ -46,6 +48,7 @@ func (h *Handler) setupRoutes() {
 	h.router.Get("/{bucket}/*", h.handleGetObject)
 	h.router.Put("/{bucket}/*", h.handlePutObject)
 	h.router.Head("/{bucket}/*", h.handleHeadObject)
+	h.router.Delete("/{bucket}/*", h.handleDeleteObject)
 }
 
 func (h *Handler) handleWelcome(w http.ResponseWriter, r *http.Request) {
@@ -59,22 +62,27 @@ func (h *Handler) handleWelcome(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
+
 	if key == "" {
-		http.Error(w, "object key is required", http.StatusBadRequest)
+		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
+	}
+
+	if r.URL.Query().Get("uploadId") != "" {
+
 	}
 
 	stream, manifest, err := h.svc.GetObject(bucket, key)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeMappedS3Error(w, r, err)
 		return
 	}
 
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
-	w.Header().Set("ETag", manifest.ETag)
+	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(time.RFC1123))
 	w.WriteHeader(http.StatusOK)
 	_, err = io.Copy(w, stream)
 
@@ -84,7 +92,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
 	if key == "" {
-		http.Error(w, "object key is required", http.StatusBadRequest)
+		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
 
@@ -97,11 +105,11 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeMappedS3Error(w, r, err)
 		return
 	}
 
-	w.Header().Set("ETag", manifest.ETag)
+	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
 	w.Header().Set("Content-Length", "0")
 
 	w.WriteHeader(http.StatusOK)
@@ -111,26 +119,26 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
 	if key == "" {
-		http.Error(w, "object key is required", http.StatusBadRequest)
+		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
 
 	manifest, err := h.svc.HeadObject(bucket, key)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeMappedS3Error(w, r, err)
 		return
 	}
 
-	w.Header().Set("ETag", manifest.ETag)
+	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
 	w.Header().Set("Content-Length", "0")
-	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(time.RFC1123))
+	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	if h.svc.CreateBucket(bucket) != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	if err := h.svc.CreateBucket(bucket); err != nil {
+		writeMappedS3Error(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -138,17 +146,37 @@ func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	if h.svc.DeleteBucket(bucket) != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	if err := h.svc.DeleteBucket(bucket); err != nil {
+		writeMappedS3Error(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusAccepted)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := chi.URLParam(r, "*")
+	if key == "" {
+		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
+		return
+	}
+
+	err := h.svc.DeleteObject(bucket, key)
+	if err != nil {
+		if errors.Is(err, metadata.ErrObjectNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeMappedS3Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	if h.svc.HeadBucket(bucket) != nil {
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+	if err := h.svc.HeadBucket(bucket); err != nil {
+		writeMappedS3Error(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -157,7 +185,7 @@ func (h *Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 	buckets, err := h.svc.ListBuckets()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeMappedS3Error(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/xml")
@@ -178,20 +206,20 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 		h.handleListObjectsV2(w, r, bucket, prefix)
 		return
 	}
-	http.Error(w, "NotImplemented", http.StatusNotImplemented)
+	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 
 }
 
 func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket, prefix string) {
 	objects, err := h.svc.ListObjects(bucket, prefix)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeMappedS3Error(w, r, err)
 		return
 	}
 
 	xmlResponse, err := utils.ConstructXMLResponseForObjectList(bucket, objects)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeMappedS3Error(w, r, err)
 		return
 	}
 
@@ -200,7 +228,6 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	w.WriteHeader(http.StatusOK)
 	_, err = w.Write([]byte(xmlResponse))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 

@@ -20,6 +20,14 @@ var systemIndex = []byte("__SYSTEM_BUCKETS__")
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]{3,63}$`)
 
+var (
+	ErrInvalidBucketName   = errors.New("invalid bucket name")
+	ErrBucketAlreadyExists = errors.New("bucket already exists")
+	ErrBucketNotFound      = errors.New("bucket not found")
+	ErrBucketNotEmpty      = errors.New("bucket not empty")
+	ErrObjectNotFound      = errors.New("object not found")
+)
+
 func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	db, err := bbolt.Open(dbPath, 0600, nil)
 	if err != nil {
@@ -41,7 +49,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 
 func (h *MetadataHandler) CreateBucket(bucketName string) error {
 	if !validBucketName.MatchString(bucketName) {
-		return fmt.Errorf("invalid bucket name: %s", bucketName)
+		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
 
 	err := h.db.Update(func(tx *bbolt.Tx) error {
@@ -50,7 +58,7 @@ func (h *MetadataHandler) CreateBucket(bucketName string) error {
 			return err
 		}
 		if indexBucket.Get([]byte(bucketName)) != nil {
-			return fmt.Errorf("bucket %s already exists", bucketName)
+			return fmt.Errorf("%w: %s", ErrBucketAlreadyExists, bucketName)
 		}
 
 		_, err = tx.CreateBucketIfNotExists([]byte(bucketName))
@@ -73,7 +81,7 @@ func (h *MetadataHandler) CreateBucket(bucketName string) error {
 
 func (h *MetadataHandler) DeleteBucket(bucketName string) error {
 	if !validBucketName.MatchString(bucketName) {
-		return fmt.Errorf("invalid bucket name: %s", bucketName)
+		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
 
 	err := h.db.Update(func(tx *bbolt.Tx) error {
@@ -82,7 +90,14 @@ func (h *MetadataHandler) DeleteBucket(bucketName string) error {
 			return err
 		}
 		if indexBucket.Get([]byte(bucketName)) == nil {
-			return fmt.Errorf("bucket %s not found", bucketName)
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucketName)
+		}
+		metadataBucket := tx.Bucket([]byte(bucketName))
+		if metadataBucket == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucketName)
+		}
+		if k, _ := metadataBucket.Cursor().First(); k != nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotEmpty, bucketName)
 		}
 		if err := tx.DeleteBucket([]byte(bucketName)); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
 			return fmt.Errorf("error deleting metadata bucket %s: %w", bucketName, err)
@@ -127,7 +142,7 @@ func (h *MetadataHandler) GetBucketManifest(bucketName string) (*models.BucketMa
 		}
 		data := systemIndexBucket.Get([]byte(bucketName))
 		if data == nil {
-			return fmt.Errorf("bucket manifest not found for bucket %s", bucketName)
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucketName)
 		}
 		err := json.Unmarshal(data, &manifest)
 		if err != nil {
@@ -157,7 +172,7 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 		}
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
-			return fmt.Errorf("metadata bucket %s not found; create it first", bucket)
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
 		return metadataBucket.Put([]byte(key), data)
 	})
@@ -173,12 +188,12 @@ func (h *MetadataHandler) GetManifest(bucket, key string) (*models.ObjectManifes
 	err := h.db.View(func(tx *bbolt.Tx) error {
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
-			return fmt.Errorf("bucket %s not found", bucket)
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
 		data := metadataBucket.Get([]byte(key))
 		if data == nil {
 
-			return fmt.Errorf("manifest not found for bucket %s and key %s", bucket, key)
+			return fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 		}
 		err := json.Unmarshal(data, &manifest)
 		if err != nil {
@@ -203,11 +218,11 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 			return errors.New("system index not found")
 		}
 		if systemIndexBucket.Get([]byte(bucket)) == nil {
-			return fmt.Errorf("bucket %s not found", bucket)
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
 		_bucket := tx.Bucket([]byte(bucket))
 		if _bucket == nil {
-			return fmt.Errorf("bucket %s not found", bucket)
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
 		err := _bucket.ForEach(func(k, v []byte) error {
 			if prefix != "" && !strings.HasPrefix(string(k), prefix) {
@@ -230,4 +245,23 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 		return nil, err
 	}
 	return objects, nil
+}
+
+func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
+	if _, err := h.GetManifest(bucket, key); err != nil {
+		return err
+	}
+
+	err := h.db.Update(func(tx *bbolt.Tx) error {
+		metadataBucket := tx.Bucket([]byte(bucket))
+		if metadataBucket == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
+		}
+		return metadataBucket.Delete([]byte(key))
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+
 }
