@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -42,6 +44,8 @@ func (h *Handler) setupRoutes() {
 	h.router.Get("/{bucket}", h.handleGetBucket)
 	h.router.Put("/{bucket}", h.handlePutBucket)
 	h.router.Put("/{bucket}/", h.handlePutBucket)
+	h.router.Post("/{bucket}", h.handlePostBucket)
+	h.router.Post("/{bucket}/", h.handlePostBucket)
 	h.router.Delete("/{bucket}", h.handleDeleteBucket)
 	h.router.Delete("/{bucket}/", h.handleDeleteBucket)
 	h.router.Head("/{bucket}", h.handleHeadBucket)
@@ -170,6 +174,11 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	bodyReader := io.Reader(r.Body)
+	if shouldDecodeAWSChunkedPayload(r) {
+		bodyReader = newAWSChunkedDecodingReader(r.Body)
+	}
+
 	uploadID := r.URL.Query().Get("uploadId")
 	partNumberRaw := r.URL.Query().Get("partNumber")
 	if uploadID != "" || partNumberRaw != "" {
@@ -184,7 +193,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		etag, err := h.svc.UploadPart(bucket, key, uploadID, partNumber, r.Body)
+		etag, err := h.svc.UploadPart(bucket, key, uploadID, partNumber, bodyReader)
 		if err != nil {
 			writeMappedS3Error(w, r, err)
 			return
@@ -200,7 +209,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		contentType = "application/octet-stream"
 	}
 
-	manifest, err := h.svc.PutObject(bucket, key, contentType, r.Body)
+	manifest, err := h.svc.PutObject(bucket, key, contentType, bodyReader)
 
 	if err != nil {
 		writeMappedS3Error(w, r, err)
@@ -248,6 +257,75 @@ func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Reques
 	_, _ = w.Write(payload)
 }
 
+func shouldDecodeAWSChunkedPayload(r *http.Request) bool {
+	contentEncoding := strings.ToLower(r.Header.Get("Content-Encoding"))
+	if strings.Contains(contentEncoding, "aws-chunked") {
+		return true
+	}
+	signingMode := strings.ToLower(r.Header.Get("x-amz-content-sha256"))
+	return strings.HasPrefix(signingMode, "streaming-aws4-hmac-sha256-payload")
+}
+
+func newAWSChunkedDecodingReader(src io.Reader) io.Reader {
+	pr, pw := io.Pipe()
+	go func() {
+		if err := decodeAWSChunkedPayload(src, pw); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+	return pr
+}
+
+func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
+	reader := bufio.NewReader(src)
+	for {
+		headerLine, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		headerLine = strings.TrimRight(headerLine, "\r\n")
+		chunkSizeToken := headerLine
+		if idx := strings.IndexByte(chunkSizeToken, ';'); idx >= 0 {
+			chunkSizeToken = chunkSizeToken[:idx]
+		}
+		chunkSizeToken = strings.TrimSpace(chunkSizeToken)
+		chunkSize, err := strconv.ParseInt(chunkSizeToken, 16, 64)
+		if err != nil {
+			return fmt.Errorf("invalid aws-chunked header %q: %w", headerLine, err)
+		}
+		if chunkSize < 0 {
+			return fmt.Errorf("invalid aws-chunked size: %d", chunkSize)
+		}
+		if chunkSize > 0 {
+			if _, err := io.CopyN(dst, reader, chunkSize); err != nil {
+				return err
+			}
+		}
+
+		crlf := make([]byte, 2)
+		if _, err := io.ReadFull(reader, crlf); err != nil {
+			return err
+		}
+		if crlf[0] != '\r' || crlf[1] != '\n' {
+			return errors.New("invalid aws-chunked payload terminator")
+		}
+
+		if chunkSize == 0 {
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return err
+				}
+				if line == "\r\n" || line == "\n" {
+					return nil
+				}
+			}
+		}
+	}
+}
+
 func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
@@ -261,9 +339,11 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	etag := manifest.ETag
+	size := strconv.Itoa(int(manifest.Size))
 
-	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
-	w.Header().Set("Content-Length", "0")
+	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("Content-Length", size)
 	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusOK)
 }
@@ -284,6 +364,61 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if _, ok := r.URL.Query()["delete"]; !ok {
+		writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+		return
+	}
+	defer r.Body.Close()
+
+	bodyReader := io.Reader(r.Body)
+	if shouldDecodeAWSChunkedPayload(r) {
+		bodyReader = newAWSChunkedDecodingReader(r.Body)
+	}
+
+	var req models.DeleteObjectsRequest
+	if err := xml.NewDecoder(bodyReader).Decode(&req); err != nil {
+		writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+		return
+	}
+
+	keys := make([]string, 0, len(req.Objects))
+	for _, obj := range req.Objects {
+		if obj.Key == "" {
+			continue
+		}
+		keys = append(keys, obj.Key)
+	}
+
+	deleted, err := h.svc.DeleteObjects(bucket, keys)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	response := models.DeleteObjectsResult{
+		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+	}
+	if !req.Quiet {
+		response.Deleted = make([]models.DeletedEntry, 0, len(deleted))
+		for _, key := range deleted {
+			response.Deleted = append(response.Deleted, models.DeletedEntry{Key: key})
+		}
+	}
+
+	payload, err := xml.MarshalIndent(response, "", "    ")
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(payload)
 }
 
 func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
@@ -345,6 +480,16 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 			prefix = ""
 		}
 		h.handleListObjectsV2(w, r, bucket, prefix)
+		return
+	}
+	if r.URL.Query().Has("location") {
+		xmlResponse := `<?xml version="1.0" encoding="UTF-8"?>
+						<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(xmlResponse))
 		return
 	}
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)

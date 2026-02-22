@@ -17,7 +17,7 @@ func main() {
 
 	objectService := service.NewObjectService(metadataHandler)
 	handler := api.NewHandler(objectService)
-	err = handler.Start("localhost:3000")
+	err = handler.Start("0.0.0.0:3000")
 	if err != nil {
 		return
 	}

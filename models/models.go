@@ -116,3 +116,23 @@ type PartItem struct {
 	ETag         string `xml:"ETag"`
 	Size         int64  `xml:"Size"`
 }
+
+type DeleteObjectsRequest struct {
+	XMLName xml.Name               `xml:"Delete"`
+	Objects []DeleteObjectIdentity `xml:"Object"`
+	Quiet   bool                   `xml:"Quiet"`
+}
+
+type DeleteObjectIdentity struct {
+	Key string `xml:"Key"`
+}
+
+type DeleteObjectsResult struct {
+	XMLName xml.Name       `xml:"DeleteResult"`
+	Xmlns   string         `xml:"xmlns,attr"`
+	Deleted []DeletedEntry `xml:"Deleted,omitempty"`
+}
+
+type DeletedEntry struct {
+	Key string `xml:"Key"`
+}

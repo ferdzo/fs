@@ -21,6 +21,7 @@ var (
 	ErrInvalidPart            = errors.New("invalid multipart part")
 	ErrInvalidPartOrder       = errors.New("invalid multipart part order")
 	ErrInvalidCompleteRequest = errors.New("invalid complete multipart request")
+	ErrEntityTooSmall         = errors.New("multipart entity too small")
 )
 
 func NewObjectService(metadataHandler *metadata.MetadataHandler) *ObjectService {
@@ -108,6 +109,10 @@ func (s *ObjectService) ListBuckets() ([]string, error) {
 	return s.metadataHandler.ListBuckets()
 }
 
+func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, error) {
+	return s.metadataHandler.DeleteManifests(bucket, keys)
+}
+
 func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
 	return s.metadataHandler.CreateMultipartUpload(bucket, key)
 }
@@ -182,7 +187,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 	chunks := make([]string, 0)
 	var totalSize int64
 
-	for _, part := range completed {
+	for i, part := range completed {
 		if part.PartNumber <= lastPartNumber {
 			return nil, ErrInvalidPartOrder
 		}
@@ -194,6 +199,9 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		}
 		if normalizeETag(part.ETag) != normalizeETag(storedPart.ETag) {
 			return nil, ErrInvalidPart
+		}
+		if i < len(completed)-1 && storedPart.Size < 5*1024*1024 {
+			return nil, ErrEntityTooSmall
 		}
 
 		orderedParts = append(orderedParts, storedPart)

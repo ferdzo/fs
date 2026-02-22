@@ -41,6 +41,11 @@ var (
 		Code:    "MalformedXML",
 		Message: "The XML you provided was not well-formed or did not validate against our published schema.",
 	}
+	s3ErrEntityTooSmall = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "EntityTooSmall",
+		Message: "Your proposed upload is smaller than the minimum allowed object size.",
+	}
 	s3ErrInternal = s3APIError{
 		Status:  http.StatusInternalServerError,
 		Code:    "InternalError",
@@ -98,6 +103,8 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrInvalidPartOrder
 	case errors.Is(err, service.ErrInvalidCompleteRequest):
 		return s3ErrMalformedXML
+	case errors.Is(err, service.ErrEntityTooSmall):
+		return s3ErrEntityTooSmall
 	default:
 		return s3ErrInternal
 	}

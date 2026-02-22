@@ -289,6 +289,34 @@ func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
 
 }
 
+func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]string, error) {
+	deleted := make([]string, 0, len(keys))
+
+	err := h.db.Update(func(tx *bbolt.Tx) error {
+		metadataBucket := tx.Bucket([]byte(bucket))
+		if metadataBucket == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
+		}
+
+		for _, key := range keys {
+			if key == "" {
+				continue
+			}
+			if metadataBucket.Get([]byte(key)) != nil {
+				if err := metadataBucket.Delete([]byte(key)); err != nil {
+					return err
+				}
+			}
+			deleted = append(deleted, key)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return deleted, nil
+}
+
 func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
 	var upload *models.MultipartUpload
 
