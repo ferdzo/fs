@@ -9,6 +9,7 @@ import (
 	"fs/models"
 	"fs/storage"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -45,7 +46,13 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		Chunks:      chunks,
 		CreatedAt:   timestamp,
 	}
-	fmt.Println(manifest)
+	slog.Debug("object_written_manifest",
+		"bucket", manifest.Bucket,
+		"key", manifest.Key,
+		"size", manifest.Size,
+		"chunk_count", len(manifest.Chunks),
+		"etag", manifest.ETag,
+	)
 	if err = s.metadataHandler.PutManifest(manifest); err != nil {
 		return nil, err
 	}

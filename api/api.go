@@ -6,12 +6,13 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"fs/logging"
 	"fs/metadata"
 	"fs/models"
 	"fs/service"
 	"fs/utils"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,23 +26,36 @@ import (
 )
 
 type Handler struct {
-	router *chi.Mux
-	svc    *service.ObjectService
+	router    *chi.Mux
+	svc       *service.ObjectService
+	logger    *slog.Logger
+	logConfig logging.Config
 }
 
-func NewHandler(svc *service.ObjectService) *Handler {
+func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config) *Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	h := &Handler{
-		router: r,
-		svc:    svc,
+		router:    r,
+		svc:       svc,
+		logger:    logger,
+		logConfig: logConfig,
 	}
 	return h
 }
 
 func (h *Handler) setupRoutes() {
-	h.router.Use(middleware.Logger)
+	if h.logConfig.Format == "text" {
+		if h.logConfig.Audit || h.logConfig.DebugMode {
+			h.router.Use(middleware.Logger)
+		}
+	} else {
+		h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
+	}
 
 	h.router.Get("/", h.handleGetBuckets)
 
@@ -546,30 +560,50 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 }
 
 func (h *Handler) Start(address string) error {
-	fmt.Printf("Starting API server on %s\n", address)
+	h.logger.Info("server_starting",
+		"address", address,
+		"log_format", h.logConfig.Format,
+		"log_level", h.logConfig.LevelName,
+		"audit_log", h.logConfig.Audit,
+	)
 	h.setupRoutes()
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
 	server := http.Server{
 		Addr:    address,
 		Handler: h.router,
 	}
+	errCh := make(chan error, 1)
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
-			log.Fatal(err)
+			if !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
 		}
 	}()
-	<-stop
+
+	select {
+	case <-stop:
+		h.logger.Info("shutdown_signal_received")
+	case err := <-errCh:
+		h.logger.Error("server_listen_failed", "error", err)
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
+		h.logger.Error("server_shutdown_failed", "error", err)
 		return err
 	}
 	if err := h.svc.Close(); err != nil {
+		h.logger.Error("service_close_failed", "error", err)
 		return err
 	}
 
+	h.logger.Info("server_stopped")
 	return nil
 }

@@ -36,7 +36,7 @@ var (
 )
 
 func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
-	db, err := bbolt.Open(dbPath, 0600, nil)
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 2 * time.Second})
 	if err != nil {
 		return nil, err
 	}
