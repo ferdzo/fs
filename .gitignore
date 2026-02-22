@@ -3,3 +3,4 @@
 blobs/
 *.db
 .idea/
+.gocache/
