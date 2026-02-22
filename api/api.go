@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -10,9 +11,13 @@ import (
 	"fs/service"
 	"fs/utils"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -58,7 +63,7 @@ func (h *Handler) setupRoutes() {
 	h.router.Delete("/{bucket}/*", h.handleDeleteObject)
 }
 
-func (h *Handler) handleWelcome(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleWelcome(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte("Welcome to the Object Storage API!"))
 	if err != nil {
@@ -103,7 +108,12 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-	defer r.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+
+		}
+	}(r.Body)
 
 	if _, ok := r.URL.Query()["uploads"]; ok {
 		upload, err := h.svc.CreateMultipartUpload(bucket, key)
@@ -172,7 +182,12 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-	defer r.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+
+		}
+	}(r.Body)
 
 	bodyReader := io.Reader(r.Body)
 	if shouldDecodeAWSChunkedPayload(r) {
@@ -372,7 +387,12 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 		return
 	}
-	defer r.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+
+		}
+	}(r.Body)
 
 	bodyReader := io.Reader(r.Body)
 	if shouldDecodeAWSChunkedPayload(r) {
@@ -467,7 +487,10 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
 	for _, bucket := range buckets {
-		w.Write([]byte(bucket))
+		_, err := w.Write([]byte(bucket))
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -489,7 +512,10 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(xmlResponse))
+		_, err := w.Write([]byte(xmlResponse))
+		if err != nil {
+			return
+		}
 		return
 	}
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
@@ -522,5 +548,28 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 func (h *Handler) Start(address string) error {
 	fmt.Printf("Starting API server on %s\n", address)
 	h.setupRoutes()
-	return http.ListenAndServe(address, h.router)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	server := http.Server{
+		Addr:    address,
+		Handler: h.router,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	<-stop
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		return err
+	}
+	if err := h.svc.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }

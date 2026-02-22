@@ -254,3 +254,7 @@ func buildMultipartETag(parts []models.UploadedPart) string {
 	}
 	return fmt.Sprintf("%x-%d", hasher.Sum(nil), len(parts))
 }
+
+func (s *ObjectService) Close() error {
+	return s.metadataHandler.Close()
+}

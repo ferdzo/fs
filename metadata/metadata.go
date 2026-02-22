@@ -70,6 +70,10 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	return h, nil
 }
 
+func (h *MetadataHandler) Close() error {
+	return h.db.Close()
+}
+
 func (h *MetadataHandler) CreateBucket(bucketName string) error {
 	if !validBucketName.MatchString(bucketName) {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
