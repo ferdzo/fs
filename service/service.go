@@ -97,3 +97,11 @@ func (s *ObjectService) DeleteBucket(bucket string) error {
 func (s *ObjectService) ListBuckets() ([]string, error) {
 	return s.metadataHandler.ListBuckets()
 }
+
+func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
+	return s.metadataHandler.CreateMultipartUpload(bucket, key)
+}
+
+func (s *ObjectService) PutMultipartObject(bucket, key, uploadId string, input io.Reader) (*models.MultipartUpload, error) {
+	return nil, nil
+}

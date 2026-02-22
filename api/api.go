@@ -1,9 +1,11 @@
 package api
 
 import (
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"fs/metadata"
+	"fs/models"
 	"fs/service"
 	"fs/utils"
 	"io"
@@ -47,6 +49,7 @@ func (h *Handler) setupRoutes() {
 
 	h.router.Get("/{bucket}/*", h.handleGetObject)
 	h.router.Put("/{bucket}/*", h.handlePutObject)
+	h.router.Post("/{bucket}/*", h.handlePostObject)
 	h.router.Head("/{bucket}/*", h.handleHeadObject)
 	h.router.Delete("/{bucket}/*", h.handleDeleteObject)
 }
@@ -68,10 +71,6 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Query().Get("uploadId") != "" {
-
-	}
-
 	stream, manifest, err := h.svc.GetObject(bucket, key)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
@@ -88,12 +87,51 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := chi.URLParam(r, "*")
+	if key == "" {
+		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
+		return
+	}
+
+	if _, ok := r.URL.Query()["uploads"]; ok {
+		upload, err := h.svc.CreateMultipartUpload(bucket, key)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		response := models.InitiateMultipartUploadResult{
+			Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+			Bucket:   upload.Bucket,
+			Key:      upload.Key,
+			UploadID: upload.UploadID,
+		}
+		payload, err := xml.MarshalIndent(response, "", "    ")
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(payload)
+		return
+	}
+
+	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+}
+
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
 	if key == "" {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
+	}
+	if r.URL.Query().Get("uploads") != "" {
+		if r.URL.Query().Get("partNumber") != "" {
+		}
 	}
 
 	contentType := r.Header.Get("Content-Type")

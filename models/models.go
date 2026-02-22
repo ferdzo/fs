@@ -58,3 +58,19 @@ type Contents struct {
 type CommonPrefixes struct {
 	Prefix string `xml:"Prefix"`
 }
+
+type MultipartUpload struct {
+	UploadID  string `json:"upload_id" xml:"UploadId"`
+	Bucket    string `json:"bucket" xml:"Bucket"`
+	Key       string `json:"key" xml:"Key"`
+	CreatedAt string `json:"created_at" xml:"CreatedAt"`
+	State     string `json:"state" xml:"State"`
+}
+
+type InitiateMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadID string   `xml:"UploadId"`
+}

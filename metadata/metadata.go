@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"go.etcd.io/bbolt"
 )
 
@@ -17,6 +19,7 @@ type MetadataHandler struct {
 }
 
 var systemIndex = []byte("__SYSTEM_BUCKETS__")
+var multipartUploadIndex = []byte("__MULTIPART_UPLOADS__")
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]{3,63}$`)
 
@@ -37,6 +40,14 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 
 	err = h.db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(systemIndex)
+		return err
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	err = h.db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(multipartUploadIndex)
 		return err
 	})
 	if err != nil {
@@ -264,4 +275,53 @@ func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
 	}
 	return nil
 
+}
+
+func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
+	var upload *models.MultipartUpload
+
+	err := h.db.View(func(tx *bbolt.Tx) error {
+		systemIndexBucket := tx.Bucket([]byte(systemIndex))
+		if systemIndexBucket == nil {
+			return errors.New("system index not found")
+		}
+		if systemIndexBucket.Get([]byte(bucket)) != nil {
+			return nil
+		}
+		return ErrBucketNotFound
+	})
+	if err != nil {
+		return nil, err
+	}
+	uploadId := uuid.New().String()
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+	upload = &models.MultipartUpload{
+		Bucket:    bucket,
+		Key:       key,
+		UploadID:  uploadId,
+		CreatedAt: createdAt,
+		State:     "pending",
+	}
+
+	err = h.db.Update(func(tx *bbolt.Tx) error {
+		multipartUploadBucket := tx.Bucket([]byte(multipartUploadIndex))
+		if multipartUploadBucket == nil {
+			return errors.New("multipart upload index not found")
+		}
+		payload, err := json.Marshal(upload)
+		if err != nil {
+			return err
+		}
+		err = multipartUploadBucket.Put([]byte(uploadId), payload)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return upload, nil
 }
