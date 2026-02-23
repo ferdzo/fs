@@ -604,6 +604,7 @@ func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
 
 func (h *MetadataHandler) GetReferencedChunkSet() (map[string]struct{}, error) {
 	chunkSet := make(map[string]struct{})
+	pendingUploadSet := make(map[string]struct{})
 
 	err := h.db.View(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
@@ -632,11 +633,36 @@ func (h *MetadataHandler) GetReferencedChunkSet() (map[string]struct{}, error) {
 			}
 		}
 
+		uploadsBucket := tx.Bucket(multipartUploadIndex)
+		if uploadsBucket == nil {
+			return errors.New("multipart upload index not found")
+		}
+		if err := uploadsBucket.ForEach(func(k, v []byte) error {
+			upload := models.MultipartUpload{}
+			if err := json.Unmarshal(v, &upload); err != nil {
+				return err
+			}
+			if upload.State == "pending" {
+				pendingUploadSet[string(k)] = struct{}{}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
 		partsBucket := tx.Bucket(multipartUploadPartsIndex)
 		if partsBucket == nil {
 			return errors.New("multipart upload parts index not found")
 		}
-		if err := partsBucket.ForEach(func(_, v []byte) error {
+		if err := partsBucket.ForEach(func(k, v []byte) error {
+			uploadID, _, ok := strings.Cut(string(k), ":")
+			if !ok {
+				return nil
+			}
+			if _, pending := pendingUploadSet[uploadID]; !pending {
+				return nil
+			}
+
 			part := models.UploadedPart{}
 			if err := json.Unmarshal(v, &part); err != nil {
 				return err
