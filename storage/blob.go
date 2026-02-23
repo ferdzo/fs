@@ -5,13 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-const chunkSize = 64 * 1024
-const blobRoot = "blobs/"
+const blobRoot = "blobs"
+const maxChunkSize = 64 * 1024 * 1024
 
 type BlobStore struct {
 	dataRoot  string
@@ -19,10 +21,19 @@ type BlobStore struct {
 }
 
 func NewBlobStore(root string, chunkSize int) (*BlobStore, error) {
-	if err := os.MkdirAll(filepath.Join(root, blobRoot), 0o755); err != nil {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil, errors.New("blob root is required")
+	}
+	if chunkSize <= 0 || chunkSize > maxChunkSize {
+		return nil, fmt.Errorf("chunk size must be between 1 and %d bytes", maxChunkSize)
+	}
+
+	cleanRoot := filepath.Clean(root)
+	if err := os.MkdirAll(filepath.Join(cleanRoot, blobRoot), 0o755); err != nil {
 		return nil, err
 	}
-	return &BlobStore{chunkSize: chunkSize, dataRoot: root}, nil
+	return &BlobStore{chunkSize: chunkSize, dataRoot: cleanRoot}, nil
 }
 
 func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, error) {
@@ -67,6 +78,9 @@ func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, er
 }
 
 func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
+	if !isValidChunkID(chunkID) {
+		return fmt.Errorf("invalid chunk id: %q", chunkID)
+	}
 	dir := filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4])
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -95,5 +109,20 @@ func (bs *BlobStore) AssembleStream(chunkIDs []string, w *io.PipeWriter) error {
 }
 
 func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {
+	if !isValidChunkID(chunkID) {
+		return nil, fmt.Errorf("invalid chunk id: %q", chunkID)
+	}
 	return os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+}
+
+func isValidChunkID(chunkID string) bool {
+	if len(chunkID) != sha256.Size*2 {
+		return false
+	}
+	for _, ch := range chunkID {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }

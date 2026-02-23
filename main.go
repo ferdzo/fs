@@ -36,6 +36,7 @@ func main() {
 	}
 	blobHandler, err := storage.NewBlobStore(config.DataPath, config.ChunkSize)
 	if err != nil {
+		_ = metadataHandler.Close()
 		logger.Error("failed_to_initialize_blob_store", "error", err)
 		return
 	}

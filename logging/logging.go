@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 type Config struct {
@@ -83,7 +85,7 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-			ww := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
 			next.ServeHTTP(ww, r)
 
@@ -92,11 +94,15 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 			}
 
 			elapsed := time.Since(start)
+			status := ww.Status()
+			if status == 0 {
+				status = http.StatusOK
+			}
 			attrs := []any{
 				"method", r.Method,
 				"path", r.URL.Path,
-				"status", ww.status,
-				"bytes", ww.bytes,
+				"status", status,
+				"bytes", ww.BytesWritten(),
 				"duration_ms", float64(elapsed.Nanoseconds()) / 1_000_000.0,
 				"remote_addr", r.RemoteAddr,
 			}
@@ -116,23 +122,6 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 			logger.Info("http_request", attrs...)
 		})
 	}
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-	status int
-	bytes  int
-}
-
-func (w *responseWriter) WriteHeader(statusCode int) {
-	w.status = statusCode
-	w.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (w *responseWriter) Write(p []byte) (int, error) {
-	n, err := w.ResponseWriter.Write(p)
-	w.bytes += n
-	return n, err
 }
 
 func envBool(key string, defaultValue bool) bool {

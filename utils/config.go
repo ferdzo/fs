@@ -25,8 +25,8 @@ func NewConfig() *Config {
 	config := &Config{
 		DataPath:  sanitizeDataPath(os.Getenv("DATA_PATH")),
 		Address:   firstNonEmpty(strings.TrimSpace(os.Getenv("ADDRESS")), "0.0.0.0"),
-		Port:      envInt("PORT", 3000),
-		ChunkSize: envInt("CHUNK_SIZE", 8192000),
+		Port:      envIntRange("PORT", 3000, 1, 65535),
+		ChunkSize: envIntRange("CHUNK_SIZE", 8192000, 1, 64*1024*1024),
 		LogLevel:  strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),
 		LogFormat: strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_FORMAT")), strings.TrimSpace(os.Getenv("LOG_TYPE")), "text")),
 		AuditLog:  envBool("AUDIT_LOG", true),
@@ -40,13 +40,16 @@ func NewConfig() *Config {
 
 }
 
-func envInt(key string, defaultValue int) int {
+func envIntRange(key string, defaultValue, minValue, maxValue int) int {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
 		return defaultValue
 	}
 	value, err := strconv.Atoi(raw)
 	if err != nil {
+		return defaultValue
+	}
+	if value < minValue || value > maxValue {
 		return defaultValue
 	}
 	return value

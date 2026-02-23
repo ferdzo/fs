@@ -98,6 +98,7 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	defer stream.Close()
 
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
@@ -116,12 +117,7 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-
-		}
-	}(r.Body)
+	defer r.Body.Close()
 
 	if _, ok := r.URL.Query()["uploads"]; ok {
 		upload, err := h.svc.CreateMultipartUpload(bucket, key)
@@ -190,17 +186,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-
-		}
-	}(r.Body)
-
-	bodyReader := io.Reader(r.Body)
-	if shouldDecodeAWSChunkedPayload(r) {
-		bodyReader = newAWSChunkedDecodingReader(r.Body)
-	}
+	defer r.Body.Close()
 
 	uploadID := r.URL.Query().Get("uploadId")
 	partNumberRaw := r.URL.Query().Get("partNumber")
@@ -214,6 +200,18 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
 			return
+		}
+		if partNumber < 1 || partNumber > 10000 {
+			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
+		}
+
+		bodyReader := io.Reader(r.Body)
+		var decodeStream io.ReadCloser
+		if shouldDecodeAWSChunkedPayload(r) {
+			decodeStream = newAWSChunkedDecodingReader(r.Body)
+			defer decodeStream.Close()
+			bodyReader = decodeStream
 		}
 
 		etag, err := h.svc.UploadPart(bucket, key, uploadID, partNumber, bodyReader)
@@ -230,6 +228,14 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
+	}
+
+	bodyReader := io.Reader(r.Body)
+	var decodeStream io.ReadCloser
+	if shouldDecodeAWSChunkedPayload(r) {
+		decodeStream = newAWSChunkedDecodingReader(r.Body)
+		defer decodeStream.Close()
+		bodyReader = decodeStream
 	}
 
 	manifest, err := h.svc.PutObject(bucket, key, contentType, bodyReader)
@@ -289,7 +295,7 @@ func shouldDecodeAWSChunkedPayload(r *http.Request) bool {
 	return strings.HasPrefix(signingMode, "streaming-aws4-hmac-sha256-payload")
 }
 
-func newAWSChunkedDecodingReader(src io.Reader) io.Reader {
+func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
 		if err := decodeAWSChunkedPayload(src, pw); err != nil {
@@ -363,7 +369,7 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	etag := manifest.ETag
-	size := strconv.Itoa(int(manifest.Size))
+	size := strconv.FormatInt(manifest.Size, 10)
 
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("Content-Length", size)
@@ -395,16 +401,14 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 		return
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-
-		}
-	}(r.Body)
+	defer r.Body.Close()
 
 	bodyReader := io.Reader(r.Body)
+	var decodeStream io.ReadCloser
 	if shouldDecodeAWSChunkedPayload(r) {
-		bodyReader = newAWSChunkedDecodingReader(r.Body)
+		decodeStream = newAWSChunkedDecodingReader(r.Body)
+		defer decodeStream.Close()
+		bodyReader = decodeStream
 	}
 
 	var req models.DeleteObjectsRequest
