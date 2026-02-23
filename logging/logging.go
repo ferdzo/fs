@@ -21,13 +21,19 @@ type Config struct {
 
 func ConfigFromEnv() Config {
 	levelName := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
+	format := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_FORMAT")))
+	return ConfigFromValues(levelName, format, envBool("AUDIT_LOG", true))
+}
+
+func ConfigFromValues(levelName, format string, audit bool) Config {
+	levelName = strings.ToLower(strings.TrimSpace(levelName))
 	if levelName == "" {
 		levelName = "info"
 	}
 	level := parseLevel(levelName)
-	levelName = level.String()
+	levelName = strings.ToUpper(level.String())
 
-	format := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_FORMAT")))
+	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" {
 		format = "text"
 	}
@@ -40,7 +46,7 @@ func ConfigFromEnv() Config {
 		Level:     level,
 		LevelName: levelName,
 		Format:    format,
-		Audit:     envBool("AUDIT_LOG", true),
+		Audit:     audit,
 		AddSource: debugMode,
 		DebugMode: debugMode,
 	}
@@ -91,15 +97,8 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 				"path", r.URL.Path,
 				"status", ww.status,
 				"bytes", ww.bytes,
+				"duration_ms", float64(elapsed.Nanoseconds()) / 1_000_000.0,
 				"remote_addr", r.RemoteAddr,
-			}
-			switch {
-			case elapsed < time.Microsecond:
-				attrs = append(attrs, "duration_ns", elapsed.Nanoseconds())
-			case elapsed < time.Millisecond:
-				attrs = append(attrs, "duration_us", elapsed.Microseconds())
-			default:
-				attrs = append(attrs, "duration_ms", elapsed.Milliseconds())
 			}
 
 			if cfg.DebugMode {

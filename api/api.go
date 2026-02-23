@@ -49,13 +49,7 @@ func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig loggi
 }
 
 func (h *Handler) setupRoutes() {
-	if h.logConfig.Format == "text" {
-		if h.logConfig.Audit || h.logConfig.DebugMode {
-			h.router.Use(middleware.Logger)
-		}
-	} else {
-		h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
-	}
+	h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
 
 	h.router.Get("/", h.handleGetBuckets)
 

@@ -15,7 +15,8 @@ import (
 )
 
 type ObjectService struct {
-	metadataHandler *metadata.MetadataHandler
+	metadata *metadata.MetadataHandler
+	blob     *storage.BlobStore
 }
 
 var (
@@ -25,13 +26,13 @@ var (
 	ErrEntityTooSmall         = errors.New("multipart entity too small")
 )
 
-func NewObjectService(metadataHandler *metadata.MetadataHandler) *ObjectService {
-	return &ObjectService{metadataHandler: metadataHandler}
+func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *storage.BlobStore) *ObjectService {
+	return &ObjectService{metadata: metadataHandler, blob: blobHandler}
 }
 
 func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
 
-	chunks, size, etag, err := storage.IngestStream(input)
+	chunks, size, etag, err := s.blob.IngestStream(input)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +54,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		"chunk_count", len(manifest.Chunks),
 		"etag", manifest.ETag,
 	)
-	if err = s.metadataHandler.PutManifest(manifest); err != nil {
+	if err = s.metadata.PutManifest(manifest); err != nil {
 		return nil, err
 	}
 
@@ -61,7 +62,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 }
 
 func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.ObjectManifest, error) {
-	manifest, err := s.metadataHandler.GetManifest(bucket, key)
+	manifest, err := s.metadata.GetManifest(bucket, key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -75,7 +76,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 			}
 		}(pw)
 
-		err := storage.AssembleStream(manifest.Chunks, pw)
+		err := s.blob.AssembleStream(manifest.Chunks, pw)
 		if err != nil {
 			return
 		}
@@ -84,7 +85,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 }
 
 func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, error) {
-	manifest, err := s.metadataHandler.GetManifest(bucket, key)
+	manifest, err := s.metadata.GetManifest(bucket, key)
 	if err != nil {
 		return models.ObjectManifest{}, err
 	}
@@ -92,36 +93,36 @@ func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, e
 }
 
 func (s *ObjectService) DeleteObject(bucket, key string) error {
-	return s.metadataHandler.DeleteManifest(bucket, key)
+	return s.metadata.DeleteManifest(bucket, key)
 }
 
 func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error) {
-	return s.metadataHandler.ListObjects(bucket, prefix)
+	return s.metadata.ListObjects(bucket, prefix)
 }
 
 func (s *ObjectService) CreateBucket(bucket string) error {
-	return s.metadataHandler.CreateBucket(bucket)
+	return s.metadata.CreateBucket(bucket)
 }
 
 func (s *ObjectService) HeadBucket(bucket string) error {
-	_, err := s.metadataHandler.GetBucketManifest(bucket)
+	_, err := s.metadata.GetBucketManifest(bucket)
 	return err
 }
 
 func (s *ObjectService) DeleteBucket(bucket string) error {
-	return s.metadataHandler.DeleteBucket(bucket)
+	return s.metadata.DeleteBucket(bucket)
 }
 
 func (s *ObjectService) ListBuckets() ([]string, error) {
-	return s.metadataHandler.ListBuckets()
+	return s.metadata.ListBuckets()
 }
 
 func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, error) {
-	return s.metadataHandler.DeleteManifests(bucket, keys)
+	return s.metadata.DeleteManifests(bucket, keys)
 }
 
 func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
-	return s.metadataHandler.CreateMultipartUpload(bucket, key)
+	return s.metadata.CreateMultipartUpload(bucket, key)
 }
 
 func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int, input io.Reader) (string, error) {
@@ -129,7 +130,7 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 		return "", ErrInvalidPart
 	}
 
-	upload, err := s.metadataHandler.GetMultipartUpload(uploadId)
+	upload, err := s.metadata.GetMultipartUpload(uploadId)
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +139,7 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 	}
 
 	var uploadedPart models.UploadedPart
-	chunkIds, totalSize, etag, err := storage.IngestStream(input)
+	chunkIds, totalSize, etag, err := s.blob.IngestStream(input)
 	if err != nil {
 		return "", err
 	}
@@ -149,7 +150,7 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 		Chunks:     chunkIds,
 		CreatedAt:  time.Now().Unix(),
 	}
-	err = s.metadataHandler.PutMultipartPart(uploadId, uploadedPart)
+	err = s.metadata.PutMultipartPart(uploadId, uploadedPart)
 	if err != nil {
 		return "", err
 	}
@@ -157,14 +158,14 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 }
 
 func (s *ObjectService) ListMultipartParts(bucket, key, uploadID string) ([]models.UploadedPart, error) {
-	upload, err := s.metadataHandler.GetMultipartUpload(uploadID)
+	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
 		return nil, err
 	}
 	if upload.Bucket != bucket || upload.Key != key {
 		return nil, metadata.ErrMultipartNotFound
 	}
-	return s.metadataHandler.ListMultipartParts(uploadID)
+	return s.metadata.ListMultipartParts(uploadID)
 }
 
 func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, completed []models.CompletedPart) (*models.ObjectManifest, error) {
@@ -172,7 +173,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		return nil, ErrInvalidCompleteRequest
 	}
 
-	upload, err := s.metadataHandler.GetMultipartUpload(uploadID)
+	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +181,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		return nil, metadata.ErrMultipartNotFound
 	}
 
-	storedParts, err := s.metadataHandler.ListMultipartParts(uploadID)
+	storedParts, err := s.metadata.ListMultipartParts(uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +228,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		CreatedAt:   time.Now().Unix(),
 	}
 
-	if err := s.metadataHandler.CompleteMultipartUpload(uploadID, manifest); err != nil {
+	if err := s.metadata.CompleteMultipartUpload(uploadID, manifest); err != nil {
 		return nil, err
 	}
 
@@ -235,14 +236,14 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 }
 
 func (s *ObjectService) AbortMultipartUpload(bucket, key, uploadID string) error {
-	upload, err := s.metadataHandler.GetMultipartUpload(uploadID)
+	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
 		return err
 	}
 	if upload.Bucket != bucket || upload.Key != key {
 		return metadata.ErrMultipartNotFound
 	}
-	return s.metadataHandler.AbortMultipartUpload(uploadID)
+	return s.metadata.AbortMultipartUpload(uploadID)
 }
 
 func normalizeETag(etag string) string {
@@ -263,5 +264,5 @@ func buildMultipartETag(parts []models.UploadedPart) string {
 }
 
 func (s *ObjectService) Close() error {
-	return s.metadataHandler.Close()
+	return s.metadata.Close()
 }

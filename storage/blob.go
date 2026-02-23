@@ -13,10 +13,22 @@ import (
 const chunkSize = 64 * 1024
 const blobRoot = "blobs/"
 
-func IngestStream(stream io.Reader) ([]string, int64, string, error) {
+type BlobStore struct {
+	dataRoot  string
+	chunkSize int
+}
+
+func NewBlobStore(root string, chunkSize int) (*BlobStore, error) {
+	if err := os.MkdirAll(filepath.Join(root, blobRoot), 0o755); err != nil {
+		return nil, err
+	}
+	return &BlobStore{chunkSize: chunkSize, dataRoot: root}, nil
+}
+
+func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, error) {
 	fullFileHasher := md5.New()
 
-	buffer := make([]byte, chunkSize)
+	buffer := make([]byte, bs.chunkSize)
 	var totalSize int64
 	var chunkIDs []string
 
@@ -35,7 +47,7 @@ func IngestStream(stream io.Reader) ([]string, int64, string, error) {
 			chunkHash := sha256.Sum256(chunkData)
 			chunkID := hex.EncodeToString(chunkHash[:])
 
-			err := saveBlob(chunkID, chunkData)
+			err := bs.saveBlob(chunkID, chunkData)
 			if err != nil {
 				return nil, 0, "", err
 			}
@@ -54,8 +66,8 @@ func IngestStream(stream io.Reader) ([]string, int64, string, error) {
 	return chunkIDs, totalSize, etag, nil
 }
 
-func saveBlob(chunkID string, data []byte) error {
-	dir := filepath.Join(blobRoot, chunkID[:2], chunkID[2:4])
+func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
+	dir := filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4])
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -69,9 +81,9 @@ func saveBlob(chunkID string, data []byte) error {
 	return nil
 }
 
-func AssembleStream(chunkIDs []string, w *io.PipeWriter) error {
+func (bs *BlobStore) AssembleStream(chunkIDs []string, w *io.PipeWriter) error {
 	for _, chunkID := range chunkIDs {
-		chunkData, err := GetBlob(chunkID)
+		chunkData, err := bs.GetBlob(chunkID)
 		if err != nil {
 			return err
 		}
@@ -82,7 +94,6 @@ func AssembleStream(chunkIDs []string, w *io.PipeWriter) error {
 	return nil
 }
 
-func GetBlob(chunkID string) ([]byte, error) {
-
-	return os.ReadFile(filepath.Join(blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
 }
