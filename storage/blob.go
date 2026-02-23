@@ -155,7 +155,11 @@ func (bs *BlobStore) DeleteBlob(chunkID string) error {
 	if !isValidChunkID(chunkID) {
 		return fmt.Errorf("invalid chunk id: %q", chunkID)
 	}
-	return os.Remove(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+	err := os.Remove(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func (bs *BlobStore) ListChunks() ([]string, error) {

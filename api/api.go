@@ -543,8 +543,8 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 	for _, bucket := range buckets {
 		manifest, err := h.svc.GetBucketManifest(bucket)
 		if err != nil {
-			writeMappedS3Error(w, r, err)
-			return
+			h.logger.Warn("bucket_manifest_read_failed", "bucket", bucket, "error", err)
+			continue
 		}
 		response.Buckets.Items = append(response.Buckets.Items, models.BucketItem{
 			Name:         bucket,
@@ -833,6 +833,9 @@ func (h *Handler) Start(ctx context.Context, address string) error {
 		h.logger.Info("shutdown_context_done", "reason", ctx.Err())
 	case err := <-errCh:
 		h.logger.Error("server_listen_failed", "error", err)
+		if closeErr := h.svc.Close(); closeErr != nil {
+			h.logger.Error("service_close_failed", "error", closeErr)
+		}
 		return err
 	}
 
