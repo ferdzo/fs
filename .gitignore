@@ -1,5 +1,8 @@
 .env
+*.db
 .vscode/
 blobs/
-*.db
+data/
 .idea/
+.gocache/
+.gomodcache/
