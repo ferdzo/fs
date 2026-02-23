@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fs/metadata"
 	"fs/models"
+	"fs/service"
 	"net/http"
 )
 
@@ -24,6 +25,26 @@ var (
 		Status:  http.StatusNotImplemented,
 		Code:    "NotImplemented",
 		Message: "A header you provided implies functionality that is not implemented.",
+	}
+	s3ErrInvalidPart = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "InvalidPart",
+		Message: "One or more of the specified parts could not be found.",
+	}
+	s3ErrInvalidPartOrder = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "InvalidPartOrder",
+		Message: "The list of parts was not in ascending order.",
+	}
+	s3ErrMalformedXML = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "MalformedXML",
+		Message: "The XML you provided was not well-formed or did not validate against our published schema.",
+	}
+	s3ErrEntityTooSmall = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "EntityTooSmall",
+		Message: "Your proposed upload is smaller than the minimum allowed object size.",
 	}
 	s3ErrInternal = s3APIError{
 		Status:  http.StatusInternalServerError,
@@ -64,6 +85,26 @@ func mapToS3Error(err error) s3APIError {
 			Code:    "NoSuchKey",
 			Message: "The specified key does not exist.",
 		}
+	case errors.Is(err, metadata.ErrMultipartNotFound):
+		return s3APIError{
+			Status:  http.StatusNotFound,
+			Code:    "NoSuchUpload",
+			Message: "The specified multipart upload does not exist.",
+		}
+	case errors.Is(err, metadata.ErrMultipartNotPending):
+		return s3APIError{
+			Status:  http.StatusBadRequest,
+			Code:    "InvalidRequest",
+			Message: "The multipart upload is not in a valid state for this operation.",
+		}
+	case errors.Is(err, service.ErrInvalidPart):
+		return s3ErrInvalidPart
+	case errors.Is(err, service.ErrInvalidPartOrder):
+		return s3ErrInvalidPartOrder
+	case errors.Is(err, service.ErrInvalidCompleteRequest):
+		return s3ErrMalformedXML
+	case errors.Is(err, service.ErrEntityTooSmall):
+		return s3ErrEntityTooSmall
 	default:
 		return s3ErrInternal
 	}

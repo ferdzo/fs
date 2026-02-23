@@ -1,14 +1,24 @@
 package api
 
 import (
+	"bufio"
+	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"fs/logging"
 	"fs/metadata"
+	"fs/models"
 	"fs/service"
 	"fs/utils"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,23 +26,30 @@ import (
 )
 
 type Handler struct {
-	router *chi.Mux
-	svc    *service.ObjectService
+	router    *chi.Mux
+	svc       *service.ObjectService
+	logger    *slog.Logger
+	logConfig logging.Config
 }
 
-func NewHandler(svc *service.ObjectService) *Handler {
+func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config) *Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	h := &Handler{
-		router: r,
-		svc:    svc,
+		router:    r,
+		svc:       svc,
+		logger:    logger,
+		logConfig: logConfig,
 	}
 	return h
 }
 
 func (h *Handler) setupRoutes() {
-	h.router.Use(middleware.Logger)
+	h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
 
 	h.router.Get("/", h.handleGetBuckets)
 
@@ -40,6 +57,8 @@ func (h *Handler) setupRoutes() {
 	h.router.Get("/{bucket}", h.handleGetBucket)
 	h.router.Put("/{bucket}", h.handlePutBucket)
 	h.router.Put("/{bucket}/", h.handlePutBucket)
+	h.router.Post("/{bucket}", h.handlePostBucket)
+	h.router.Post("/{bucket}/", h.handlePostBucket)
 	h.router.Delete("/{bucket}", h.handleDeleteBucket)
 	h.router.Delete("/{bucket}/", h.handleDeleteBucket)
 	h.router.Head("/{bucket}", h.handleHeadBucket)
@@ -47,11 +66,12 @@ func (h *Handler) setupRoutes() {
 
 	h.router.Get("/{bucket}/*", h.handleGetObject)
 	h.router.Put("/{bucket}/*", h.handlePutObject)
+	h.router.Post("/{bucket}/*", h.handlePostObject)
 	h.router.Head("/{bucket}/*", h.handleHeadObject)
 	h.router.Delete("/{bucket}/*", h.handleDeleteObject)
 }
 
-func (h *Handler) handleWelcome(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleWelcome(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte("Welcome to the Object Storage API!"))
 	if err != nil {
@@ -68,8 +88,9 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Query().Get("uploadId") != "" {
-
+	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+		h.handleListMultipartParts(w, r, bucket, key, uploadID)
+		return
 	}
 
 	stream, manifest, err := h.svc.GetObject(bucket, key)
@@ -77,6 +98,7 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	defer stream.Close()
 
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
@@ -88,11 +110,118 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := chi.URLParam(r, "*")
+	if key == "" {
+		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
+		return
+	}
+	defer r.Body.Close()
+
+	if _, ok := r.URL.Query()["uploads"]; ok {
+		upload, err := h.svc.CreateMultipartUpload(bucket, key)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		response := models.InitiateMultipartUploadResult{
+			Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+			Bucket:   upload.Bucket,
+			Key:      upload.Key,
+			UploadID: upload.UploadID,
+		}
+		payload, err := xml.MarshalIndent(response, "", "    ")
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(payload)
+		return
+	}
+
+	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+		var req models.CompleteMultipartUploadRequest
+		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+			return
+		}
+
+		manifest, err := h.svc.CompleteMultipartUpload(bucket, key, uploadID, req.Parts)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		response := models.CompleteMultipartUploadResult{
+			Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+			Bucket:   bucket,
+			Key:      key,
+			ETag:     `"` + manifest.ETag + `"`,
+			Location: r.URL.Path,
+		}
+		payload, err := xml.MarshalIndent(response, "", "    ")
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(payload)
+		return
+	}
+
+	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+}
+
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
 	if key == "" {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
+		return
+	}
+	defer r.Body.Close()
+
+	uploadID := r.URL.Query().Get("uploadId")
+	partNumberRaw := r.URL.Query().Get("partNumber")
+	if uploadID != "" || partNumberRaw != "" {
+		if uploadID == "" || partNumberRaw == "" {
+			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
+		}
+
+		partNumber, err := strconv.Atoi(partNumberRaw)
+		if err != nil {
+			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
+		}
+		if partNumber < 1 || partNumber > 10000 {
+			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
+		}
+
+		bodyReader := io.Reader(r.Body)
+		var decodeStream io.ReadCloser
+		if shouldDecodeAWSChunkedPayload(r) {
+			decodeStream = newAWSChunkedDecodingReader(r.Body)
+			defer decodeStream.Close()
+			bodyReader = decodeStream
+		}
+
+		etag, err := h.svc.UploadPart(bucket, key, uploadID, partNumber, bodyReader)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		w.Header().Set("ETag", `"`+etag+`"`)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -101,8 +230,15 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		contentType = "application/octet-stream"
 	}
 
-	manifest, err := h.svc.PutObject(bucket, key, contentType, r.Body)
-	defer r.Body.Close()
+	bodyReader := io.Reader(r.Body)
+	var decodeStream io.ReadCloser
+	if shouldDecodeAWSChunkedPayload(r) {
+		decodeStream = newAWSChunkedDecodingReader(r.Body)
+		defer decodeStream.Close()
+		bodyReader = decodeStream
+	}
+
+	manifest, err := h.svc.PutObject(bucket, key, contentType, bodyReader)
 
 	if err != nil {
 		writeMappedS3Error(w, r, err)
@@ -113,6 +249,110 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", "0")
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+	parts, err := h.svc.ListMultipartParts(bucket, key, uploadID)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	response := models.ListPartsResult{
+		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:   bucket,
+		Key:      key,
+		UploadID: uploadID,
+		Parts:    make([]models.PartItem, 0, len(parts)),
+	}
+	for _, part := range parts {
+		response.Parts = append(response.Parts, models.PartItem{
+			PartNumber:   part.PartNumber,
+			LastModified: time.Unix(part.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
+			ETag:         `"` + part.ETag + `"`,
+			Size:         part.Size,
+		})
+	}
+
+	payload, err := xml.MarshalIndent(response, "", "    ")
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(payload)
+}
+
+func shouldDecodeAWSChunkedPayload(r *http.Request) bool {
+	contentEncoding := strings.ToLower(r.Header.Get("Content-Encoding"))
+	if strings.Contains(contentEncoding, "aws-chunked") {
+		return true
+	}
+	signingMode := strings.ToLower(r.Header.Get("x-amz-content-sha256"))
+	return strings.HasPrefix(signingMode, "streaming-aws4-hmac-sha256-payload")
+}
+
+func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		if err := decodeAWSChunkedPayload(src, pw); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+	return pr
+}
+
+func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
+	reader := bufio.NewReader(src)
+	for {
+		headerLine, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		headerLine = strings.TrimRight(headerLine, "\r\n")
+		chunkSizeToken := headerLine
+		if idx := strings.IndexByte(chunkSizeToken, ';'); idx >= 0 {
+			chunkSizeToken = chunkSizeToken[:idx]
+		}
+		chunkSizeToken = strings.TrimSpace(chunkSizeToken)
+		chunkSize, err := strconv.ParseInt(chunkSizeToken, 16, 64)
+		if err != nil {
+			return fmt.Errorf("invalid aws-chunked header %q: %w", headerLine, err)
+		}
+		if chunkSize < 0 {
+			return fmt.Errorf("invalid aws-chunked size: %d", chunkSize)
+		}
+		if chunkSize > 0 {
+			if _, err := io.CopyN(dst, reader, chunkSize); err != nil {
+				return err
+			}
+		}
+
+		crlf := make([]byte, 2)
+		if _, err := io.ReadFull(reader, crlf); err != nil {
+			return err
+		}
+		if crlf[0] != '\r' || crlf[1] != '\n' {
+			return errors.New("invalid aws-chunked payload terminator")
+		}
+
+		if chunkSize == 0 {
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return err
+				}
+				if line == "\r\n" || line == "\n" {
+					return nil
+				}
+			}
+		}
+	}
 }
 
 func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
@@ -128,9 +368,11 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	etag := manifest.ETag
+	size := strconv.FormatInt(manifest.Size, 10)
 
-	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
-	w.Header().Set("Content-Length", "0")
+	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("Content-Length", size)
 	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusOK)
 }
@@ -153,6 +395,64 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if _, ok := r.URL.Query()["delete"]; !ok {
+		writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+		return
+	}
+	defer r.Body.Close()
+
+	bodyReader := io.Reader(r.Body)
+	var decodeStream io.ReadCloser
+	if shouldDecodeAWSChunkedPayload(r) {
+		decodeStream = newAWSChunkedDecodingReader(r.Body)
+		defer decodeStream.Close()
+		bodyReader = decodeStream
+	}
+
+	var req models.DeleteObjectsRequest
+	if err := xml.NewDecoder(bodyReader).Decode(&req); err != nil {
+		writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+		return
+	}
+
+	keys := make([]string, 0, len(req.Objects))
+	for _, obj := range req.Objects {
+		if obj.Key == "" {
+			continue
+		}
+		keys = append(keys, obj.Key)
+	}
+
+	deleted, err := h.svc.DeleteObjects(bucket, keys)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	response := models.DeleteObjectsResult{
+		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+	}
+	if !req.Quiet {
+		response.Deleted = make([]models.DeletedEntry, 0, len(deleted))
+		for _, key := range deleted {
+			response.Deleted = append(response.Deleted, models.DeletedEntry{Key: key})
+		}
+	}
+
+	payload, err := xml.MarshalIndent(response, "", "    ")
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(payload)
+}
+
 func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
@@ -160,7 +460,15 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrInvalidObjectKey, r.URL.Path)
 		return
 	}
-
+	if uploadId := r.URL.Query().Get("uploadId"); uploadId != "" {
+		err := h.svc.AbortMultipartUpload(bucket, key, uploadId)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	err := h.svc.DeleteObject(bucket, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrObjectNotFound) {
@@ -191,7 +499,10 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
 	for _, bucket := range buckets {
-		w.Write([]byte(bucket))
+		_, err := w.Write([]byte(bucket))
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -204,6 +515,19 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 			prefix = ""
 		}
 		h.handleListObjectsV2(w, r, bucket, prefix)
+		return
+	}
+	if r.URL.Query().Has("location") {
+		xmlResponse := `<?xml version="1.0" encoding="UTF-8"?>
+						<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte(xmlResponse))
+		if err != nil {
+			return
+		}
 		return
 	}
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
@@ -234,7 +558,50 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 }
 
 func (h *Handler) Start(address string) error {
-	fmt.Printf("Starting API server on %s\n", address)
+	h.logger.Info("server_starting",
+		"address", address,
+		"log_format", h.logConfig.Format,
+		"log_level", h.logConfig.LevelName,
+		"audit_log", h.logConfig.Audit,
+	)
 	h.setupRoutes()
-	return http.ListenAndServe(address, h.router)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	server := http.Server{
+		Addr:    address,
+		Handler: h.router,
+	}
+	errCh := make(chan error, 1)
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil {
+			if !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}
+	}()
+
+	select {
+	case <-stop:
+		h.logger.Info("shutdown_signal_received")
+	case err := <-errCh:
+		h.logger.Error("server_listen_failed", "error", err)
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		h.logger.Error("server_shutdown_failed", "error", err)
+		return err
+	}
+	if err := h.svc.Close(); err != nil {
+		h.logger.Error("service_close_failed", "error", err)
+		return err
+	}
+
+	h.logger.Info("server_stopped")
+	return nil
 }
