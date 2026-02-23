@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fs/api"
 	"fs/logging"
 	"fs/metadata"
@@ -8,8 +9,10 @@ import (
 	"fs/storage"
 	"fs/utils"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 )
 
 func main() {
@@ -44,8 +47,16 @@ func main() {
 	objectService := service.NewObjectService(metadataHandler, blobHandler)
 	handler := api.NewHandler(objectService, logger, logConfig)
 	addr := config.Address + ":" + strconv.Itoa(config.Port)
-	if err = handler.Start(addr); err != nil {
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if config.GcEnabled {
+		go objectService.RunGC(ctx, config.GcInterval)
+	}
+
+	if err = handler.Start(ctx, addr); err != nil {
 		logger.Error("server_stopped_with_error", "error", err)
 		return
 	}
+
 }

@@ -126,6 +126,22 @@ func (h *MetadataHandler) DeleteBucket(bucketName string) error {
 		if k, _ := metadataBucket.Cursor().First(); k != nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotEmpty, bucketName)
 		}
+
+		multipartUploadsBucket, err := getMultipartUploadBucket(tx)
+		if err != nil {
+			return err
+		}
+		cursor := multipartUploadsBucket.Cursor()
+		for _, payload := cursor.First(); payload != nil; _, payload = cursor.Next() {
+			upload := models.MultipartUpload{}
+			if err := json.Unmarshal(payload, &upload); err != nil {
+				return err
+			}
+			if upload.Bucket == bucketName && upload.State == "pending" {
+				return fmt.Errorf("%w: %s", ErrBucketNotEmpty, bucketName)
+			}
+		}
+
 		if err := tx.DeleteBucket([]byte(bucketName)); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
 			return fmt.Errorf("error deleting metadata bucket %s: %w", bucketName, err)
 		}
@@ -584,4 +600,73 @@ func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
 		return err
 	}
 	return nil
+}
+
+func (h *MetadataHandler) GetReferencedChunkSet() (map[string]struct{}, error) {
+	chunkSet := make(map[string]struct{})
+
+	err := h.db.View(func(tx *bbolt.Tx) error {
+		systemIndexBucket := tx.Bucket([]byte(systemIndex))
+		if systemIndexBucket == nil {
+			return errors.New("system index not found")
+		}
+		c := systemIndexBucket.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			metadataBucket := tx.Bucket(k)
+			if metadataBucket == nil {
+				continue
+			}
+			err := metadataBucket.ForEach(func(k, v []byte) error {
+				object := models.ObjectManifest{}
+				err := json.Unmarshal(v, &object)
+				if err != nil {
+					return err
+				}
+				for _, chunkID := range object.Chunks {
+					chunkSet[chunkID] = struct{}{}
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		partsBucket := tx.Bucket(multipartUploadPartsIndex)
+		if partsBucket == nil {
+			return errors.New("multipart upload parts index not found")
+		}
+		if err := partsBucket.ForEach(func(_, v []byte) error {
+			part := models.UploadedPart{}
+			if err := json.Unmarshal(v, &part); err != nil {
+				return err
+			}
+			for _, chunkID := range part.Chunks {
+				chunkSet[chunkID] = struct{}{}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return chunkSet, nil
+}
+
+func (h *MetadataHandler) GetReferencedChunks() ([]string, error) {
+	chunkSet, err := h.GetReferencedChunkSet()
+	if err != nil {
+		return nil, err
+	}
+
+	chunks := make([]string, 0, len(chunkSet))
+	for chunkID := range chunkSet {
+		chunks = append(chunks, chunkID)
+	}
+	return chunks, nil
+
 }
