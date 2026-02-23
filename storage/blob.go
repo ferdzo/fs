@@ -87,10 +87,46 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 	}
 
 	fullPath := filepath.Join(dir, chunkID)
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-		if err := os.WriteFile(fullPath, data, 0644); err != nil {
-			return err
+	if _, err := os.Stat(fullPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(dir, chunkID+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
 		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		if _, statErr := os.Stat(fullPath); statErr == nil {
+			return nil
+		}
+		return err
+	}
+	cleanup = false
+
+	if err := syncDir(dir); err != nil {
+		return err
 	}
 	return nil
 }
@@ -115,6 +151,41 @@ func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
 }
 
+func (bs *BlobStore) DeleteBlob(chunkID string) error {
+	if !isValidChunkID(chunkID) {
+		return fmt.Errorf("invalid chunk id: %q", chunkID)
+	}
+	return os.Remove(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+}
+
+func (bs *BlobStore) ListChunks() ([]string, error) {
+	var chunkIDs []string
+	err := bs.ForEachChunk(func(chunkID string) error {
+		chunkIDs = append(chunkIDs, chunkID)
+		return nil
+	})
+	return chunkIDs, err
+}
+
+func (bs *BlobStore) ForEachChunk(fn func(chunkID string) error) error {
+	if fn == nil {
+		return errors.New("chunk callback is required")
+	}
+	return filepath.Walk(filepath.Join(bs.dataRoot, blobRoot), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			chunkID := info.Name()
+			if isValidChunkID(chunkID) {
+				return fn(chunkID)
+			}
+		}
+		return nil
+
+	})
+}
+
 func isValidChunkID(chunkID string) bool {
 	if len(chunkID) != sha256.Size*2 {
 		return false
@@ -125,4 +196,13 @@ func isValidChunkID(chunkID string) bool {
 		}
 	}
 	return true
+}
+
+func syncDir(dirPath string) error {
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
