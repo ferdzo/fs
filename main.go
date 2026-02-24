@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -24,6 +25,7 @@ func main() {
 		"log_format", logConfig.Format,
 		"audit_log", logConfig.Audit,
 		"data_path", config.DataPath,
+		"multipart_retention_hours", int(config.MultipartCleanupRetention/time.Hour),
 	)
 
 	if err := os.MkdirAll(config.DataPath, 0o755); err != nil {
@@ -44,7 +46,7 @@ func main() {
 		return
 	}
 
-	objectService := service.NewObjectService(metadataHandler, blobHandler)
+	objectService := service.NewObjectService(metadataHandler, blobHandler, config.MultipartCleanupRetention)
 	handler := api.NewHandler(objectService, logger, logConfig)
 	addr := config.Address + ":" + strconv.Itoa(config.Port)
 
