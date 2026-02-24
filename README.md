@@ -9,7 +9,7 @@ Bucket operations:
 - `HEAD /{bucket}`
 - `DELETE /{bucket}`
 - `GET /` (list buckets)
-- 
+
 Object operations:
 - `PUT /{bucket}/{key}`
 - `GET /{bucket}/{key}`
