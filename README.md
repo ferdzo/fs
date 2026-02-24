@@ -31,3 +31,7 @@ An experimental Object Storage written in Go that should be partially compatible
 - Not full S3 API coverage.
 - No versioning or lifecycle policies.
 - Error and edge-case behavior is still being refined for client compatibility.
+
+## License
+
+MIT License
