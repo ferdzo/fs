@@ -41,6 +41,16 @@ var (
 		Code:    "MalformedXML",
 		Message: "The XML you provided was not well-formed or did not validate against our published schema.",
 	}
+	s3ErrInvalidArgument = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "InvalidArgument",
+		Message: "Invalid argument.",
+	}
+	s3ErrInvalidRange = s3APIError{
+		Status:  http.StatusRequestedRangeNotSatisfiable,
+		Code:    "InvalidRange",
+		Message: "The requested range is not satisfiable.",
+	}
 	s3ErrEntityTooSmall = s3APIError{
 		Status:  http.StatusBadRequest,
 		Code:    "EntityTooSmall",

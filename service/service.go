@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
@@ -11,12 +12,14 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
 type ObjectService struct {
 	metadata *metadata.MetadataHandler
 	blob     *storage.BlobStore
+	gcMu     sync.RWMutex
 }
 
 var (
@@ -31,6 +34,8 @@ func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *st
 }
 
 func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
 
 	chunks, size, etag, err := s.blob.IngestStream(input)
 	if err != nil {
@@ -62,29 +67,30 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 }
 
 func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.ObjectManifest, error) {
+	s.gcMu.RLock()
+
 	manifest, err := s.metadata.GetManifest(bucket, key)
 	if err != nil {
+		s.gcMu.RUnlock()
 		return nil, nil, err
 	}
 	pr, pw := io.Pipe()
 
 	go func() {
-		defer func(pw *io.PipeWriter) {
-			err := pw.Close()
-			if err != nil {
-
-			}
-		}(pw)
-
-		err := s.blob.AssembleStream(manifest.Chunks, pw)
-		if err != nil {
+		defer s.gcMu.RUnlock()
+		if err := s.blob.AssembleStream(manifest.Chunks, pw); err != nil {
+			_ = pw.CloseWithError(err)
 			return
 		}
+		_ = pw.Close()
 	}()
 	return pr, manifest, nil
 }
 
 func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	manifest, err := s.metadata.GetManifest(bucket, key)
 	if err != nil {
 		return models.ObjectManifest{}, err
@@ -93,39 +99,68 @@ func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, e
 }
 
 func (s *ObjectService) DeleteObject(bucket, key string) error {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
 	return s.metadata.DeleteManifest(bucket, key)
 }
 
 func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	return s.metadata.ListObjects(bucket, prefix)
 }
 
 func (s *ObjectService) CreateBucket(bucket string) error {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
 	return s.metadata.CreateBucket(bucket)
 }
 
 func (s *ObjectService) HeadBucket(bucket string) error {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	_, err := s.metadata.GetBucketManifest(bucket)
 	return err
 }
 
+func (s *ObjectService) GetBucketManifest(bucket string) (*models.BucketManifest, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
+	return s.metadata.GetBucketManifest(bucket)
+}
+
 func (s *ObjectService) DeleteBucket(bucket string) error {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
 	return s.metadata.DeleteBucket(bucket)
 }
 
 func (s *ObjectService) ListBuckets() ([]string, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	return s.metadata.ListBuckets()
 }
 
 func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
 	return s.metadata.DeleteManifests(bucket, keys)
 }
 
 func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
 	return s.metadata.CreateMultipartUpload(bucket, key)
 }
 
 func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int, input io.Reader) (string, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	if partNumber < 1 || partNumber > 10000 {
 		return "", ErrInvalidPart
 	}
@@ -158,6 +193,9 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 }
 
 func (s *ObjectService) ListMultipartParts(bucket, key, uploadID string) ([]models.UploadedPart, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
 		return nil, err
@@ -169,6 +207,9 @@ func (s *ObjectService) ListMultipartParts(bucket, key, uploadID string) ([]mode
 }
 
 func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, completed []models.CompletedPart) (*models.ObjectManifest, error) {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	if len(completed) == 0 {
 		return nil, ErrInvalidCompleteRequest
 	}
@@ -236,6 +277,9 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 }
 
 func (s *ObjectService) AbortMultipartUpload(bucket, key, uploadID string) error {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
 	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
 		return err
@@ -265,4 +309,56 @@ func buildMultipartETag(parts []models.UploadedPart) string {
 
 func (s *ObjectService) Close() error {
 	return s.metadata.Close()
+}
+
+func (s *ObjectService) GarbageCollect() error {
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+
+	referencedChunkSet, err := s.metadata.GetReferencedChunkSet()
+	if err != nil {
+		return err
+	}
+
+	totalChunks := 0
+	deletedChunks := 0
+	deleteErrors := 0
+
+	if err := s.blob.ForEachChunk(func(chunkID string) error {
+		totalChunks++
+		if _, found := referencedChunkSet[chunkID]; found {
+			return nil
+		}
+		if err := s.blob.DeleteBlob(chunkID); err != nil {
+			deleteErrors++
+			slog.Warn("garbage_collect_delete_failed", "chunk_id", chunkID, "error", err)
+			return nil
+		}
+		deletedChunks++
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	slog.Info("garbage_collect_completed",
+		"referenced_chunks", len(referencedChunkSet),
+		"total_chunks", totalChunks,
+		"deleted_chunks", deletedChunks,
+		"delete_errors", deleteErrors,
+	)
+	return nil
+}
+
+func (s *ObjectService) RunGC(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = s.GarbageCollect()
+		}
+	}
 }
