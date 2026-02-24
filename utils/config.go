@@ -11,15 +11,16 @@ import (
 )
 
 type Config struct {
-	DataPath   string
-	Address    string
-	Port       int
-	ChunkSize  int
-	LogLevel   string
-	LogFormat  string
-	AuditLog   bool
-	GcInterval time.Duration
-	GcEnabled  bool
+	DataPath                  string
+	Address                   string
+	Port                      int
+	ChunkSize                 int
+	LogLevel                  string
+	LogFormat                 string
+	AuditLog                  bool
+	GcInterval                time.Duration
+	GcEnabled                 bool
+	MultipartCleanupRetention time.Duration
 }
 
 func NewConfig() *Config {
@@ -33,8 +34,11 @@ func NewConfig() *Config {
 		LogLevel:   strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),
 		LogFormat:  strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_FORMAT")), strings.TrimSpace(os.Getenv("LOG_TYPE")), "text")),
 		AuditLog:   envBool("AUDIT_LOG", true),
-		GcInterval: time.Duration(envIntRange("GC_INTERVAL", 10, -1, 60)) * time.Minute,
+		GcInterval: time.Duration(envIntRange("GC_INTERVAL", 10, 1, 60)) * time.Minute,
 		GcEnabled:  envBool("GC_ENABLED", true),
+		MultipartCleanupRetention: time.Duration(
+			envIntRange("MULTIPART_RETENTION_HOURS", 24, 1, 24*30),
+		) * time.Hour,
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {

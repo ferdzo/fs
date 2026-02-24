@@ -29,6 +29,10 @@ Multi-object delete:
 
 AWS SigV4 streaming payload decoding for uploads (`aws-chunked` request bodies)
 
+Health:
+- `GET /healthz`
+- `HEAD /healthz`
+
 ## Limitations
 
 - No authentication/authorization yet.

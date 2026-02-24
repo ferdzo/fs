@@ -7,6 +7,8 @@ import (
 	"fs/models"
 	"fs/service"
 	"net/http"
+
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 type s3APIError struct {
@@ -20,6 +22,11 @@ var (
 		Status:  http.StatusBadRequest,
 		Code:    "InvalidArgument",
 		Message: "Object key is required.",
+	}
+	s3ErrKeyTooLong = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "KeyTooLongError",
+		Message: "Your key is too long.",
 	}
 	s3ErrNotImplemented = s3APIError{
 		Status:  http.StatusNotImplemented,
@@ -55,6 +62,16 @@ var (
 		Status:  http.StatusBadRequest,
 		Code:    "EntityTooSmall",
 		Message: "Your proposed upload is smaller than the minimum allowed object size.",
+	}
+	s3ErrEntityTooLarge = s3APIError{
+		Status:  http.StatusRequestEntityTooLarge,
+		Code:    "EntityTooLarge",
+		Message: "Your proposed upload exceeds the maximum allowed size.",
+	}
+	s3ErrTooManyDeleteObjects = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "MalformedXML",
+		Message: "The request must contain no more than 1000 object identifiers.",
 	}
 	s3ErrInternal = s3APIError{
 		Status:  http.StatusInternalServerError,
@@ -121,6 +138,13 @@ func mapToS3Error(err error) s3APIError {
 }
 
 func writeS3Error(w http.ResponseWriter, r *http.Request, apiErr s3APIError, resource string) {
+	requestID := ""
+	if r != nil {
+		requestID = middleware.GetReqID(r.Context())
+		if requestID != "" {
+			w.Header().Set("x-amz-request-id", requestID)
+		}
+	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(apiErr.Status)
 
@@ -129,9 +153,10 @@ func writeS3Error(w http.ResponseWriter, r *http.Request, apiErr s3APIError, res
 	}
 
 	payload := models.S3ErrorResponse{
-		Code:     apiErr.Code,
-		Message:  apiErr.Message,
-		Resource: resource,
+		Code:      apiErr.Code,
+		Message:   apiErr.Message,
+		Resource:  resource,
+		RequestID: requestID,
 	}
 
 	out, err := xml.MarshalIndent(payload, "", "    ")
