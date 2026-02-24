@@ -29,6 +29,5 @@ An experimental Object Storage written in Go that should be partially compatible
 
 - No authentication/authorization yet.
 - Not full S3 API coverage.
-- No garbage collection of unreferenced blob chunks yet.
 - No versioning or lifecycle policies.
 - Error and edge-case behavior is still being refined for client compatibility.

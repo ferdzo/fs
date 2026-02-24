@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -10,15 +11,13 @@ import (
 	"fs/metadata"
 	"fs/models"
 	"fs/service"
-	"fs/utils"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/signal"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -99,6 +98,34 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer stream.Close()
+
+	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+	if rangeHeader != "" {
+		start, end, err := parseSingleByteRange(rangeHeader, manifest.Size)
+		if err != nil {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.Size))
+			writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
+			return
+		}
+
+		if start > 0 {
+			if _, err := io.CopyN(io.Discard, stream, start); err != nil {
+				writeMappedS3Error(w, r, err)
+				return
+			}
+		}
+
+		length := end - start + 1
+		w.Header().Set("Content-Type", manifest.ContentType)
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, manifest.Size))
+		w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+		w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.CopyN(w, stream, length)
+		return
+	}
 
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
@@ -418,8 +445,16 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keys := make([]string, 0, len(req.Objects))
+	response := models.DeleteObjectsResult{
+		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+	}
 	for _, obj := range req.Objects {
 		if obj.Key == "" {
+			response.Errors = append(response.Errors, models.DeleteError{
+				Key:     obj.Key,
+				Code:    s3ErrInvalidObjectKey.Code,
+				Message: s3ErrInvalidObjectKey.Message,
+			})
 			continue
 		}
 		keys = append(keys, obj.Key)
@@ -431,9 +466,6 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := models.DeleteObjectsResult{
-		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
-	}
 	if !req.Quiet {
 		response.Deleted = make([]models.DeletedEntry, 0, len(deleted))
 		for _, key := range deleted {
@@ -496,25 +528,47 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	for _, bucket := range buckets {
-		_, err := w.Write([]byte(bucket))
-		if err != nil {
-			return
-		}
+
+	response := models.ListAllMyBucketsResult{
+		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+		Owner: models.BucketsOwner{
+			ID:          "local",
+			DisplayName: "local",
+		},
+		Buckets: models.BucketsElement{
+			Items: make([]models.BucketItem, 0, len(buckets)),
+		},
 	}
+
+	for _, bucket := range buckets {
+		manifest, err := h.svc.GetBucketManifest(bucket)
+		if err != nil {
+			h.logger.Warn("bucket_manifest_read_failed", "bucket", bucket, "error", err)
+			continue
+		}
+		response.Buckets.Items = append(response.Buckets.Items, models.BucketItem{
+			Name:         bucket,
+			CreationDate: manifest.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		})
+	}
+
+	payload, err := xml.MarshalIndent(response, "", "    ")
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(payload)
 }
 
 func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 
 	if r.URL.Query().Get("list-type") == "2" {
-		prefix := r.URL.Query().Get("prefix")
-		if prefix == "" {
-			prefix = ""
-		}
-		h.handleListObjectsV2(w, r, bucket, prefix)
+		h.handleListObjectsV2(w, r, bucket)
 		return
 	}
 	if r.URL.Query().Has("location") {
@@ -534,30 +588,224 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket, prefix string) {
+func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
+	prefix := r.URL.Query().Get("prefix")
+	delimiter := r.URL.Query().Get("delimiter")
+	startAfter := r.URL.Query().Get("start-after")
+	encodingType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("encoding-type")))
+	if encodingType != "" && encodingType != "url" {
+		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+		return
+	}
+
+	maxKeys := 1000
+	if rawMaxKeys := strings.TrimSpace(r.URL.Query().Get("max-keys")); rawMaxKeys != "" {
+		parsed, err := strconv.Atoi(rawMaxKeys)
+		if err != nil || parsed < 0 {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+		if parsed > 1000 {
+			parsed = 1000
+		}
+		maxKeys = parsed
+	}
+
+	continuationToken := strings.TrimSpace(r.URL.Query().Get("continuation-token"))
+	continuationMarker := ""
+	if continuationToken != "" {
+		decoded, err := base64.StdEncoding.DecodeString(continuationToken)
+		if err != nil || len(decoded) == 0 {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+		continuationMarker = string(decoded)
+	}
+
 	objects, err := h.svc.ListObjects(bucket, prefix)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
 		return
 	}
 
-	xmlResponse, err := utils.ConstructXMLResponseForObjectList(bucket, objects)
+	entries := buildListV2Entries(objects, prefix, delimiter)
+	startIdx := 0
+	if continuationMarker != "" {
+		found := false
+		for i, entry := range entries {
+			if entry.Marker == continuationMarker {
+				startIdx = i + 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+	} else if startAfter != "" {
+		for startIdx < len(entries) && entries[startIdx].SortKey <= startAfter {
+			startIdx++
+		}
+	}
+
+	result := models.ListBucketResultV2{
+		Xmlns:             "http://s3.amazonaws.com/doc/2006-03-01/",
+		Name:              bucket,
+		Prefix:            s3EncodeIfNeeded(prefix, encodingType),
+		Delimiter:         s3EncodeIfNeeded(delimiter, encodingType),
+		MaxKeys:           maxKeys,
+		ContinuationToken: continuationToken,
+		StartAfter:        s3EncodeIfNeeded(startAfter, encodingType),
+		EncodingType:      encodingType,
+	}
+
+	endIdx := startIdx
+	for endIdx < len(entries) && result.KeyCount < maxKeys {
+		entry := entries[endIdx]
+		if entry.Object != nil {
+			result.Contents = append(result.Contents, models.Contents{
+				Key:          s3EncodeIfNeeded(entry.Object.Key, encodingType),
+				LastModified: time.Unix(entry.Object.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
+				ETag:         `"` + entry.Object.ETag + `"`,
+				Size:         entry.Object.Size,
+				StorageClass: "STANDARD",
+			})
+		} else {
+			result.CommonPrefixes = append(result.CommonPrefixes, models.CommonPrefixes{
+				Prefix: s3EncodeIfNeeded(entry.CommonPrefix, encodingType),
+			})
+		}
+		result.KeyCount++
+		endIdx++
+	}
+
+	result.IsTruncated = endIdx < len(entries)
+	if result.IsTruncated && result.KeyCount > 0 {
+		result.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(entries[endIdx-1].Marker))
+	}
+
+	xmlResponse, err := xml.MarshalIndent(result, "", "    ")
 	if err != nil {
 		writeMappedS3Error(w, r, err)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(xmlResponse)))
 	w.WriteHeader(http.StatusOK)
-	_, err = w.Write([]byte(xmlResponse))
-	if err != nil {
-		return
-	}
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(xmlResponse)
 
 }
 
-func (h *Handler) Start(address string) error {
+type listV2Entry struct {
+	Marker       string
+	SortKey      string
+	Object       *models.ObjectManifest
+	CommonPrefix string
+}
+
+func buildListV2Entries(objects []*models.ObjectManifest, prefix, delimiter string) []listV2Entry {
+	sorted := make([]*models.ObjectManifest, 0, len(objects))
+	sorted = append(sorted, objects...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Key < sorted[j].Key
+	})
+
+	entries := make([]listV2Entry, 0, len(sorted))
+	seenCommonPrefixes := make(map[string]struct{})
+	for _, object := range sorted {
+		if object == nil {
+			continue
+		}
+		if delimiter != "" {
+			relative := strings.TrimPrefix(object.Key, prefix)
+			if idx := strings.Index(relative, delimiter); idx >= 0 {
+				commonPrefix := prefix + relative[:idx+len(delimiter)]
+				if _, exists := seenCommonPrefixes[commonPrefix]; exists {
+					continue
+				}
+				seenCommonPrefixes[commonPrefix] = struct{}{}
+				entries = append(entries, listV2Entry{
+					Marker:       "C:" + commonPrefix,
+					SortKey:      commonPrefix,
+					CommonPrefix: commonPrefix,
+				})
+				continue
+			}
+		}
+
+		entries = append(entries, listV2Entry{
+			Marker:  "K:" + object.Key,
+			SortKey: object.Key,
+			Object:  object,
+		})
+	}
+	return entries
+}
+
+func s3EncodeIfNeeded(value, encodingType string) string {
+	if encodingType != "url" || value == "" {
+		return value
+	}
+	encoded := url.QueryEscape(value)
+	return strings.ReplaceAll(encoded, "+", "%20")
+}
+
+func parseSingleByteRange(rangeHeader string, size int64) (int64, int64, error) {
+	if size <= 0 || !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, 0, errors.New("invalid range")
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
+	if spec == "" || strings.Contains(spec, ",") {
+		return 0, 0, errors.New("invalid range")
+	}
+
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, errors.New("invalid range")
+	}
+
+	if parts[0] == "" {
+		suffixLength, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || suffixLength <= 0 {
+			return 0, 0, errors.New("invalid range")
+		}
+		if suffixLength > size {
+			suffixLength = size
+		}
+		start := size - suffixLength
+		end := size - 1
+		return start, end, nil
+	}
+
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0, 0, errors.New("invalid range")
+	}
+
+	var end int64
+	if parts[1] == "" {
+		end = size - 1
+	} else {
+		end, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || end < start {
+			return 0, 0, errors.New("invalid range")
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+
+	return start, end, nil
+}
+
+func (h *Handler) Start(ctx context.Context, address string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	h.logger.Info("server_starting",
 		"address", address,
 		"log_format", h.logConfig.Format,
@@ -565,9 +813,7 @@ func (h *Handler) Start(address string) error {
 		"audit_log", h.logConfig.Audit,
 	)
 	h.setupRoutes()
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(stop)
+
 	server := http.Server{
 		Addr:    address,
 		Handler: h.router,
@@ -583,10 +829,13 @@ func (h *Handler) Start(address string) error {
 	}()
 
 	select {
-	case <-stop:
-		h.logger.Info("shutdown_signal_received")
+	case <-ctx.Done():
+		h.logger.Info("shutdown_context_done", "reason", ctx.Err())
 	case err := <-errCh:
 		h.logger.Error("server_listen_failed", "error", err)
+		if closeErr := h.svc.Close(); closeErr != nil {
+			h.logger.Error("service_close_failed", "error", closeErr)
+		}
 		return err
 	}
 

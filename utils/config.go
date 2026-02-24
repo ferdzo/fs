@@ -5,31 +5,36 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	DataPath  string
-	Address   string
-	Port      int
-	ChunkSize int
-	LogLevel  string
-	LogFormat string
-	AuditLog  bool
+	DataPath   string
+	Address    string
+	Port       int
+	ChunkSize  int
+	LogLevel   string
+	LogFormat  string
+	AuditLog   bool
+	GcInterval time.Duration
+	GcEnabled  bool
 }
 
 func NewConfig() *Config {
 	_ = godotenv.Load()
 
 	config := &Config{
-		DataPath:  sanitizeDataPath(os.Getenv("DATA_PATH")),
-		Address:   firstNonEmpty(strings.TrimSpace(os.Getenv("ADDRESS")), "0.0.0.0"),
-		Port:      envIntRange("PORT", 3000, 1, 65535),
-		ChunkSize: envIntRange("CHUNK_SIZE", 8192000, 1, 64*1024*1024),
-		LogLevel:  strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),
-		LogFormat: strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_FORMAT")), strings.TrimSpace(os.Getenv("LOG_TYPE")), "text")),
-		AuditLog:  envBool("AUDIT_LOG", true),
+		DataPath:   sanitizeDataPath(os.Getenv("DATA_PATH")),
+		Address:    firstNonEmpty(strings.TrimSpace(os.Getenv("ADDRESS")), "0.0.0.0"),
+		Port:       envIntRange("PORT", 3000, 1, 65535),
+		ChunkSize:  envIntRange("CHUNK_SIZE", 8192000, 1, 64*1024*1024),
+		LogLevel:   strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),
+		LogFormat:  strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_FORMAT")), strings.TrimSpace(os.Getenv("LOG_TYPE")), "text")),
+		AuditLog:   envBool("AUDIT_LOG", true),
+		GcInterval: time.Duration(envIntRange("GC_INTERVAL", 10, -1, 60)) * time.Minute,
+		GcEnabled:  envBool("GC_ENABLED", true),
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {
