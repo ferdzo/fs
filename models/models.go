@@ -24,6 +24,27 @@ type BucketManifest struct {
 	PublicAccessBlock bool      `json:"public_access_block"`
 }
 
+type ListAllMyBucketsResult struct {
+	XMLName xml.Name       `xml:"ListAllMyBucketsResult"`
+	Xmlns   string         `xml:"xmlns,attr"`
+	Owner   BucketsOwner   `xml:"Owner"`
+	Buckets BucketsElement `xml:"Buckets"`
+}
+
+type BucketsOwner struct {
+	ID          string `xml:"ID"`
+	DisplayName string `xml:"DisplayName,omitempty"`
+}
+
+type BucketsElement struct {
+	Items []BucketItem `xml:"Bucket"`
+}
+
+type BucketItem struct {
+	Name         string `xml:"Name"`
+	CreationDate string `xml:"CreationDate"`
+}
+
 type S3ErrorResponse struct {
 	XMLName   xml.Name `xml:"Error"`
 	Code      string   `xml:"Code"`
@@ -44,6 +65,25 @@ type ListBucketResult struct {
 	IsTruncated bool   `xml:"IsTruncated"`
 
 	Contents       []Contents       `xml:"Contents"`
+	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
+}
+
+type ListBucketResultV2 struct {
+	XMLName xml.Name `xml:"ListBucketResult"`
+	Xmlns   string   `xml:"xmlns,attr"`
+
+	Name                  string `xml:"Name"`
+	Prefix                string `xml:"Prefix"`
+	Delimiter             string `xml:"Delimiter,omitempty"`
+	MaxKeys               int    `xml:"MaxKeys"`
+	KeyCount              int    `xml:"KeyCount"`
+	IsTruncated           bool   `xml:"IsTruncated"`
+	ContinuationToken     string `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string `xml:"NextContinuationToken,omitempty"`
+	StartAfter            string `xml:"StartAfter,omitempty"`
+	EncodingType          string `xml:"EncodingType,omitempty"`
+
+	Contents       []Contents       `xml:"Contents,omitempty"`
 	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
 }
 
@@ -131,8 +171,15 @@ type DeleteObjectsResult struct {
 	XMLName xml.Name       `xml:"DeleteResult"`
 	Xmlns   string         `xml:"xmlns,attr"`
 	Deleted []DeletedEntry `xml:"Deleted,omitempty"`
+	Errors  []DeleteError  `xml:"Error,omitempty"`
 }
 
 type DeletedEntry struct {
 	Key string `xml:"Key"`
+}
+
+type DeleteError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
 }
