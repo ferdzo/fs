@@ -17,9 +17,10 @@ import (
 )
 
 type ObjectService struct {
-	metadata *metadata.MetadataHandler
-	blob     *storage.BlobStore
-	gcMu     sync.RWMutex
+	metadata           *metadata.MetadataHandler
+	blob               *storage.BlobStore
+	multipartRetention time.Duration
+	gcMu               sync.RWMutex
 }
 
 var (
@@ -29,8 +30,15 @@ var (
 	ErrEntityTooSmall         = errors.New("multipart entity too small")
 )
 
-func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *storage.BlobStore) *ObjectService {
-	return &ObjectService{metadata: metadataHandler, blob: blobHandler}
+func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *storage.BlobStore, multipartRetention time.Duration) *ObjectService {
+	if multipartRetention <= 0 {
+		multipartRetention = 24 * time.Hour
+	}
+	return &ObjectService{
+		metadata:           metadataHandler,
+		blob:               blobHandler,
+		multipartRetention: multipartRetention,
+	}
 }
 
 func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
@@ -109,6 +117,13 @@ func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectMani
 	defer s.gcMu.RUnlock()
 
 	return s.metadata.ListObjects(bucket, prefix)
+}
+
+func (s *ObjectService) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
+	s.gcMu.RLock()
+	defer s.gcMu.RUnlock()
+
+	return s.metadata.ForEachObjectFrom(bucket, startKey, fn)
 }
 
 func (s *ObjectService) CreateBucket(bucket string) error {
@@ -323,6 +338,7 @@ func (s *ObjectService) GarbageCollect() error {
 	totalChunks := 0
 	deletedChunks := 0
 	deleteErrors := 0
+	cleanedUploads := 0
 
 	if err := s.blob.ForEachChunk(func(chunkID string) error {
 		totalChunks++
@@ -340,16 +356,27 @@ func (s *ObjectService) GarbageCollect() error {
 		return err
 	}
 
+	cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention)
+	if err != nil {
+		return err
+	}
+
 	slog.Info("garbage_collect_completed",
 		"referenced_chunks", len(referencedChunkSet),
 		"total_chunks", totalChunks,
 		"deleted_chunks", deletedChunks,
 		"delete_errors", deleteErrors,
+		"cleaned_uploads", cleanedUploads,
 	)
 	return nil
 }
 
 func (s *ObjectService) RunGC(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		slog.Warn("garbage_collect_disabled_invalid_interval", "interval", interval.String())
+		return
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
