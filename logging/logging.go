@@ -86,6 +86,10 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			requestID := middleware.GetReqID(r.Context())
+			if requestID != "" {
+				ww.Header().Set("x-amz-request-id", requestID)
+			}
 
 			next.ServeHTTP(ww, r)
 
@@ -105,6 +109,9 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 				"bytes", ww.BytesWritten(),
 				"duration_ms", float64(elapsed.Nanoseconds()) / 1_000_000.0,
 				"remote_addr", r.RemoteAddr,
+			}
+			if requestID != "" {
+				attrs = append(attrs, "request_id", requestID)
 			}
 
 			if cfg.DebugMode {

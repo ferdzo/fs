@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"fs/models"
+	"net"
 	"regexp"
 	"sort"
 	"strings"
@@ -23,7 +24,7 @@ var systemIndex = []byte("__SYSTEM_BUCKETS__")
 var multipartUploadIndex = []byte("__MULTIPART_UPLOADS__")
 var multipartUploadPartsIndex = []byte("__MULTIPART_UPLOAD_PARTS__")
 
-var validBucketName = regexp.MustCompile(`^[a-z0-9.-]{3,63}$`)
+var validBucketName = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
 var (
 	ErrInvalidBucketName   = errors.New("invalid bucket name")
@@ -70,12 +71,36 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	return h, nil
 }
 
+func isValidBucketName(bucketName string) bool {
+	if len(bucketName) < 3 || len(bucketName) > 63 {
+		return false
+	}
+	if !validBucketName.MatchString(bucketName) {
+		return false
+	}
+	if strings.Contains(bucketName, "..") {
+		return false
+	}
+	if bucketName[0] == '.' || bucketName[0] == '-' || bucketName[len(bucketName)-1] == '.' || bucketName[len(bucketName)-1] == '-' {
+		return false
+	}
+	for _, label := range strings.Split(bucketName, ".") {
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+	}
+	if ip := net.ParseIP(bucketName); ip != nil && ip.To4() != nil {
+		return false
+	}
+	return true
+}
+
 func (h *MetadataHandler) Close() error {
 	return h.db.Close()
 }
 
 func (h *MetadataHandler) CreateBucket(bucketName string) error {
-	if !validBucketName.MatchString(bucketName) {
+	if !isValidBucketName(bucketName) {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
 
@@ -107,7 +132,7 @@ func (h *MetadataHandler) CreateBucket(bucketName string) error {
 }
 
 func (h *MetadataHandler) DeleteBucket(bucketName string) error {
-	if !validBucketName.MatchString(bucketName) {
+	if !isValidBucketName(bucketName) {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
 
@@ -288,6 +313,46 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 		return nil, err
 	}
 	return objects, nil
+}
+
+func (h *MetadataHandler) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
+	if fn == nil {
+		return errors.New("object callback is required")
+	}
+
+	return h.db.View(func(tx *bbolt.Tx) error {
+		systemIndexBucket := tx.Bucket([]byte(systemIndex))
+		if systemIndexBucket == nil {
+			return errors.New("system index not found")
+		}
+		if systemIndexBucket.Get([]byte(bucket)) == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
+		}
+
+		metadataBucket := tx.Bucket([]byte(bucket))
+		if metadataBucket == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
+		}
+
+		cursor := metadataBucket.Cursor()
+		var k, v []byte
+		if startKey == "" {
+			k, v = cursor.First()
+		} else {
+			k, v = cursor.Seek([]byte(startKey))
+		}
+
+		for ; k != nil; k, v = cursor.Next() {
+			object := models.ObjectManifest{}
+			if err := json.Unmarshal(v, &object); err != nil {
+				return err
+			}
+			if err := fn(&object); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
@@ -600,6 +665,58 @@ func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
 		return err
 	}
 	return nil
+}
+
+func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+
+	cleaned := 0
+	err := h.db.Update(func(tx *bbolt.Tx) error {
+		uploadsBucket, err := getMultipartUploadBucket(tx)
+		if err != nil {
+			return err
+		}
+
+		now := time.Now().UTC()
+		keysToDelete := make([]string, 0)
+		if err := uploadsBucket.ForEach(func(k, v []byte) error {
+			upload := models.MultipartUpload{}
+			if err := json.Unmarshal(v, &upload); err != nil {
+				return err
+			}
+			if upload.State == "pending" {
+				return nil
+			}
+			createdAt, err := time.Parse(time.RFC3339, upload.CreatedAt)
+			if err != nil {
+				return nil
+			}
+			if now.Sub(createdAt) >= retention {
+				keysToDelete = append(keysToDelete, string(k))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		for _, uploadID := range keysToDelete {
+			if err := uploadsBucket.Delete([]byte(uploadID)); err != nil {
+				return err
+			}
+			if err := deleteMultipartPartsByUploadID(tx, uploadID); err != nil {
+				return err
+			}
+			cleaned++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return cleaned, nil
 }
 
 func (h *MetadataHandler) GetReferencedChunkSet() (map[string]struct{}, error) {
