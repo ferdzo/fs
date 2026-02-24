@@ -33,6 +33,6 @@ An experimental Object Storage written in Go that should be partially compatible
 - No versioning or lifecycle policies.
 - Error and edge-case behavior is still being refined for client compatibility.
 
-# License
+## License
 
 MIT License
