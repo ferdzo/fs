@@ -88,8 +88,13 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-			metrics.Default.IncHTTPInFlight()
-			defer metrics.Default.DecHTTPInFlight()
+			op := metricOperationLabel(r)
+			metrics.Default.IncHTTPInFlightOp(op)
+			metrics.Default.IncWorkerPoolActive()
+			defer func() {
+				metrics.Default.DecHTTPInFlightOp(op)
+				metrics.Default.DecWorkerPoolActive()
+			}()
 			requestID := middleware.GetReqID(r.Context())
 			if requestID != "" {
 				ww.Header().Set("x-amz-request-id", requestID)
@@ -103,7 +108,7 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 				status = http.StatusOK
 			}
 			route := metricRouteLabel(r)
-			metrics.Default.ObserveHTTPRequest(r.Method, route, status, elapsed, ww.BytesWritten())
+			metrics.Default.ObserveHTTPRequestDetailed(r.Method, route, op, status, elapsed, ww.BytesWritten())
 
 			if !cfg.Audit && !cfg.DebugMode {
 				return
@@ -165,6 +170,17 @@ func metricRouteLabel(r *http.Request) string {
 		return "/{bucket}"
 	}
 	return "/{bucket}/*"
+}
+
+func metricOperationLabel(r *http.Request) string {
+	if r == nil {
+		return "other"
+	}
+	isDeletePost := false
+	if r.Method == http.MethodPost && r.URL != nil {
+		_, isDeletePost = r.URL.Query()["delete"]
+	}
+	return metrics.NormalizeHTTPOperation(r.Method, isDeletePost)
 }
 
 func envBool(key string, defaultValue bool) bool {
