@@ -40,7 +40,7 @@ Required when `AUTH_ENABLED=true`:
 - `AUTH_MASTER_KEY` must be base64 for 32 decoded bytes (AES-256 key), e.g. `openssl rand -base64 32`
 - `AUTH_BOOTSTRAP_ACCESS_KEY` and `AUTH_BOOTSTRAP_SECRET_KEY` define initial credentials
 
-Reference: `docs/auth-spec.md`
+Reference: `auth/README.md`
 
 Health:
 - `GET /healthz`
