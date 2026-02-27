@@ -21,6 +21,14 @@ type Config struct {
 	GcInterval                time.Duration
 	GcEnabled                 bool
 	MultipartCleanupRetention time.Duration
+	AuthEnabled               bool
+	AuthRegion                string
+	AuthSkew                  time.Duration
+	AuthMaxPresign            time.Duration
+	AuthMasterKey             string
+	AuthBootstrapAccessKey    string
+	AuthBootstrapSecretKey    string
+	AuthBootstrapPolicy       string
 }
 
 func NewConfig() *Config {
@@ -39,6 +47,14 @@ func NewConfig() *Config {
 		MultipartCleanupRetention: time.Duration(
 			envIntRange("MULTIPART_RETENTION_HOURS", 24, 1, 24*30),
 		) * time.Hour,
+		AuthEnabled:            envBool("AUTH_ENABLED", true),
+		AuthRegion:             firstNonEmpty(strings.TrimSpace(os.Getenv("AUTH_REGION")), "us-east-1"),
+		AuthSkew:               time.Duration(envIntRange("AUTH_SKEW_SECONDS", 300, 30, 3600)) * time.Second,
+		AuthMaxPresign:         time.Duration(envIntRange("AUTH_MAX_PRESIGN_SECONDS", 86400, 60, 86400)) * time.Second,
+		AuthMasterKey:          strings.TrimSpace(os.Getenv("AUTH_MASTER_KEY")),
+		AuthBootstrapAccessKey: strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_ACCESS_KEY")),
+		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_SECRET_KEY")),
+		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_POLICY")),
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {

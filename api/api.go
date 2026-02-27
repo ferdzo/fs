@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"fs/auth"
 	"fs/logging"
 	"fs/metadata"
 	"fs/models"
@@ -30,6 +31,7 @@ type Handler struct {
 	svc       *service.ObjectService
 	logger    *slog.Logger
 	logConfig logging.Config
+	authSvc   *auth.Service
 }
 
 const (
@@ -44,7 +46,7 @@ const (
 	serverMaxConnections          = 1024
 )
 
-func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config) *Handler {
+func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service) *Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -57,12 +59,14 @@ func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig loggi
 		svc:       svc,
 		logger:    logger,
 		logConfig: logConfig,
+		authSvc:   authSvc,
 	}
 	return h
 }
 
 func (h *Handler) setupRoutes() {
 	h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
+	h.router.Use(auth.Middleware(h.authSvc, h.logger, h.logConfig.Audit, writeMappedS3Error))
 
 	h.router.Get("/healthz", h.handleHealth)
 	h.router.Head("/healthz", h.handleHealth)

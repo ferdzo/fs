@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/xml"
 	"errors"
+	"fs/auth"
 	"fs/metadata"
 	"fs/models"
 	"fs/service"
@@ -73,6 +74,41 @@ var (
 		Code:    "MalformedXML",
 		Message: "The request must contain no more than 1000 object identifiers.",
 	}
+	s3ErrAccessDenied = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "AccessDenied",
+		Message: "Access Denied.",
+	}
+	s3ErrInvalidAccessKeyID = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "InvalidAccessKeyId",
+		Message: "The AWS Access Key Id you provided does not exist in our records.",
+	}
+	s3ErrSignatureDoesNotMatch = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "SignatureDoesNotMatch",
+		Message: "The request signature we calculated does not match the signature you provided.",
+	}
+	s3ErrAuthorizationHeaderMalformed = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "AuthorizationHeaderMalformed",
+		Message: "The authorization header is malformed; the region/service/date is wrong or missing.",
+	}
+	s3ErrRequestTimeTooSkewed = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "RequestTimeTooSkewed",
+		Message: "The difference between the request time and the server's time is too large.",
+	}
+	s3ErrExpiredToken = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "ExpiredToken",
+		Message: "The provided token has expired.",
+	}
+	s3ErrInvalidPresign = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "AuthorizationQueryParametersError",
+		Message: "Error parsing the X-Amz-Credential parameter.",
+	}
 	s3ErrInternal = s3APIError{
 		Status:  http.StatusInternalServerError,
 		Code:    "InternalError",
@@ -132,6 +168,26 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrMalformedXML
 	case errors.Is(err, service.ErrEntityTooSmall):
 		return s3ErrEntityTooSmall
+	case errors.Is(err, auth.ErrAccessDenied):
+		return s3ErrAccessDenied
+	case errors.Is(err, auth.ErrInvalidAccessKeyID):
+		return s3ErrInvalidAccessKeyID
+	case errors.Is(err, auth.ErrSignatureDoesNotMatch):
+		return s3ErrSignatureDoesNotMatch
+	case errors.Is(err, auth.ErrAuthorizationHeaderMalformed):
+		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, auth.ErrRequestTimeTooSkewed):
+		return s3ErrRequestTimeTooSkewed
+	case errors.Is(err, auth.ErrExpiredToken):
+		return s3ErrExpiredToken
+	case errors.Is(err, auth.ErrCredentialDisabled):
+		return s3ErrAccessDenied
+	case errors.Is(err, auth.ErrNoAuthCredentials):
+		return s3ErrAccessDenied
+	case errors.Is(err, auth.ErrUnsupportedAuthScheme):
+		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, auth.ErrInvalidPresign):
+		return s3ErrInvalidPresign
 	default:
 		return s3ErrInternal
 	}
