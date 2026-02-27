@@ -29,13 +29,25 @@ Multi-object delete:
 
 AWS SigV4 streaming payload decoding for uploads (`aws-chunked` request bodies)
 
+Authentication:
+- AWS SigV4 request verification (header and presigned URL forms)
+- Local credential/policy store in bbolt
+- Bootstrap access key/secret via environment variables
+
+## Auth Setup
+
+Required when `AUTH_ENABLED=true`:
+- `AUTH_MASTER_KEY` must be base64 for 32 decoded bytes (AES-256 key), e.g. `openssl rand -base64 32`
+- `AUTH_BOOTSTRAP_ACCESS_KEY` and `AUTH_BOOTSTRAP_SECRET_KEY` define initial credentials
+
+Reference: `docs/auth-spec.md`
+
 Health:
 - `GET /healthz`
 - `HEAD /healthz`
 
 ## Limitations
 
-- No authentication/authorization yet.
 - Not full S3 API coverage.
 - No versioning or lifecycle policies.
 - Error and edge-case behavior is still being refined for client compatibility.

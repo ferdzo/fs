@@ -23,17 +23,21 @@ type MetadataHandler struct {
 var systemIndex = []byte("__SYSTEM_BUCKETS__")
 var multipartUploadIndex = []byte("__MULTIPART_UPLOADS__")
 var multipartUploadPartsIndex = []byte("__MULTIPART_UPLOAD_PARTS__")
+var authIdentitiesIndex = []byte("__AUTH_IDENTITIES__")
+var authPoliciesIndex = []byte("__AUTH_POLICIES__")
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
 var (
-	ErrInvalidBucketName   = errors.New("invalid bucket name")
-	ErrBucketAlreadyExists = errors.New("bucket already exists")
-	ErrBucketNotFound      = errors.New("bucket not found")
-	ErrBucketNotEmpty      = errors.New("bucket not empty")
-	ErrObjectNotFound      = errors.New("object not found")
-	ErrMultipartNotFound   = errors.New("multipart upload not found")
-	ErrMultipartNotPending = errors.New("multipart upload is not pending")
+	ErrInvalidBucketName    = errors.New("invalid bucket name")
+	ErrBucketAlreadyExists  = errors.New("bucket already exists")
+	ErrBucketNotFound       = errors.New("bucket not found")
+	ErrBucketNotEmpty       = errors.New("bucket not empty")
+	ErrObjectNotFound       = errors.New("object not found")
+	ErrMultipartNotFound    = errors.New("multipart upload not found")
+	ErrMultipartNotPending  = errors.New("multipart upload is not pending")
+	ErrAuthIdentityNotFound = errors.New("auth identity not found")
+	ErrAuthPolicyNotFound   = errors.New("auth policy not found")
 )
 
 func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
@@ -61,6 +65,22 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	}
 	err = h.db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(multipartUploadPartsIndex)
+		return err
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	err = h.db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(authIdentitiesIndex)
+		return err
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	err = h.db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(authPoliciesIndex)
 		return err
 	})
 	if err != nil {
@@ -97,6 +117,106 @@ func isValidBucketName(bucketName string) bool {
 
 func (h *MetadataHandler) Close() error {
 	return h.db.Close()
+}
+
+func (h *MetadataHandler) PutAuthIdentity(identity *models.AuthIdentity) error {
+	if identity == nil {
+		return errors.New("auth identity is required")
+	}
+	if strings.TrimSpace(identity.AccessKeyID) == "" {
+		return errors.New("access key id is required")
+	}
+	return h.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+		payload, err := json.Marshal(identity)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(identity.AccessKeyID), payload)
+	})
+}
+
+func (h *MetadataHandler) GetAuthIdentity(accessKeyID string) (*models.AuthIdentity, error) {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return nil, errors.New("access key id is required")
+	}
+
+	var identity *models.AuthIdentity
+	err := h.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+		payload := bucket.Get([]byte(accessKeyID))
+		if payload == nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityNotFound, accessKeyID)
+		}
+		record := models.AuthIdentity{}
+		if err := json.Unmarshal(payload, &record); err != nil {
+			return err
+		}
+		identity = &record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
+func (h *MetadataHandler) PutAuthPolicy(policy *models.AuthPolicy) error {
+	if policy == nil {
+		return errors.New("auth policy is required")
+	}
+	principal := strings.TrimSpace(policy.Principal)
+	if principal == "" {
+		return errors.New("auth policy principal is required")
+	}
+	policy.Principal = principal
+	return h.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authPoliciesIndex)
+		if bucket == nil {
+			return errors.New("auth policies index not found")
+		}
+		payload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(principal), payload)
+	})
+}
+
+func (h *MetadataHandler) GetAuthPolicy(accessKeyID string) (*models.AuthPolicy, error) {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return nil, errors.New("access key id is required")
+	}
+
+	var policy *models.AuthPolicy
+	err := h.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authPoliciesIndex)
+		if bucket == nil {
+			return errors.New("auth policies index not found")
+		}
+		payload := bucket.Get([]byte(accessKeyID))
+		if payload == nil {
+			return fmt.Errorf("%w: %s", ErrAuthPolicyNotFound, accessKeyID)
+		}
+		record := models.AuthPolicy{}
+		if err := json.Unmarshal(payload, &record); err != nil {
+			return err
+		}
+		policy = &record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return policy, nil
 }
 
 func (h *MetadataHandler) CreateBucket(bucketName string) error {

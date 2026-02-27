@@ -183,3 +183,26 @@ type DeleteError struct {
 	Code    string `xml:"Code"`
 	Message string `xml:"Message"`
 }
+
+type AuthIdentity struct {
+	AccessKeyID string `json:"access_key_id"`
+	SecretEnc   string `json:"secret_enc"`
+	SecretNonce string `json:"secret_nonce"`
+	EncAlg      string `json:"enc_alg"`
+	KeyVersion  string `json:"key_version"`
+	Status      string `json:"status"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+}
+
+type AuthPolicy struct {
+	Principal  string                `json:"principal"`
+	Statements []AuthPolicyStatement `json:"statements"`
+}
+
+type AuthPolicyStatement struct {
+	Effect  string   `json:"effect"`
+	Actions []string `json:"actions"`
+	Bucket  string   `json:"bucket"`
+	Prefix  string   `json:"prefix"`
+}

@@ -1,0 +1,186 @@
+package auth
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"fs/models"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Store interface {
+	GetAuthIdentity(accessKeyID string) (*models.AuthIdentity, error)
+	PutAuthIdentity(identity *models.AuthIdentity) error
+	GetAuthPolicy(accessKeyID string) (*models.AuthPolicy, error)
+	PutAuthPolicy(policy *models.AuthPolicy) error
+}
+
+type Service struct {
+	cfg       Config
+	store     Store
+	masterKey []byte
+	now       func() time.Time
+}
+
+func NewService(cfg Config, store Store) (*Service, error) {
+	if store == nil {
+		return nil, errors.New("auth store is required")
+	}
+
+	svc := &Service{
+		cfg:   cfg,
+		store: store,
+		now:   func() time.Time { return time.Now().UTC() },
+	}
+	if !cfg.Enabled {
+		return svc, nil
+	}
+
+	if strings.TrimSpace(cfg.MasterKey) == "" {
+		return nil, ErrMasterKeyRequired
+	}
+	masterKey, err := decodeMasterKey(cfg.MasterKey)
+	if err != nil {
+		return nil, err
+	}
+	svc.masterKey = masterKey
+	return svc, nil
+}
+
+func (s *Service) Config() Config {
+	return s.cfg
+}
+
+func (s *Service) EnsureBootstrap() error {
+	if !s.cfg.Enabled {
+		return nil
+	}
+	accessKey := strings.TrimSpace(s.cfg.BootstrapAccessKey)
+	secret := strings.TrimSpace(s.cfg.BootstrapSecretKey)
+	if accessKey == "" || secret == "" {
+		return nil
+	}
+
+	if len(accessKey) < 3 {
+		return errors.New("bootstrap access key must be at least 3 characters")
+	}
+	if len(secret) < 8 {
+		return errors.New("bootstrap secret key must be at least 8 characters")
+	}
+
+	now := s.now().Unix()
+	ciphertext, nonce, err := encryptSecret(s.masterKey, accessKey, secret)
+	if err != nil {
+		return err
+	}
+	identity := &models.AuthIdentity{
+		AccessKeyID: accessKey,
+		SecretEnc:   ciphertext,
+		SecretNonce: nonce,
+		EncAlg:      "AES-256-GCM",
+		KeyVersion:  "v1",
+		Status:      "active",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if existing, err := s.store.GetAuthIdentity(accessKey); err == nil && existing != nil {
+		identity.CreatedAt = existing.CreatedAt
+	}
+	if err := s.store.PutAuthIdentity(identity); err != nil {
+		return err
+	}
+
+	policy := defaultBootstrapPolicy(accessKey)
+	if strings.TrimSpace(s.cfg.BootstrapPolicy) != "" {
+		parsed, err := parsePolicyJSON(s.cfg.BootstrapPolicy)
+		if err != nil {
+			return err
+		}
+		policy = parsed
+		policy.Principal = accessKey
+	}
+	return s.store.PutAuthPolicy(policy)
+}
+
+func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
+	if !s.cfg.Enabled {
+		return RequestContext{Authenticated: false, AuthType: "disabled"}, nil
+	}
+	input, err := parseSigV4(r)
+	if err != nil {
+		return RequestContext{}, err
+	}
+
+	if err := validateSigV4Input(s.now(), s.cfg, input); err != nil {
+		return RequestContext{}, err
+	}
+
+	identity, err := s.store.GetAuthIdentity(input.AccessKeyID)
+	if err != nil {
+		return RequestContext{}, ErrInvalidAccessKeyID
+	}
+	if !strings.EqualFold(identity.Status, "active") {
+		return RequestContext{}, ErrCredentialDisabled
+	}
+
+	secret, err := decryptSecret(s.masterKey, identity.AccessKeyID, identity.SecretEnc, identity.SecretNonce)
+	if err != nil {
+		return RequestContext{}, ErrSignatureDoesNotMatch
+	}
+	ok, err := signatureMatches(secret, r, input)
+	if err != nil {
+		return RequestContext{}, err
+	}
+	if !ok {
+		return RequestContext{}, ErrSignatureDoesNotMatch
+	}
+
+	policy, err := s.store.GetAuthPolicy(identity.AccessKeyID)
+	if err != nil {
+		return RequestContext{}, ErrAccessDenied
+	}
+	target := resolveTarget(r)
+	if target.Action == "" {
+		return RequestContext{}, ErrAccessDenied
+	}
+	if !isAllowed(policy, target) {
+		return RequestContext{}, ErrAccessDenied
+	}
+
+	authType := "sigv4-header"
+	if input.Presigned {
+		authType = "sigv4-presign"
+	}
+	return RequestContext{
+		Authenticated: true,
+		AccessKeyID:   identity.AccessKeyID,
+		AuthType:      authType,
+	}, nil
+}
+
+func parsePolicyJSON(raw string) (*models.AuthPolicy, error) {
+	policy := models.AuthPolicy{}
+	if err := json.Unmarshal([]byte(raw), &policy); err != nil {
+		return nil, fmt.Errorf("invalid bootstrap policy: %w", err)
+	}
+	if len(policy.Statements) == 0 {
+		return nil, errors.New("bootstrap policy must contain at least one statement")
+	}
+	return &policy, nil
+}
+
+func defaultBootstrapPolicy(principal string) *models.AuthPolicy {
+	return &models.AuthPolicy{
+		Principal: principal,
+		Statements: []models.AuthPolicyStatement{
+			{
+				Effect:  "allow",
+				Actions: []string{"s3:*"},
+				Bucket:  "*",
+				Prefix:  "*",
+			},
+		},
+	}
+}
