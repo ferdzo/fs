@@ -298,6 +298,19 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
+		manifest, err := h.svc.HeadObject(bucket, key)
+		if err != nil {
+			if !errors.Is(err, metadata.ErrObjectNotFound) {
+				writeMappedS3Error(w, r, err)
+				return
+			}
+		} else if ifNoneMatchPreconditionFailed(ifNoneMatch, manifest.ETag) {
+			writeS3Error(w, r, s3ErrPreconditionFailed, r.URL.Path)
+			return
+		}
+	}
+
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -426,6 +439,25 @@ func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
 			}
 		}
 	}
+}
+
+func ifNoneMatchPreconditionFailed(headerValue, etag string) bool {
+	for _, rawToken := range strings.Split(headerValue, ",") {
+		token := strings.TrimSpace(rawToken)
+		if token == "" {
+			continue
+		}
+		if token == "*" {
+			return true
+		}
+
+		token = strings.TrimPrefix(token, "W/")
+		token = strings.Trim(token, `"`)
+		if strings.EqualFold(token, etag) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
@@ -670,26 +702,196 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
+	query := r.URL.Query()
 
-	if r.URL.Query().Get("list-type") == "2" {
-		h.handleListObjectsV2(w, r, bucket)
-		return
-	}
-	if r.URL.Query().Has("location") {
+	if query.Has("location") {
 		xmlResponse := `<?xml version="1.0" encoding="UTF-8"?>
 						<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
 		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte(xmlResponse))
-		if err != nil {
-			return
-		}
+		_, _ = w.Write([]byte(xmlResponse))
 		return
 	}
-	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 
+	listType := strings.TrimSpace(query.Get("list-type"))
+	if listType == "2" {
+		h.handleListObjectsV2(w, r, bucket)
+		return
+	}
+	if listType != "" {
+		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+		return
+	}
+
+	if shouldUseListObjectsV1(query) {
+		h.handleListObjectsV1(w, r, bucket)
+		return
+	}
+
+	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+}
+
+func shouldUseListObjectsV1(query url.Values) bool {
+	if len(query) == 0 {
+		return true
+	}
+
+	listingParams := map[string]struct{}{
+		"delimiter":     {},
+		"encoding-type": {},
+		"marker":        {},
+		"max-keys":      {},
+		"prefix":        {},
+	}
+	for key := range query {
+		if _, ok := listingParams[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
+	prefix := r.URL.Query().Get("prefix")
+	delimiter := r.URL.Query().Get("delimiter")
+	marker := r.URL.Query().Get("marker")
+	encodingType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("encoding-type")))
+	if encodingType != "" && encodingType != "url" {
+		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+		return
+	}
+
+	maxKeys := 1000
+	if rawMaxKeys := strings.TrimSpace(r.URL.Query().Get("max-keys")); rawMaxKeys != "" {
+		parsed, err := strconv.Atoi(rawMaxKeys)
+		if err != nil || parsed < 0 {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+		if parsed > 1000 {
+			parsed = 1000
+		}
+		maxKeys = parsed
+	}
+
+	result := models.ListBucketResultV1{
+		Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
+		Name:         bucket,
+		Prefix:       s3EncodeIfNeeded(prefix, encodingType),
+		Marker:       s3EncodeIfNeeded(marker, encodingType),
+		Delimiter:    s3EncodeIfNeeded(delimiter, encodingType),
+		MaxKeys:      maxKeys,
+		EncodingType: encodingType,
+	}
+
+	type pageEntry struct {
+		Object       *models.ObjectManifest
+		CommonPrefix string
+	}
+
+	entries := make([]pageEntry, 0, maxKeys)
+	seenCommonPrefixes := make(map[string]struct{})
+	truncated := false
+	stopErr := errors.New("list_v1_page_complete")
+
+	startKey := prefix
+	if marker != "" && marker > startKey {
+		startKey = marker
+	}
+
+	if maxKeys > 0 {
+		err := h.svc.ForEachObjectFrom(bucket, startKey, func(object *models.ObjectManifest) error {
+			if object == nil {
+				return nil
+			}
+			key := object.Key
+
+			if prefix != "" {
+				if key < prefix {
+					return nil
+				}
+				if !strings.HasPrefix(key, prefix) {
+					return stopErr
+				}
+			}
+			if marker != "" && key <= marker {
+				return nil
+			}
+
+			if delimiter != "" {
+				relative := strings.TrimPrefix(key, prefix)
+				if idx := strings.Index(relative, delimiter); idx >= 0 {
+					commonPrefix := prefix + relative[:idx+len(delimiter)]
+					if marker != "" && commonPrefix <= marker {
+						return nil
+					}
+					if _, exists := seenCommonPrefixes[commonPrefix]; exists {
+						return nil
+					}
+					seenCommonPrefixes[commonPrefix] = struct{}{}
+					if len(entries) >= maxKeys {
+						truncated = true
+						return stopErr
+					}
+					entries = append(entries, pageEntry{
+						CommonPrefix: commonPrefix,
+					})
+					return nil
+				}
+			}
+
+			if len(entries) >= maxKeys {
+				truncated = true
+				return stopErr
+			}
+			entries = append(entries, pageEntry{Object: object})
+			return nil
+		})
+		if err != nil && !errors.Is(err, stopErr) {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+	}
+
+	for _, entry := range entries {
+		if entry.Object != nil {
+			result.Contents = append(result.Contents, models.Contents{
+				Key:          s3EncodeIfNeeded(entry.Object.Key, encodingType),
+				LastModified: time.Unix(entry.Object.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
+				ETag:         `"` + entry.Object.ETag + `"`,
+				Size:         entry.Object.Size,
+				StorageClass: "STANDARD",
+			})
+		} else {
+			result.CommonPrefixes = append(result.CommonPrefixes, models.CommonPrefixes{
+				Prefix: s3EncodeIfNeeded(entry.CommonPrefix, encodingType),
+			})
+		}
+	}
+
+	result.IsTruncated = truncated
+	if result.IsTruncated && result.NextMarker == "" && len(entries) > 0 {
+		last := entries[len(entries)-1]
+		if last.Object != nil {
+			result.NextMarker = s3EncodeIfNeeded(last.Object.Key, encodingType)
+		} else {
+			result.NextMarker = s3EncodeIfNeeded(last.CommonPrefix, encodingType)
+		}
+	}
+
+	xmlResponse, err := xml.MarshalIndent(result, "", "    ")
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(xmlResponse)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(xmlResponse)
 }
 
 func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {

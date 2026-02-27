@@ -68,6 +68,23 @@ type ListBucketResult struct {
 	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
 }
 
+type ListBucketResultV1 struct {
+	XMLName xml.Name `xml:"ListBucketResult"`
+	Xmlns   string   `xml:"xmlns,attr"`
+
+	Name         string `xml:"Name"`
+	Prefix       string `xml:"Prefix"`
+	Marker       string `xml:"Marker,omitempty"`
+	NextMarker   string `xml:"NextMarker,omitempty"`
+	Delimiter    string `xml:"Delimiter,omitempty"`
+	MaxKeys      int    `xml:"MaxKeys"`
+	IsTruncated  bool   `xml:"IsTruncated"`
+	EncodingType string `xml:"EncodingType,omitempty"`
+
+	Contents       []Contents       `xml:"Contents,omitempty"`
+	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
+}
+
 type ListBucketResultV2 struct {
 	XMLName xml.Name `xml:"ListBucketResult"`
 	Xmlns   string   `xml:"xmlns,attr"`
