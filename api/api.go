@@ -10,6 +10,7 @@ import (
 	"fs/auth"
 	"fs/logging"
 	"fs/metadata"
+	"fs/metrics"
 	"fs/models"
 	"fs/service"
 	"io"
@@ -70,6 +71,8 @@ func (h *Handler) setupRoutes() {
 
 	h.router.Get("/healthz", h.handleHealth)
 	h.router.Head("/healthz", h.handleHealth)
+	h.router.Get("/metrics", h.handleMetrics)
+	h.router.Head("/metrics", h.handleMetrics)
 	h.router.Get("/", h.handleGetBuckets)
 
 	h.router.Get("/{bucket}/", h.handleGetBucket)
@@ -104,6 +107,17 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodHead {
 		_, _ = w.Write([]byte("ok"))
 	}
+}
+
+func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	payload := metrics.Default.RenderPrometheus()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte(payload))
 }
 
 func validateObjectKey(key string) *s3APIError {

@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"errors"
+	"fs/metrics"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,17 +20,20 @@ func Middleware(
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authCtx := RequestContext{Authenticated: false, AuthType: "none"}
 			if svc == nil || !svc.Config().Enabled {
+				metrics.Default.ObserveAuth("bypass", "disabled", "auth_disabled")
 				next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), authCtx)))
 				return
 			}
 
-			if r.URL.Path == "/healthz" {
+			if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+				metrics.Default.ObserveAuth("bypass", "none", "public_endpoint")
 				next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), authCtx)))
 				return
 			}
 
 			resolvedCtx, err := svc.AuthenticateRequest(r)
 			if err != nil {
+				metrics.Default.ObserveAuth("error", "sigv4", authErrorClass(err))
 				if auditEnabled && logger != nil {
 					requestID := middleware.GetReqID(r.Context())
 					attrs := []any{
@@ -50,6 +55,7 @@ func Middleware(
 				return
 			}
 
+			metrics.Default.ObserveAuth("ok", resolvedCtx.AuthType, "none")
 			if auditEnabled && logger != nil {
 				requestID := middleware.GetReqID(r.Context())
 				attrs := []any{
@@ -66,6 +72,33 @@ func Middleware(
 			}
 			next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), resolvedCtx)))
 		})
+	}
+}
+
+func authErrorClass(err error) string {
+	switch {
+	case errors.Is(err, ErrInvalidAccessKeyID):
+		return "invalid_access_key"
+	case errors.Is(err, ErrSignatureDoesNotMatch):
+		return "signature_mismatch"
+	case errors.Is(err, ErrAuthorizationHeaderMalformed):
+		return "auth_header_malformed"
+	case errors.Is(err, ErrRequestTimeTooSkewed):
+		return "time_skew"
+	case errors.Is(err, ErrExpiredToken):
+		return "expired_token"
+	case errors.Is(err, ErrNoAuthCredentials):
+		return "missing_credentials"
+	case errors.Is(err, ErrUnsupportedAuthScheme):
+		return "unsupported_auth_scheme"
+	case errors.Is(err, ErrInvalidPresign):
+		return "invalid_presign"
+	case errors.Is(err, ErrCredentialDisabled):
+		return "credential_disabled"
+	case errors.Is(err, ErrAccessDenied):
+		return "access_denied"
+	default:
+		return "other"
 	}
 }
 

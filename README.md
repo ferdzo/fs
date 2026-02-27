@@ -45,6 +45,8 @@ Reference: `auth/README.md`
 Health:
 - `GET /healthz`
 - `HEAD /healthz`
+- `GET /metrics` (Prometheus exposition format)
+- `HEAD /metrics`
 
 ## Limitations
 
