@@ -59,6 +59,11 @@ var (
 		Code:    "InvalidRange",
 		Message: "The requested range is not satisfiable.",
 	}
+	s3ErrPreconditionFailed = s3APIError{
+		Status:  http.StatusPreconditionFailed,
+		Code:    "PreconditionFailed",
+		Message: "At least one of the pre-conditions you specified did not hold.",
+	}
 	s3ErrEntityTooSmall = s3APIError{
 		Status:  http.StatusBadRequest,
 		Code:    "EntityTooSmall",
