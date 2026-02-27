@@ -42,6 +42,28 @@ func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *st
 	}
 }
 
+func (s *ObjectService) acquireGCRLock() func() {
+	waitStart := time.Now()
+	s.gcMu.RLock()
+	metrics.Default.ObserveLockWait("gc_mu_read", time.Since(waitStart))
+	holdStart := time.Now()
+	return func() {
+		metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
+		s.gcMu.RUnlock()
+	}
+}
+
+func (s *ObjectService) acquireGCLock() func() {
+	waitStart := time.Now()
+	s.gcMu.Lock()
+	metrics.Default.ObserveLockWait("gc_mu_write", time.Since(waitStart))
+	holdStart := time.Now()
+	return func() {
+		metrics.Default.ObserveLockHold("gc_mu_write", time.Since(holdStart))
+		s.gcMu.Unlock()
+	}
+}
+
 func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
 	start := time.Now()
 	success := false
@@ -49,8 +71,8 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		metrics.Default.ObserveService("put_object", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	chunks, size, etag, err := s.blob.IngestStream(input)
 	if err != nil {
@@ -89,16 +111,21 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 		metrics.Default.ObserveService("get_object", time.Since(start), success)
 	}()
 
+	waitStart := time.Now()
 	s.gcMu.RLock()
+	metrics.Default.ObserveLockWait("gc_mu_read", time.Since(waitStart))
+	holdStart := time.Now()
 
 	manifest, err := s.metadata.GetManifest(bucket, key)
 	if err != nil {
+		metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
 		s.gcMu.RUnlock()
 		return nil, nil, err
 	}
 	pr, pw := io.Pipe()
 
 	go func() {
+		defer metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
 		defer s.gcMu.RUnlock()
 		if err := s.blob.AssembleStream(manifest.Chunks, pw); err != nil {
 			_ = pw.CloseWithError(err)
@@ -117,8 +144,8 @@ func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, e
 		metrics.Default.ObserveService("head_object", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	manifest, err := s.metadata.GetManifest(bucket, key)
 	if err != nil {
@@ -135,16 +162,16 @@ func (s *ObjectService) DeleteObject(bucket, key string) error {
 		metrics.Default.ObserveService("delete_object", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 	err := s.metadata.DeleteManifest(bucket, key)
 	success = err == nil
 	return err
 }
 
 func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error) {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	return s.metadata.ListObjects(bucket, prefix)
 }
@@ -156,8 +183,8 @@ func (s *ObjectService) ForEachObjectFrom(bucket, startKey string, fn func(*mode
 		metrics.Default.ObserveService("for_each_object_from", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	err := s.metadata.ForEachObjectFrom(bucket, startKey, fn)
 	success = err == nil
@@ -171,31 +198,31 @@ func (s *ObjectService) CreateBucket(bucket string) error {
 		metrics.Default.ObserveService("create_bucket", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 	err := s.metadata.CreateBucket(bucket)
 	success = err == nil
 	return err
 }
 
 func (s *ObjectService) HeadBucket(bucket string) error {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	_, err := s.metadata.GetBucketManifest(bucket)
 	return err
 }
 
 func (s *ObjectService) GetBucketManifest(bucket string) (*models.BucketManifest, error) {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	return s.metadata.GetBucketManifest(bucket)
 }
 
 func (s *ObjectService) DeleteBucket(bucket string) error {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 	return s.metadata.DeleteBucket(bucket)
 }
 
@@ -206,8 +233,8 @@ func (s *ObjectService) ListBuckets() ([]string, error) {
 		metrics.Default.ObserveService("list_buckets", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	buckets, err := s.metadata.ListBuckets()
 	success = err == nil
@@ -215,14 +242,14 @@ func (s *ObjectService) ListBuckets() ([]string, error) {
 }
 
 func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, error) {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 	return s.metadata.DeleteManifests(bucket, keys)
 }
 
 func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 	return s.metadata.CreateMultipartUpload(bucket, key)
 }
 
@@ -233,8 +260,8 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 		metrics.Default.ObserveService("upload_part", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	if partNumber < 1 || partNumber > 10000 {
 		return "", ErrInvalidPart
@@ -269,8 +296,8 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 }
 
 func (s *ObjectService) ListMultipartParts(bucket, key, uploadID string) ([]models.UploadedPart, error) {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
@@ -289,8 +316,8 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		metrics.Default.ObserveService("complete_multipart_upload", time.Since(start), success)
 	}()
 
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	if len(completed) == 0 {
 		return nil, ErrInvalidCompleteRequest
@@ -360,8 +387,8 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 }
 
 func (s *ObjectService) AbortMultipartUpload(bucket, key, uploadID string) error {
-	s.gcMu.RLock()
-	defer s.gcMu.RUnlock()
+	unlock := s.acquireGCRLock()
+	defer unlock()
 
 	upload, err := s.metadata.GetMultipartUpload(uploadID)
 	if err != nil {
@@ -404,8 +431,8 @@ func (s *ObjectService) GarbageCollect() error {
 		metrics.Default.ObserveGC(time.Since(start), deletedChunks, deleteErrors, cleanedUploads, success)
 	}()
 
-	s.gcMu.Lock()
-	defer s.gcMu.Unlock()
+	unlock := s.acquireGCLock()
+	defer unlock()
 
 	referencedChunkSet, err := s.metadata.GetReferencedChunkSet()
 	if err != nil {

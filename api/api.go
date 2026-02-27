@@ -236,6 +236,7 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 			writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
 			return
 		}
+		metrics.Default.ObserveBatchSize(len(req.Parts))
 
 		manifest, err := h.svc.CompleteMultipartUpload(bucket, key, uploadID, req.Parts)
 		if err != nil {
@@ -311,6 +312,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	metrics.Default.ObserveBatchSize(1)
 
 	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
 		manifest, err := h.svc.HeadObject(bucket, key)
@@ -523,6 +525,7 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, r, s3ErrTooManyDeleteObjects, r.URL.Path)
 		return
 	}
+	metrics.Default.ObserveBatchSize(len(req.Objects))
 
 	keys := make([]string, 0, len(req.Objects))
 	response := models.DeleteObjectsResult{
@@ -641,6 +644,8 @@ func newLimitedListener(inner net.Listener, maxConns int) net.Listener {
 	if maxConns <= 0 {
 		return inner
 	}
+	metrics.Default.SetConnectionPoolMax(maxConns)
+	metrics.Default.SetWorkerPoolSize(maxConns)
 	return &limitedListener{
 		Listener: inner,
 		slots:    make(chan struct{}, maxConns),
@@ -648,15 +653,27 @@ func newLimitedListener(inner net.Listener, maxConns int) net.Listener {
 }
 
 func (l *limitedListener) Accept() (net.Conn, error) {
-	l.slots <- struct{}{}
+	select {
+	case l.slots <- struct{}{}:
+	default:
+		metrics.Default.IncConnectionPoolWait()
+		metrics.Default.IncRequestQueueLength()
+		l.slots <- struct{}{}
+		metrics.Default.DecRequestQueueLength()
+	}
+	metrics.Default.IncConnectionPoolActive()
 	conn, err := l.Listener.Accept()
 	if err != nil {
 		<-l.slots
+		metrics.Default.DecConnectionPoolActive()
 		return nil, err
 	}
 	return &limitedConn{
 		Conn: conn,
-		done: func() { <-l.slots },
+		done: func() {
+			<-l.slots
+			metrics.Default.DecConnectionPoolActive()
+		},
 	}, nil
 }
 
