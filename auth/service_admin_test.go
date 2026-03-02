@@ -138,6 +138,60 @@ func TestDeleteBootstrapUserRejected(t *testing.T) {
 	}
 }
 
+func TestSetUserPolicy(t *testing.T) {
+	_, svc := newTestAuthService(t)
+
+	_, err := svc.CreateUser(CreateUserInput{
+		AccessKeyID: "policy-user",
+		SecretKey:   "super-secret-1",
+		Policy: models.AuthPolicy{
+			Statements: []models.AuthPolicyStatement{
+				{Effect: "allow", Actions: []string{"s3:GetObject"}, Bucket: "b1", Prefix: "*"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateUser returned error: %v", err)
+	}
+
+	updated, err := svc.SetUserPolicy("policy-user", models.AuthPolicy{
+		Statements: []models.AuthPolicyStatement{
+			{Effect: "allow", Actions: []string{"s3:PutObject"}, Bucket: "b2", Prefix: "p/"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SetUserPolicy returned error: %v", err)
+	}
+	if len(updated.Policy.Statements) != 1 || updated.Policy.Statements[0].Actions[0] != "s3:PutObject" {
+		t.Fatalf("SetUserPolicy did not apply new policy: %+v", updated.Policy)
+	}
+}
+
+func TestSetUserStatus(t *testing.T) {
+	_, svc := newTestAuthService(t)
+
+	_, err := svc.CreateUser(CreateUserInput{
+		AccessKeyID: "status-user",
+		SecretKey:   "super-secret-1",
+		Policy: models.AuthPolicy{
+			Statements: []models.AuthPolicyStatement{
+				{Effect: "allow", Actions: []string{"s3:*"}, Bucket: "*", Prefix: "*"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateUser returned error: %v", err)
+	}
+
+	updated, err := svc.SetUserStatus("status-user", "disabled")
+	if err != nil {
+		t.Fatalf("SetUserStatus returned error: %v", err)
+	}
+	if updated.Status != "disabled" {
+		t.Fatalf("SetUserStatus status = %q, want disabled", updated.Status)
+	}
+}
+
 func newTestAuthService(t *testing.T) (*metadata.MetadataHandler, *Service) {
 	t.Helper()
 

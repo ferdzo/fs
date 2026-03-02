@@ -375,6 +375,93 @@ func (s *Service) DeleteUser(accessKeyID string) error {
 	return nil
 }
 
+func (s *Service) SetUserPolicy(accessKeyID string, policy models.AuthPolicy) (*UserDetails, error) {
+	if !s.cfg.Enabled {
+		return nil, ErrAuthNotEnabled
+	}
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if !validAccessKeyID.MatchString(accessKeyID) {
+		return nil, fmt.Errorf("%w: invalid access key id", ErrInvalidUserInput)
+	}
+
+	identity, err := s.store.GetAuthIdentity(accessKeyID)
+	if err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	normalizedPolicy, err := normalizePolicy(policy, accessKeyID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.PutAuthPolicy(&normalizedPolicy); err != nil {
+		return nil, err
+	}
+
+	identity.UpdatedAt = s.now().Unix()
+	if err := s.store.PutAuthIdentity(identity); err != nil {
+		return nil, err
+	}
+
+	return &UserDetails{
+		AccessKeyID: identity.AccessKeyID,
+		Status:      normalizeUserStatus(identity.Status),
+		CreatedAt:   identity.CreatedAt,
+		UpdatedAt:   identity.UpdatedAt,
+		Policy:      normalizedPolicy,
+	}, nil
+}
+
+func (s *Service) SetUserStatus(accessKeyID, status string) (*UserDetails, error) {
+	if !s.cfg.Enabled {
+		return nil, ErrAuthNotEnabled
+	}
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if !validAccessKeyID.MatchString(accessKeyID) {
+		return nil, fmt.Errorf("%w: invalid access key id", ErrInvalidUserInput)
+	}
+
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return nil, fmt.Errorf("%w: status is required", ErrInvalidUserInput)
+	}
+	normalizedStatus := normalizeUserStatus(status)
+	if normalizedStatus == "" {
+		return nil, fmt.Errorf("%w: status must be active or disabled", ErrInvalidUserInput)
+	}
+
+	identity, err := s.store.GetAuthIdentity(accessKeyID)
+	if err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	identity.Status = normalizedStatus
+	identity.UpdatedAt = s.now().Unix()
+	if err := s.store.PutAuthIdentity(identity); err != nil {
+		return nil, err
+	}
+
+	policy, err := s.store.GetAuthPolicy(accessKeyID)
+	if err != nil {
+		if errors.Is(err, metadata.ErrAuthPolicyNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	return &UserDetails{
+		AccessKeyID: identity.AccessKeyID,
+		Status:      normalizeUserStatus(identity.Status),
+		CreatedAt:   identity.CreatedAt,
+		UpdatedAt:   identity.UpdatedAt,
+		Policy:      *policy,
+	}, nil
+}
+
 func parsePolicyJSON(raw string) (*models.AuthPolicy, error) {
 	policy := models.AuthPolicy{}
 	if err := json.Unmarshal([]byte(raw), &policy); err != nil {

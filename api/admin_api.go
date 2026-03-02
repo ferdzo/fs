@@ -33,6 +33,14 @@ type adminCreateUserRequest struct {
 	Policy      models.AuthPolicy `json:"policy"`
 }
 
+type adminSetPolicyRequest struct {
+	Policy models.AuthPolicy `json:"policy"`
+}
+
+type adminSetStatusRequest struct {
+	Status string `json:"status"`
+}
+
 type adminUserListItem struct {
 	AccessKeyID string `json:"accessKeyId"`
 	Status      string `json:"status"`
@@ -59,6 +67,8 @@ func (h *Handler) registerAdminRoutes() {
 		r.Post("/users", h.handleAdminCreateUser)
 		r.Get("/users", h.handleAdminListUsers)
 		r.Get("/users/{accessKeyId}", h.handleAdminGetUser)
+		r.Put("/users/{accessKeyId}/policy", h.handleAdminSetUserPolicy)
+		r.Put("/users/{accessKeyId}/status", h.handleAdminSetUserStatus)
 		r.Delete("/users/{accessKeyId}", h.handleAdminDeleteUser)
 	})
 }
@@ -166,6 +176,60 @@ func (h *Handler) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handleAdminSetUserPolicy(w http.ResponseWriter, r *http.Request) {
+	if !h.requireBootstrapAdmin(w, r) {
+		return
+	}
+
+	accessKeyID := chi.URLParam(r, "accessKeyId")
+	var req adminSetPolicyRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		writeAdminError(w, r, http.StatusBadRequest, "InvalidRequest", err.Error())
+		return
+	}
+
+	user, err := h.authSvc.SetUserPolicy(accessKeyID, req.Policy)
+	if err != nil {
+		writeMappedAdminError(w, r, err)
+		return
+	}
+	resp := adminUserResponse{
+		AccessKeyID: user.AccessKeyID,
+		Status:      user.Status,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Policy:      &user.Policy,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) handleAdminSetUserStatus(w http.ResponseWriter, r *http.Request) {
+	if !h.requireBootstrapAdmin(w, r) {
+		return
+	}
+
+	accessKeyID := chi.URLParam(r, "accessKeyId")
+	var req adminSetStatusRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		writeAdminError(w, r, http.StatusBadRequest, "InvalidRequest", err.Error())
+		return
+	}
+
+	user, err := h.authSvc.SetUserStatus(accessKeyID, req.Status)
+	if err != nil {
+		writeMappedAdminError(w, r, err)
+		return
+	}
+	resp := adminUserResponse{
+		AccessKeyID: user.AccessKeyID,
+		Status:      user.Status,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Policy:      &user.Policy,
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) requireBootstrapAdmin(w http.ResponseWriter, r *http.Request) bool {
