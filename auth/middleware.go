@@ -25,7 +25,7 @@ func Middleware(
 				return
 			}
 
-			if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+			if r.URL.Path == "/healthz" {
 				metrics.Default.ObserveAuth("bypass", "none", "public_endpoint")
 				next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), authCtx)))
 				return

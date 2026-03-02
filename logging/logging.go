@@ -90,10 +90,8 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			op := metricOperationLabel(r)
 			metrics.Default.IncHTTPInFlightOp(op)
-			metrics.Default.IncWorkerPoolActive()
 			defer func() {
 				metrics.Default.DecHTTPInFlightOp(op)
-				metrics.Default.DecWorkerPoolActive()
 			}()
 			requestID := middleware.GetReqID(r.Context())
 			if requestID != "" {
