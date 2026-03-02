@@ -29,6 +29,7 @@ type Config struct {
 	AuthBootstrapAccessKey    string
 	AuthBootstrapSecretKey    string
 	AuthBootstrapPolicy       string
+	AdminAPIEnabled           bool
 }
 
 func NewConfig() *Config {
@@ -55,6 +56,7 @@ func NewConfig() *Config {
 		AuthBootstrapAccessKey: strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_ACCESS_KEY")),
 		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_SECRET_KEY")),
 		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_POLICY")),
+		AdminAPIEnabled:        envBool("ADMIN_API_ENABLED", true),
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {

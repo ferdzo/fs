@@ -39,6 +39,7 @@ func main() {
 		"multipart_retention_hours", int(config.MultipartCleanupRetention/time.Hour),
 		"auth_enabled", authConfig.Enabled,
 		"auth_region", authConfig.Region,
+		"admin_api_enabled", config.AdminAPIEnabled,
 	)
 
 	if err := os.MkdirAll(config.DataPath, 0o755); err != nil {
@@ -72,7 +73,7 @@ func main() {
 		return
 	}
 
-	handler := api.NewHandler(objectService, logger, logConfig, authService)
+	handler := api.NewHandler(objectService, logger, logConfig, authService, config.AdminAPIEnabled)
 	addr := config.Address + ":" + strconv.Itoa(config.Port)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
