@@ -1,11 +1,15 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"fs/metadata"
 	"fs/models"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -13,9 +17,39 @@ import (
 type Store interface {
 	GetAuthIdentity(accessKeyID string) (*models.AuthIdentity, error)
 	PutAuthIdentity(identity *models.AuthIdentity) error
+	ListAuthIdentities(limit int, after string) ([]models.AuthIdentity, string, error)
 	GetAuthPolicy(accessKeyID string) (*models.AuthPolicy, error)
 	PutAuthPolicy(policy *models.AuthPolicy) error
 }
+
+type CreateUserInput struct {
+	AccessKeyID string
+	SecretKey   string
+	Status      string
+	Policy      models.AuthPolicy
+}
+
+type UserSummary struct {
+	AccessKeyID string
+	Status      string
+	CreatedAt   int64
+	UpdatedAt   int64
+}
+
+type UserDetails struct {
+	AccessKeyID string
+	Status      string
+	CreatedAt   int64
+	UpdatedAt   int64
+	Policy      models.AuthPolicy
+}
+
+type CreateUserResult struct {
+	UserDetails
+	SecretKey string
+}
+
+var validAccessKeyID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$`)
 
 type Service struct {
 	cfg       Config
@@ -160,6 +194,140 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	}, nil
 }
 
+func (s *Service) CreateUser(input CreateUserInput) (*CreateUserResult, error) {
+	if !s.cfg.Enabled {
+		return nil, ErrAuthNotEnabled
+	}
+
+	accessKeyID := strings.TrimSpace(input.AccessKeyID)
+	if !validAccessKeyID.MatchString(accessKeyID) {
+		return nil, fmt.Errorf("%w: invalid access key id", ErrInvalidUserInput)
+	}
+
+	secretKey := strings.TrimSpace(input.SecretKey)
+	if secretKey == "" {
+		generated, err := generateSecretKey(32)
+		if err != nil {
+			return nil, err
+		}
+		secretKey = generated
+	}
+	if len(secretKey) < 8 {
+		return nil, fmt.Errorf("%w: secret key must be at least 8 characters", ErrInvalidUserInput)
+	}
+
+	status := normalizeUserStatus(input.Status)
+	if status == "" {
+		return nil, fmt.Errorf("%w: status must be active or disabled", ErrInvalidUserInput)
+	}
+
+	policy, err := normalizePolicy(input.Policy, accessKeyID)
+	if err != nil {
+		return nil, err
+	}
+
+	existing, err := s.store.GetAuthIdentity(accessKeyID)
+	if err == nil && existing != nil {
+		return nil, ErrUserAlreadyExists
+	}
+	if err != nil && !errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+		return nil, err
+	}
+
+	now := s.now().Unix()
+	ciphertext, nonce, err := encryptSecret(s.masterKey, accessKeyID, secretKey)
+	if err != nil {
+		return nil, err
+	}
+	identity := &models.AuthIdentity{
+		AccessKeyID: accessKeyID,
+		SecretEnc:   ciphertext,
+		SecretNonce: nonce,
+		EncAlg:      "AES-256-GCM",
+		KeyVersion:  "v1",
+		Status:      status,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.store.PutAuthIdentity(identity); err != nil {
+		return nil, err
+	}
+	if err := s.store.PutAuthPolicy(&policy); err != nil {
+		return nil, err
+	}
+
+	return &CreateUserResult{
+		UserDetails: UserDetails{
+			AccessKeyID: accessKeyID,
+			Status:      status,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Policy:      policy,
+		},
+		SecretKey: secretKey,
+	}, nil
+}
+
+func (s *Service) ListUsers(limit int, cursor string) ([]UserSummary, string, error) {
+	if !s.cfg.Enabled {
+		return nil, "", ErrAuthNotEnabled
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	identities, nextCursor, err := s.store.ListAuthIdentities(limit, cursor)
+	if err != nil {
+		return nil, "", err
+	}
+	users := make([]UserSummary, 0, len(identities))
+	for _, identity := range identities {
+		users = append(users, UserSummary{
+			AccessKeyID: identity.AccessKeyID,
+			Status:      normalizeUserStatus(identity.Status),
+			CreatedAt:   identity.CreatedAt,
+			UpdatedAt:   identity.UpdatedAt,
+		})
+	}
+	return users, nextCursor, nil
+}
+
+func (s *Service) GetUser(accessKeyID string) (*UserDetails, error) {
+	if !s.cfg.Enabled {
+		return nil, ErrAuthNotEnabled
+	}
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return nil, fmt.Errorf("%w: access key id is required", ErrInvalidUserInput)
+	}
+
+	identity, err := s.store.GetAuthIdentity(accessKeyID)
+	if err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	policy, err := s.store.GetAuthPolicy(accessKeyID)
+	if err != nil {
+		if errors.Is(err, metadata.ErrAuthPolicyNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	return &UserDetails{
+		AccessKeyID: identity.AccessKeyID,
+		Status:      normalizeUserStatus(identity.Status),
+		CreatedAt:   identity.CreatedAt,
+		UpdatedAt:   identity.UpdatedAt,
+		Policy:      *policy,
+	}, nil
+}
+
 func parsePolicyJSON(raw string) (*models.AuthPolicy, error) {
 	policy := models.AuthPolicy{}
 	if err := json.Unmarshal([]byte(raw), &policy); err != nil {
@@ -183,4 +351,72 @@ func defaultBootstrapPolicy(principal string) *models.AuthPolicy {
 			},
 		},
 	}
+}
+
+func generateSecretKey(length int) (string, error) {
+	if length <= 0 {
+		length = 32
+	}
+	buf := make([]byte, length)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func normalizeUserStatus(raw string) string {
+	status := strings.ToLower(strings.TrimSpace(raw))
+	if status == "" {
+		return "active"
+	}
+	if status != "active" && status != "disabled" {
+		return ""
+	}
+	return status
+}
+
+func normalizePolicy(policy models.AuthPolicy, principal string) (models.AuthPolicy, error) {
+	if len(policy.Statements) == 0 {
+		return models.AuthPolicy{}, fmt.Errorf("%w: at least one policy statement is required", ErrInvalidUserInput)
+	}
+
+	out := models.AuthPolicy{
+		Principal:  principal,
+		Statements: make([]models.AuthPolicyStatement, 0, len(policy.Statements)),
+	}
+	for _, stmt := range policy.Statements {
+		effect := strings.ToLower(strings.TrimSpace(stmt.Effect))
+		if effect != "allow" && effect != "deny" {
+			return models.AuthPolicy{}, fmt.Errorf("%w: invalid policy effect %q", ErrInvalidUserInput, stmt.Effect)
+		}
+
+		actions := make([]string, 0, len(stmt.Actions))
+		for _, action := range stmt.Actions {
+			action = strings.TrimSpace(action)
+			if action == "" {
+				continue
+			}
+			actions = append(actions, action)
+		}
+		if len(actions) == 0 {
+			return models.AuthPolicy{}, fmt.Errorf("%w: policy statement must include at least one action", ErrInvalidUserInput)
+		}
+
+		bucket := strings.TrimSpace(stmt.Bucket)
+		if bucket == "" {
+			bucket = "*"
+		}
+		prefix := strings.TrimSpace(stmt.Prefix)
+		if prefix == "" {
+			prefix = "*"
+		}
+
+		out.Statements = append(out.Statements, models.AuthPolicyStatement{
+			Effect:  effect,
+			Actions: actions,
+			Bucket:  bucket,
+			Prefix:  prefix,
+		})
+	}
+	return out, nil
 }
