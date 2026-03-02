@@ -98,9 +98,6 @@ func (h *Handler) setupRoutes() {
 	h.router.Delete("/{bucket}/*", h.handleDeleteObject)
 }
 
-func (h *Handler) registerAdminRoutes() {
-}
-
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.svc.ListBuckets(); err != nil {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
