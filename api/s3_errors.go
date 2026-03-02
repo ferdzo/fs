@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fs/auth"
 	"fs/metadata"
+	"fs/metrics"
 	"fs/models"
 	"fs/service"
 	"net/http"
@@ -200,12 +201,19 @@ func mapToS3Error(err error) s3APIError {
 
 func writeS3Error(w http.ResponseWriter, r *http.Request, apiErr s3APIError, resource string) {
 	requestID := ""
+	op := "other"
 	if r != nil {
 		requestID = middleware.GetReqID(r.Context())
+		isDeletePost := false
+		if r.Method == http.MethodPost {
+			_, isDeletePost = r.URL.Query()["delete"]
+		}
+		op = metrics.NormalizeHTTPOperation(r.Method, isDeletePost)
 		if requestID != "" {
 			w.Header().Set("x-amz-request-id", requestID)
 		}
 	}
+	metrics.Default.ObserveError(op, apiErr.Code)
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(apiErr.Status)
 
