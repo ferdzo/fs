@@ -171,18 +171,6 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 		return RequestContext{}, ErrSignatureDoesNotMatch
 	}
 
-	policy, err := s.store.GetAuthPolicy(identity.AccessKeyID)
-	if err != nil {
-		return RequestContext{}, ErrAccessDenied
-	}
-	target := resolveTarget(r)
-	if target.Action == "" {
-		return RequestContext{}, ErrAccessDenied
-	}
-	if !isAllowed(policy, target) {
-		return RequestContext{}, ErrAccessDenied
-	}
-
 	authType := "sigv4-header"
 	if input.Presigned {
 		authType = "sigv4-presign"
@@ -196,6 +184,18 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 			AccessKeyID:   identity.AccessKeyID,
 			AuthType:      authType,
 		}, nil
+	}
+
+	policy, err := s.store.GetAuthPolicy(identity.AccessKeyID)
+	if err != nil {
+		return RequestContext{}, ErrAccessDenied
+	}
+	target := resolveTarget(r)
+	if target.Action == "" {
+		return RequestContext{}, ErrAccessDenied
+	}
+	if !isAllowed(policy, target) {
+		return RequestContext{}, ErrAccessDenied
 	}
 
 	return RequestContext{
