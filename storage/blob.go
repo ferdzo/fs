@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"fs/metrics"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const blobRoot = "blobs"
@@ -37,11 +39,16 @@ func NewBlobStore(root string, chunkSize int) (*BlobStore, error) {
 }
 
 func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, error) {
+	start := time.Now()
 	fullFileHasher := md5.New()
 
 	buffer := make([]byte, bs.chunkSize)
 	var totalSize int64
 	var chunkIDs []string
+	success := false
+	defer func() {
+		metrics.Default.ObserveBlob("ingest_stream", time.Since(start), 0, success)
+	}()
 
 	for {
 		bytesRead, err := io.ReadFull(stream, buffer)
@@ -74,10 +81,18 @@ func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, er
 	}
 
 	etag := hex.EncodeToString(fullFileHasher.Sum(nil))
+	success = true
 	return chunkIDs, totalSize, etag, nil
 }
 
 func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
+	start := time.Now()
+	success := false
+	writtenBytes := int64(0)
+	defer func() {
+		metrics.Default.ObserveBlob("write_chunk", time.Since(start), writtenBytes, success)
+	}()
+
 	if !isValidChunkID(chunkID) {
 		return fmt.Errorf("invalid chunk id: %q", chunkID)
 	}
@@ -88,6 +103,7 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 
 	fullPath := filepath.Join(dir, chunkID)
 	if _, err := os.Stat(fullPath); err == nil {
+		success = true
 		return nil
 	} else if !os.IsNotExist(err) {
 		return err
@@ -119,6 +135,7 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		if _, statErr := os.Stat(fullPath); statErr == nil {
+			success = true
 			return nil
 		}
 		return err
@@ -128,10 +145,18 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 	if err := syncDir(dir); err != nil {
 		return err
 	}
+	writtenBytes = int64(len(data))
+	success = true
 	return nil
 }
 
 func (bs *BlobStore) AssembleStream(chunkIDs []string, w *io.PipeWriter) error {
+	start := time.Now()
+	success := false
+	defer func() {
+		metrics.Default.ObserveBlob("assemble_stream", time.Since(start), 0, success)
+	}()
+
 	for _, chunkID := range chunkIDs {
 		chunkData, err := bs.GetBlob(chunkID)
 		if err != nil {
@@ -141,14 +166,28 @@ func (bs *BlobStore) AssembleStream(chunkIDs []string, w *io.PipeWriter) error {
 			return err
 		}
 	}
+	success = true
 	return nil
 }
 
 func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {
+	start := time.Now()
+	success := false
+	var size int64
+	defer func() {
+		metrics.Default.ObserveBlob("read_chunk", time.Since(start), size, success)
+	}()
+
 	if !isValidChunkID(chunkID) {
 		return nil, fmt.Errorf("invalid chunk id: %q", chunkID)
 	}
-	return os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+	data, err := os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+	if err != nil {
+		return nil, err
+	}
+	size = int64(len(data))
+	success = true
+	return data, nil
 }
 
 func (bs *BlobStore) DeleteBlob(chunkID string) error {
