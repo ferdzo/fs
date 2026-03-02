@@ -661,13 +661,12 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 		l.slots <- struct{}{}
 		metrics.Default.DecRequestQueueLength()
 	}
-	metrics.Default.IncConnectionPoolActive()
 	conn, err := l.Listener.Accept()
 	if err != nil {
 		<-l.slots
-		metrics.Default.DecConnectionPoolActive()
 		return nil, err
 	}
+	metrics.Default.IncConnectionPoolActive()
 	return &limitedConn{
 		Conn: conn,
 		done: func() {
