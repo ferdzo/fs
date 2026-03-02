@@ -59,6 +59,7 @@ func (h *Handler) registerAdminRoutes() {
 		r.Post("/users", h.handleAdminCreateUser)
 		r.Get("/users", h.handleAdminListUsers)
 		r.Get("/users/{accessKeyId}", h.handleAdminGetUser)
+		r.Delete("/users/{accessKeyId}", h.handleAdminDeleteUser)
 	})
 }
 
@@ -153,6 +154,18 @@ func (h *Handler) handleAdminGetUser(w http.ResponseWriter, r *http.Request) {
 		Policy:      &user.Policy,
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	if !h.requireBootstrapAdmin(w, r) {
+		return
+	}
+	accessKeyID := chi.URLParam(r, "accessKeyId")
+	if err := h.authSvc.DeleteUser(accessKeyID); err != nil {
+		writeMappedAdminError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) requireBootstrapAdmin(w http.ResponseWriter, r *http.Request) bool {

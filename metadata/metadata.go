@@ -154,6 +154,23 @@ func (h *MetadataHandler) PutAuthIdentity(identity *models.AuthIdentity) error {
 	})
 }
 
+func (h *MetadataHandler) DeleteAuthIdentity(accessKeyID string) error {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return errors.New("access key id is required")
+	}
+	return h.update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+		if bucket.Get([]byte(accessKeyID)) == nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityNotFound, accessKeyID)
+		}
+		return bucket.Delete([]byte(accessKeyID))
+	})
+}
+
 func (h *MetadataHandler) GetAuthIdentity(accessKeyID string) (*models.AuthIdentity, error) {
 	accessKeyID = strings.TrimSpace(accessKeyID)
 	if accessKeyID == "" {
@@ -202,6 +219,23 @@ func (h *MetadataHandler) PutAuthPolicy(policy *models.AuthPolicy) error {
 			return err
 		}
 		return bucket.Put([]byte(principal), payload)
+	})
+}
+
+func (h *MetadataHandler) DeleteAuthPolicy(accessKeyID string) error {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return errors.New("access key id is required")
+	}
+	return h.update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authPoliciesIndex)
+		if bucket == nil {
+			return errors.New("auth policies index not found")
+		}
+		if bucket.Get([]byte(accessKeyID)) == nil {
+			return fmt.Errorf("%w: %s", ErrAuthPolicyNotFound, accessKeyID)
+		}
+		return bucket.Delete([]byte(accessKeyID))
 	})
 }
 

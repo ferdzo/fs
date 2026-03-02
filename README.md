@@ -38,6 +38,7 @@ Admin API (JSON):
 - `POST /_admin/v1/users`
 - `GET /_admin/v1/users`
 - `GET /_admin/v1/users/{accessKeyId}`
+- `DELETE /_admin/v1/users/{accessKeyId}`
 
 ## Auth Setup
 

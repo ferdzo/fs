@@ -17,9 +17,11 @@ import (
 type Store interface {
 	GetAuthIdentity(accessKeyID string) (*models.AuthIdentity, error)
 	PutAuthIdentity(identity *models.AuthIdentity) error
+	DeleteAuthIdentity(accessKeyID string) error
 	ListAuthIdentities(limit int, after string) ([]models.AuthIdentity, string, error)
 	GetAuthPolicy(accessKeyID string) (*models.AuthPolicy, error)
 	PutAuthPolicy(policy *models.AuthPolicy) error
+	DeleteAuthPolicy(accessKeyID string) error
 }
 
 type CreateUserInput struct {
@@ -337,6 +339,40 @@ func (s *Service) GetUser(accessKeyID string) (*UserDetails, error) {
 		UpdatedAt:   identity.UpdatedAt,
 		Policy:      *policy,
 	}, nil
+}
+
+func (s *Service) DeleteUser(accessKeyID string) error {
+	if !s.cfg.Enabled {
+		return ErrAuthNotEnabled
+	}
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if !validAccessKeyID.MatchString(accessKeyID) {
+		return fmt.Errorf("%w: invalid access key id", ErrInvalidUserInput)
+	}
+
+	bootstrap := strings.TrimSpace(s.cfg.BootstrapAccessKey)
+	if bootstrap != "" && accessKeyID == bootstrap {
+		return fmt.Errorf("%w: bootstrap user cannot be deleted", ErrInvalidUserInput)
+	}
+
+	if _, err := s.store.GetAuthIdentity(accessKeyID); err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+			return ErrUserNotFound
+		}
+		return err
+	}
+
+	if err := s.store.DeleteAuthIdentity(accessKeyID); err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+			return ErrUserNotFound
+		}
+		return err
+	}
+
+	if err := s.store.DeleteAuthPolicy(accessKeyID); err != nil && !errors.Is(err, metadata.ErrAuthPolicyNotFound) {
+		return err
+	}
+	return nil
 }
 
 func parsePolicyJSON(raw string) (*models.AuthPolicy, error) {

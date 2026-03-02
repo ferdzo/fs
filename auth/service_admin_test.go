@@ -106,6 +106,38 @@ func TestCreateUserRejectsInvalidAccessKey(t *testing.T) {
 	}
 }
 
+func TestDeleteUser(t *testing.T) {
+	_, svc := newTestAuthService(t)
+
+	_, err := svc.CreateUser(CreateUserInput{
+		AccessKeyID: "delete-user",
+		SecretKey:   "super-secret-1",
+		Policy: models.AuthPolicy{
+			Statements: []models.AuthPolicyStatement{
+				{Effect: "allow", Actions: []string{"s3:*"}, Bucket: "*", Prefix: "*"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateUser returned error: %v", err)
+	}
+
+	if err := svc.DeleteUser("delete-user"); err != nil {
+		t.Fatalf("DeleteUser returned error: %v", err)
+	}
+	if _, err := svc.GetUser("delete-user"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("GetUser after delete error = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestDeleteBootstrapUserRejected(t *testing.T) {
+	_, svc := newTestAuthService(t)
+
+	if err := svc.DeleteUser("root-user"); !errors.Is(err, ErrInvalidUserInput) {
+		t.Fatalf("DeleteUser bootstrap error = %v, want ErrInvalidUserInput", err)
+	}
+}
+
 func newTestAuthService(t *testing.T) (*metadata.MetadataHandler, *Service) {
 	t.Helper()
 
