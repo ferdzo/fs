@@ -34,11 +34,17 @@ Authentication:
 - Local credential/policy store in bbolt
 - Bootstrap access key/secret via environment variables
 
+Admin API (JSON):
+- `POST /_admin/v1/users`
+- `GET /_admin/v1/users`
+- `GET /_admin/v1/users/{accessKeyId}`
+
 ## Auth Setup
 
 Required when `AUTH_ENABLED=true`:
 - `AUTH_MASTER_KEY` must be base64 for 32 decoded bytes (AES-256 key), e.g. `openssl rand -base64 32`
 - `AUTH_BOOTSTRAP_ACCESS_KEY` and `AUTH_BOOTSTRAP_SECRET_KEY` define initial credentials
+- `ADMIN_API_ENABLED=true` enables `/_admin/v1/*` routes (bootstrap key only)
 
 Reference: `auth/README.md`
 
