@@ -106,10 +106,6 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 
 func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.ObjectManifest, error) {
 	start := time.Now()
-	success := false
-	defer func() {
-		metrics.Default.ObserveService("get_object", time.Since(start), success)
-	}()
 
 	waitStart := time.Now()
 	s.gcMu.RLock()
@@ -120,20 +116,27 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	if err != nil {
 		metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
 		s.gcMu.RUnlock()
+		metrics.Default.ObserveService("get_object", time.Since(start), false)
 		return nil, nil, err
 	}
 	pr, pw := io.Pipe()
 
 	go func() {
+		streamOK := false
+		defer func() {
+			metrics.Default.ObserveService("get_object", time.Since(start), streamOK)
+		}()
 		defer metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
 		defer s.gcMu.RUnlock()
 		if err := s.blob.AssembleStream(manifest.Chunks, pw); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
-		_ = pw.Close()
+		if err := pw.Close(); err != nil {
+			return
+		}
+		streamOK = true
 	}()
-	success = true
 	return pr, manifest, nil
 }
 

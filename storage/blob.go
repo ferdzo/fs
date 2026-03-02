@@ -88,8 +88,9 @@ func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, er
 func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 	start := time.Now()
 	success := false
+	writtenBytes := int64(0)
 	defer func() {
-		metrics.Default.ObserveBlob("write_chunk", time.Since(start), int64(len(data)), success)
+		metrics.Default.ObserveBlob("write_chunk", time.Since(start), writtenBytes, success)
 	}()
 
 	if !isValidChunkID(chunkID) {
@@ -144,6 +145,7 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 	if err := syncDir(dir); err != nil {
 		return err
 	}
+	writtenBytes = int64(len(data))
 	success = true
 	return nil
 }

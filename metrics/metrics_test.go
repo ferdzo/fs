@@ -24,3 +24,11 @@ func TestRenderPrometheusHistogramNoEmptyLabelSet(t *testing.T) {
 		t.Fatalf("unexpected empty label set for gc count metric")
 	}
 }
+
+func TestEscapeLabelValueEscapesSingleBackslash(t *testing.T) {
+	got := escapeLabelValue(`a\b`)
+	want := `a\\b`
+	if got != want {
+		t.Fatalf("escapeLabelValue returned %q, want %q", got, want)
+	}
+}
