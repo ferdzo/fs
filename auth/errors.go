@@ -5,6 +5,9 @@ import "errors"
 var (
 	ErrAccessDenied                 = errors.New("access denied")
 	ErrInvalidAccessKeyID           = errors.New("invalid access key id")
+	ErrUserAlreadyExists            = errors.New("user already exists")
+	ErrUserNotFound                 = errors.New("user not found")
+	ErrInvalidUserInput             = errors.New("invalid user input")
 	ErrSignatureDoesNotMatch        = errors.New("signature does not match")
 	ErrAuthorizationHeaderMalformed = errors.New("authorization header malformed")
 	ErrRequestTimeTooSkewed         = errors.New("request time too skewed")

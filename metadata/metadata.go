@@ -234,6 +234,53 @@ func (h *MetadataHandler) GetAuthPolicy(accessKeyID string) (*models.AuthPolicy,
 	return policy, nil
 }
 
+func (h *MetadataHandler) ListAuthIdentities(limit int, after string) ([]models.AuthIdentity, string, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	after = strings.TrimSpace(after)
+
+	identities := make([]models.AuthIdentity, 0, limit)
+	nextCursor := ""
+
+	err := h.view(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+
+		cursor := bucket.Cursor()
+		var k, v []byte
+		if after == "" {
+			k, v = cursor.First()
+		} else {
+			k, v = cursor.Seek([]byte(after))
+			if k != nil && string(k) == after {
+				k, v = cursor.Next()
+			}
+		}
+
+		count := 0
+		for ; k != nil; k, v = cursor.Next() {
+			if count >= limit {
+				nextCursor = string(k)
+				break
+			}
+			record := models.AuthIdentity{}
+			if err := json.Unmarshal(v, &record); err != nil {
+				return err
+			}
+			identities = append(identities, record)
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return identities, nextCursor, nil
+}
+
 func (h *MetadataHandler) CreateBucket(bucketName string) error {
 	if !isValidBucketName(bucketName) {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
