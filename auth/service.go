@@ -187,6 +187,17 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	if input.Presigned {
 		authType = "sigv4-presign"
 	}
+
+	// Admin API authorization is enforced in admin handlers (bootstrap-only).
+	// We still require valid SigV4 credentials here, but skip S3 action policy checks.
+	if strings.HasPrefix(r.URL.Path, "/_admin/") {
+		return RequestContext{
+			Authenticated: true,
+			AccessKeyID:   identity.AccessKeyID,
+			AuthType:      authType,
+		}, nil
+	}
+
 	return RequestContext{
 		Authenticated: true,
 		AccessKeyID:   identity.AccessKeyID,
