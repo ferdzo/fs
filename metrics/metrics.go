@@ -763,8 +763,8 @@ func trimFloat(v float64) string {
 
 func escapeLabelValue(value string) string {
 	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, "\n", `\\n`)
-	value = strings.ReplaceAll(value, `"`, `\\"`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
 	return value
 }
 
