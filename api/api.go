@@ -33,6 +33,7 @@ type Handler struct {
 	logger    *slog.Logger
 	logConfig logging.Config
 	authSvc   *auth.Service
+	adminAPI  bool
 }
 
 const (
@@ -47,7 +48,7 @@ const (
 	serverMaxConnections          = 1024
 )
 
-func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service) *Handler {
+func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service, adminAPI bool) *Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -61,6 +62,7 @@ func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig loggi
 		logger:    logger,
 		logConfig: logConfig,
 		authSvc:   authSvc,
+		adminAPI:  adminAPI,
 	}
 	return h
 }
@@ -74,6 +76,9 @@ func (h *Handler) setupRoutes() {
 	h.router.Get("/metrics", h.handleMetrics)
 	h.router.Head("/metrics", h.handleMetrics)
 	h.router.Get("/", h.handleGetBuckets)
+	if h.adminAPI {
+		h.registerAdminRoutes()
+	}
 
 	h.router.Get("/{bucket}/", h.handleGetBucket)
 	h.router.Get("/{bucket}", h.handleGetBucket)
@@ -91,6 +96,9 @@ func (h *Handler) setupRoutes() {
 	h.router.Post("/{bucket}/*", h.handlePostObject)
 	h.router.Head("/{bucket}/*", h.handleHeadObject)
 	h.router.Delete("/{bucket}/*", h.handleDeleteObject)
+}
+
+func (h *Handler) registerAdminRoutes() {
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
