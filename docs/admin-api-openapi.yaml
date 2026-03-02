@@ -1,0 +1,336 @@
+openapi: 3.1.0
+info:
+  title: fs Admin API
+  version: 1.0.0
+  description: |
+    JSON admin API for managing local users and policies.
+
+    Notes:
+    - Base path is `/_admin/v1`.
+    - Requests must be AWS SigV4 signed.
+    - Only the bootstrap access key is authorized for admin endpoints.
+servers:
+  - url: http://localhost:2600
+    description: Local development
+security:
+  - AwsSigV4: []
+paths:
+  /_admin/v1/users:
+    post:
+      summary: Create user
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/UserAlreadyExists'
+        '503':
+          $ref: '#/components/responses/AuthDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      summary: List users
+      operationId: listUsers
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User summaries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/AuthDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /_admin/v1/users/{accessKeyId}:
+    get:
+      summary: Get user with policy
+      operationId: getUser
+      parameters:
+        - $ref: '#/components/parameters/AccessKeyId'
+      responses:
+        '200':
+          description: User details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '503':
+          $ref: '#/components/responses/AuthDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      summary: Delete user
+      operationId: deleteUser
+      parameters:
+        - $ref: '#/components/parameters/AccessKeyId'
+      responses:
+        '204':
+          description: User deleted
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '503':
+          $ref: '#/components/responses/AuthDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /_admin/v1/users/{accessKeyId}/policy:
+    put:
+      summary: Replace user policy
+      operationId: setUserPolicy
+      parameters:
+        - $ref: '#/components/parameters/AccessKeyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetPolicyRequest'
+      responses:
+        '200':
+          description: User details with updated policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '503':
+          $ref: '#/components/responses/AuthDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /_admin/v1/users/{accessKeyId}/status:
+    put:
+      summary: Set user status
+      operationId: setUserStatus
+      parameters:
+        - $ref: '#/components/parameters/AccessKeyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetStatusRequest'
+      responses:
+        '200':
+          description: User details with updated status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '503':
+          $ref: '#/components/responses/AuthDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    AwsSigV4:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        AWS Signature Version 4 headers are required (`Authorization`, `x-amz-date`,
+        and for payload-signed requests `x-amz-content-sha256`).
+        Only bootstrap credential is authorized for admin endpoints.
+  parameters:
+    AccessKeyId:
+      name: accessKeyId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: User access key ID
+  responses:
+    InvalidRequest:
+      description: Invalid request input
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+    UserAlreadyExists:
+      description: User already exists
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+    UserNotFound:
+      description: User not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+    AuthDisabled:
+      description: Authentication subsystem disabled
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+  schemas:
+    AdminError:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        requestId:
+          type: string
+      required: [code, message]
+    PolicyStatement:
+      type: object
+      properties:
+        effect:
+          type: string
+          enum: [allow, deny]
+        actions:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        bucket:
+          type: string
+          default: "*"
+        prefix:
+          type: string
+          default: "*"
+      required: [effect, actions]
+    Policy:
+      type: object
+      properties:
+        principal:
+          type: string
+          description: Server-managed; overwritten with target access key ID.
+        statements:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyStatement'
+          minItems: 1
+      required: [statements]
+    CreateUserRequest:
+      type: object
+      properties:
+        accessKeyId:
+          type: string
+        secretKey:
+          type: string
+          description: If omitted, server generates one.
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+        policy:
+          $ref: '#/components/schemas/Policy'
+      required: [accessKeyId, policy]
+    SetPolicyRequest:
+      type: object
+      properties:
+        policy:
+          $ref: '#/components/schemas/Policy'
+      required: [policy]
+    SetStatusRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [active, disabled]
+      required: [status]
+    UserListItem:
+      type: object
+      properties:
+        accessKeyId:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+        createdAt:
+          type: integer
+          format: int64
+        updatedAt:
+          type: integer
+          format: int64
+      required: [accessKeyId, status, createdAt, updatedAt]
+    UserListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserListItem'
+        nextCursor:
+          type: string
+      required: [items]
+    UserResponse:
+      allOf:
+        - $ref: '#/components/schemas/UserListItem'
+        - type: object
+          properties:
+            policy:
+              $ref: '#/components/schemas/Policy'
+            secretKey:
+              type: string
+              description: Returned only on create.
