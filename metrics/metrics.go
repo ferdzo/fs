@@ -75,8 +75,6 @@ type Registry struct {
 	connectionPoolWaits  atomic.Uint64
 
 	requestQueueLength atomic.Int64
-	workerPoolActive   atomic.Int64
-	workerPoolSize     atomic.Int64
 
 	mu sync.Mutex
 
@@ -364,21 +362,6 @@ func (r *Registry) DecRequestQueueLength() {
 	r.requestQueueLength.Add(-1)
 }
 
-func (r *Registry) SetWorkerPoolSize(size int) {
-	if size < 0 {
-		size = 0
-	}
-	r.workerPoolSize.Store(int64(size))
-}
-
-func (r *Registry) IncWorkerPoolActive() {
-	r.workerPoolActive.Add(1)
-}
-
-func (r *Registry) DecWorkerPoolActive() {
-	r.workerPoolActive.Add(-1)
-}
-
 func (r *Registry) ObserveLockWait(lockName string, d time.Duration) {
 	lockName = strings.TrimSpace(lockName)
 	if lockName == "" {
@@ -520,10 +503,7 @@ func (r *Registry) RenderPrometheus() string {
 	connectionMax := float64(r.connectionPoolMax.Load())
 	connectionWaits := r.connectionPoolWaits.Load()
 	queueLength := float64(r.requestQueueLength.Load())
-	workerActive := float64(r.workerPoolActive.Load())
-	workerSize := float64(r.workerPoolSize.Load())
 
-	openFDs, hasOpenFDs := readOpenFDs()
 	resident, hasResident := readResidentMemoryBytes()
 	cpuSeconds, hasCPU := readProcessCPUSeconds()
 
@@ -555,8 +535,6 @@ func (r *Registry) RenderPrometheus() string {
 	writeCounter(&b, "fs_connection_pool_waits_total", "Number of waits due to pool saturation.", connectionWaits)
 
 	writeGauge(&b, "fs_request_queue_length", "Requests waiting for an execution slot.", queueLength)
-	writeGauge(&b, "fs_worker_pool_active", "Active workers.", workerActive)
-	writeGauge(&b, "fs_worker_pool_size", "Configured worker pool size.", workerSize)
 
 	writeHistogramVecKV(&b, "fs_lock_wait_seconds", "Time spent waiting for locks.", lockWait, []string{"lock_name"})
 	writeHistogramVecKV(&b, "fs_lock_hold_seconds", "Time locks were held.", lockHold, []string{"lock_name"})
@@ -593,10 +571,6 @@ func (r *Registry) RenderPrometheus() string {
 	}
 	if hasResident {
 		writeGauge(&b, "process_resident_memory_bytes", "Resident memory size in bytes.", resident)
-	}
-	if hasOpenFDs {
-		writeGauge(&b, "process_open_fds", "Number of open file descriptors.", openFDs)
-		writeGauge(&b, "fs_open_fds", "Number of open file descriptors.", openFDs)
 	}
 
 	return b.String()
@@ -732,8 +706,16 @@ func writeHistogramWithLabelsMap(b *strings.Builder, name string, labels map[str
 		}
 		fmt.Fprintf(b, "%s_bucket{%s} %d\n", name, labelsToString(bucketLabels), cumulative)
 	}
-	fmt.Fprintf(b, "%s_sum{%s} %.9f\n", name, labelsToString(labels), s.sum)
-	fmt.Fprintf(b, "%s_count{%s} %d\n", name, labelsToString(labels), s.count)
+	labelsSuffix := formatLabelsSuffix(labels)
+	fmt.Fprintf(b, "%s_sum%s %.9f\n", name, labelsSuffix, s.sum)
+	fmt.Fprintf(b, "%s_count%s %d\n", name, labelsSuffix, s.count)
+}
+
+func formatLabelsSuffix(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	return "{" + labelsToString(labels) + "}"
 }
 
 func formatLabels(keys, values []string) string {
@@ -784,14 +766,6 @@ func escapeLabelValue(value string) string {
 	value = strings.ReplaceAll(value, "\n", `\\n`)
 	value = strings.ReplaceAll(value, `"`, `\\"`)
 	return value
-}
-
-func readOpenFDs() (float64, bool) {
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return 0, false
-	}
-	return float64(len(entries)), true
 }
 
 func readResidentMemoryBytes() (float64, bool) {

@@ -110,13 +110,14 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	payload := metrics.Default.RenderPrometheus()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
-	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
+	payload := metrics.Default.RenderPrometheus()
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(payload))
 }
 
@@ -645,7 +646,6 @@ func newLimitedListener(inner net.Listener, maxConns int) net.Listener {
 		return inner
 	}
 	metrics.Default.SetConnectionPoolMax(maxConns)
-	metrics.Default.SetWorkerPoolSize(maxConns)
 	return &limitedListener{
 		Listener: inner,
 		slots:    make(chan struct{}, maxConns),
