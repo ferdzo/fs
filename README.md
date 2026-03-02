@@ -51,6 +51,10 @@ Required when `AUTH_ENABLED=true`:
 
 Reference: `auth/README.md`
 
+Additional docs:
+- Admin OpenAPI spec: `docs/admin-api-openapi.yaml`
+- S3 compatibility matrix: `docs/s3-compatibility.md`
+
 Health:
 - `GET /healthz`
 - `HEAD /healthz`
