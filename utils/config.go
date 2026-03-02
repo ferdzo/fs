@@ -48,7 +48,7 @@ func NewConfig() *Config {
 		MultipartCleanupRetention: time.Duration(
 			envIntRange("MULTIPART_RETENTION_HOURS", 24, 1, 24*30),
 		) * time.Hour,
-		AuthEnabled:            envBool("AUTH_ENABLED", true),
+		AuthEnabled:            envBool("AUTH_ENABLED", false),
 		AuthRegion:             firstNonEmpty(strings.TrimSpace(os.Getenv("AUTH_REGION")), "us-east-1"),
 		AuthSkew:               time.Duration(envIntRange("AUTH_SKEW_SECONDS", 300, 30, 3600)) * time.Second,
 		AuthMaxPresign:         time.Duration(envIntRange("AUTH_MAX_PRESIGN_SECONDS", 86400, 60, 86400)) * time.Second,

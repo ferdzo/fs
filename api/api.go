@@ -740,8 +740,15 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
 	if query.Has("location") {
-		xmlResponse := `<?xml version="1.0" encoding="UTF-8"?>
-						<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`
+		region := "us-east-1"
+		if h.authSvc != nil {
+			candidate := strings.TrimSpace(h.authSvc.Config().Region)
+			if candidate != "" {
+				region = candidate
+			}
+		}
+		xmlResponse := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s</LocationConstraint>`, region)
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
