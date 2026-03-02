@@ -135,7 +135,7 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		if _, statErr := os.Stat(fullPath); statErr == nil {
-:q			success = true
+			success = true
 			return nil
 		}
 		return err
