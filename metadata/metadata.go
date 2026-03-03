@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"fs/metrics"
 	"fs/models"
 	"net"
 	"regexp"
@@ -23,17 +24,21 @@ type MetadataHandler struct {
 var systemIndex = []byte("__SYSTEM_BUCKETS__")
 var multipartUploadIndex = []byte("__MULTIPART_UPLOADS__")
 var multipartUploadPartsIndex = []byte("__MULTIPART_UPLOAD_PARTS__")
+var authIdentitiesIndex = []byte("__AUTH_IDENTITIES__")
+var authPoliciesIndex = []byte("__AUTH_POLICIES__")
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
 var (
-	ErrInvalidBucketName   = errors.New("invalid bucket name")
-	ErrBucketAlreadyExists = errors.New("bucket already exists")
-	ErrBucketNotFound      = errors.New("bucket not found")
-	ErrBucketNotEmpty      = errors.New("bucket not empty")
-	ErrObjectNotFound      = errors.New("object not found")
-	ErrMultipartNotFound   = errors.New("multipart upload not found")
-	ErrMultipartNotPending = errors.New("multipart upload is not pending")
+	ErrInvalidBucketName    = errors.New("invalid bucket name")
+	ErrBucketAlreadyExists  = errors.New("bucket already exists")
+	ErrBucketNotFound       = errors.New("bucket not found")
+	ErrBucketNotEmpty       = errors.New("bucket not empty")
+	ErrObjectNotFound       = errors.New("object not found")
+	ErrMultipartNotFound    = errors.New("multipart upload not found")
+	ErrMultipartNotPending  = errors.New("multipart upload is not pending")
+	ErrAuthIdentityNotFound = errors.New("auth identity not found")
+	ErrAuthPolicyNotFound   = errors.New("auth policy not found")
 )
 
 func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
@@ -43,7 +48,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	}
 	h := &MetadataHandler{db: db}
 
-	err = h.db.Update(func(tx *bbolt.Tx) error {
+	err = h.update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(systemIndex)
 		return err
 	})
@@ -51,7 +56,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.db.Update(func(tx *bbolt.Tx) error {
+	err = h.update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(multipartUploadIndex)
 		return err
 	})
@@ -59,8 +64,24 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.db.Update(func(tx *bbolt.Tx) error {
+	err = h.update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(multipartUploadPartsIndex)
+		return err
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	err = h.update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(authIdentitiesIndex)
+		return err
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	err = h.update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(authPoliciesIndex)
 		return err
 	})
 	if err != nil {
@@ -99,12 +120,207 @@ func (h *MetadataHandler) Close() error {
 	return h.db.Close()
 }
 
+func (h *MetadataHandler) view(fn func(tx *bbolt.Tx) error) error {
+	start := time.Now()
+	err := h.db.View(fn)
+	metrics.Default.ObserveMetadataTx("view", time.Since(start), err == nil)
+	return err
+}
+
+func (h *MetadataHandler) update(fn func(tx *bbolt.Tx) error) error {
+	start := time.Now()
+	err := h.db.Update(fn)
+	metrics.Default.ObserveMetadataTx("update", time.Since(start), err == nil)
+	return err
+}
+
+func (h *MetadataHandler) PutAuthIdentity(identity *models.AuthIdentity) error {
+	if identity == nil {
+		return errors.New("auth identity is required")
+	}
+	if strings.TrimSpace(identity.AccessKeyID) == "" {
+		return errors.New("access key id is required")
+	}
+	return h.update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+		payload, err := json.Marshal(identity)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(identity.AccessKeyID), payload)
+	})
+}
+
+func (h *MetadataHandler) DeleteAuthIdentity(accessKeyID string) error {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return errors.New("access key id is required")
+	}
+	return h.update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+		if bucket.Get([]byte(accessKeyID)) == nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityNotFound, accessKeyID)
+		}
+		return bucket.Delete([]byte(accessKeyID))
+	})
+}
+
+func (h *MetadataHandler) GetAuthIdentity(accessKeyID string) (*models.AuthIdentity, error) {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return nil, errors.New("access key id is required")
+	}
+
+	var identity *models.AuthIdentity
+	err := h.view(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+		payload := bucket.Get([]byte(accessKeyID))
+		if payload == nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityNotFound, accessKeyID)
+		}
+		record := models.AuthIdentity{}
+		if err := json.Unmarshal(payload, &record); err != nil {
+			return err
+		}
+		identity = &record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
+func (h *MetadataHandler) PutAuthPolicy(policy *models.AuthPolicy) error {
+	if policy == nil {
+		return errors.New("auth policy is required")
+	}
+	principal := strings.TrimSpace(policy.Principal)
+	if principal == "" {
+		return errors.New("auth policy principal is required")
+	}
+	policy.Principal = principal
+	return h.update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authPoliciesIndex)
+		if bucket == nil {
+			return errors.New("auth policies index not found")
+		}
+		payload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(principal), payload)
+	})
+}
+
+func (h *MetadataHandler) DeleteAuthPolicy(accessKeyID string) error {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return errors.New("access key id is required")
+	}
+	return h.update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authPoliciesIndex)
+		if bucket == nil {
+			return errors.New("auth policies index not found")
+		}
+		if bucket.Get([]byte(accessKeyID)) == nil {
+			return fmt.Errorf("%w: %s", ErrAuthPolicyNotFound, accessKeyID)
+		}
+		return bucket.Delete([]byte(accessKeyID))
+	})
+}
+
+func (h *MetadataHandler) GetAuthPolicy(accessKeyID string) (*models.AuthPolicy, error) {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return nil, errors.New("access key id is required")
+	}
+
+	var policy *models.AuthPolicy
+	err := h.view(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authPoliciesIndex)
+		if bucket == nil {
+			return errors.New("auth policies index not found")
+		}
+		payload := bucket.Get([]byte(accessKeyID))
+		if payload == nil {
+			return fmt.Errorf("%w: %s", ErrAuthPolicyNotFound, accessKeyID)
+		}
+		record := models.AuthPolicy{}
+		if err := json.Unmarshal(payload, &record); err != nil {
+			return err
+		}
+		policy = &record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return policy, nil
+}
+
+func (h *MetadataHandler) ListAuthIdentities(limit int, after string) ([]models.AuthIdentity, string, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	after = strings.TrimSpace(after)
+
+	identities := make([]models.AuthIdentity, 0, limit)
+	nextCursor := ""
+
+	err := h.view(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(authIdentitiesIndex)
+		if bucket == nil {
+			return errors.New("auth identities index not found")
+		}
+
+		cursor := bucket.Cursor()
+		var k, v []byte
+		if after == "" {
+			k, v = cursor.First()
+		} else {
+			k, v = cursor.Seek([]byte(after))
+			if k != nil && string(k) == after {
+				k, v = cursor.Next()
+			}
+		}
+
+		count := 0
+		for ; k != nil; k, v = cursor.Next() {
+			if count >= limit {
+				nextCursor = string(k)
+				break
+			}
+			record := models.AuthIdentity{}
+			if err := json.Unmarshal(v, &record); err != nil {
+				return err
+			}
+			identities = append(identities, record)
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return identities, nextCursor, nil
+}
+
 func (h *MetadataHandler) CreateBucket(bucketName string) error {
 	if !isValidBucketName(bucketName) {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		indexBucket, err := tx.CreateBucketIfNotExists([]byte(systemIndex))
 		if err != nil {
 			return err
@@ -136,7 +352,7 @@ func (h *MetadataHandler) DeleteBucket(bucketName string) error {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		indexBucket, err := tx.CreateBucketIfNotExists([]byte(systemIndex))
 		if err != nil {
 			return err
@@ -183,7 +399,7 @@ func (h *MetadataHandler) DeleteBucket(bucketName string) error {
 
 func (h *MetadataHandler) ListBuckets() ([]string, error) {
 	buckets := []string{}
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
 		if systemIndexBucket == nil {
 			return errors.New("system index not found")
@@ -203,7 +419,7 @@ func (h *MetadataHandler) ListBuckets() ([]string, error) {
 func (h *MetadataHandler) GetBucketManifest(bucketName string) (*models.BucketManifest, error) {
 	var manifest *models.BucketManifest
 
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
 		if systemIndexBucket == nil {
 			return errors.New("system index not found")
@@ -233,7 +449,7 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 		return err
 	}
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			return err
@@ -253,7 +469,7 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 func (h *MetadataHandler) GetManifest(bucket, key string) (*models.ObjectManifest, error) {
 	var manifest *models.ObjectManifest
 
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
@@ -280,7 +496,7 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 
 	var objects []*models.ObjectManifest
 
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
 		if systemIndexBucket == nil {
 			return errors.New("system index not found")
@@ -320,7 +536,7 @@ func (h *MetadataHandler) ForEachObjectFrom(bucket, startKey string, fn func(*mo
 		return errors.New("object callback is required")
 	}
 
-	return h.db.View(func(tx *bbolt.Tx) error {
+	return h.view(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
 		if systemIndexBucket == nil {
 			return errors.New("system index not found")
@@ -360,7 +576,7 @@ func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
 		return err
 	}
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
@@ -377,7 +593,7 @@ func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
 func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]string, error) {
 	deleted := make([]string, 0, len(keys))
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
@@ -405,7 +621,7 @@ func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]strin
 func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
 	var upload *models.MultipartUpload
 
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
 		if systemIndexBucket == nil {
 			return errors.New("system index not found")
@@ -428,7 +644,7 @@ func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.Mul
 		State:     "pending",
 	}
 
-	err = h.db.Update(func(tx *bbolt.Tx) error {
+	err = h.update(func(tx *bbolt.Tx) error {
 		multipartUploadBucket := tx.Bucket([]byte(multipartUploadIndex))
 		if multipartUploadBucket == nil {
 			return errors.New("multipart upload index not found")
@@ -523,7 +739,7 @@ func deleteMultipartPartsByUploadID(tx *bbolt.Tx, uploadID string) error {
 
 func (h *MetadataHandler) GetMultipartUpload(uploadID string) (*models.MultipartUpload, error) {
 	var upload *models.MultipartUpload
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		var err error
 		upload, _, err = getMultipartUploadFromTx(tx, uploadID)
 		if err != nil {
@@ -541,7 +757,7 @@ func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.Uploaded
 		return fmt.Errorf("invalid part number: %d", part.PartNumber)
 	}
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		upload, _, err := getMultipartUploadFromTx(tx, uploadID)
 		if err != nil {
 			return err
@@ -570,7 +786,7 @@ func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.Uploaded
 func (h *MetadataHandler) ListMultipartParts(uploadID string) ([]models.UploadedPart, error) {
 	parts := make([]models.UploadedPart, 0)
 
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		if _, _, err := getMultipartUploadFromTx(tx, uploadID); err != nil {
 			return err
 		}
@@ -604,7 +820,7 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 		return errors.New("final object manifest is required")
 	}
 
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		upload, multipartUploadBucket, err := getMultipartUploadFromTx(tx, uploadID)
 		if err != nil {
 			return err
@@ -643,7 +859,7 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 	return nil
 }
 func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		upload, multipartUploadBucket, err := getMultipartUploadFromTx(tx, uploadID)
 		if err != nil {
 			return err
@@ -673,7 +889,7 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 	}
 
 	cleaned := 0
-	err := h.db.Update(func(tx *bbolt.Tx) error {
+	err := h.update(func(tx *bbolt.Tx) error {
 		uploadsBucket, err := getMultipartUploadBucket(tx)
 		if err != nil {
 			return err
@@ -723,7 +939,7 @@ func (h *MetadataHandler) GetReferencedChunkSet() (map[string]struct{}, error) {
 	chunkSet := make(map[string]struct{})
 	pendingUploadSet := make(map[string]struct{})
 
-	err := h.db.View(func(tx *bbolt.Tx) error {
+	err := h.view(func(tx *bbolt.Tx) error {
 		systemIndexBucket := tx.Bucket([]byte(systemIndex))
 		if systemIndexBucket == nil {
 			return errors.New("system index not found")

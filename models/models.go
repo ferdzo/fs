@@ -68,6 +68,23 @@ type ListBucketResult struct {
 	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
 }
 
+type ListBucketResultV1 struct {
+	XMLName xml.Name `xml:"ListBucketResult"`
+	Xmlns   string   `xml:"xmlns,attr"`
+
+	Name         string `xml:"Name"`
+	Prefix       string `xml:"Prefix"`
+	Marker       string `xml:"Marker,omitempty"`
+	NextMarker   string `xml:"NextMarker,omitempty"`
+	Delimiter    string `xml:"Delimiter,omitempty"`
+	MaxKeys      int    `xml:"MaxKeys"`
+	IsTruncated  bool   `xml:"IsTruncated"`
+	EncodingType string `xml:"EncodingType,omitempty"`
+
+	Contents       []Contents       `xml:"Contents,omitempty"`
+	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
+}
+
 type ListBucketResultV2 struct {
 	XMLName xml.Name `xml:"ListBucketResult"`
 	Xmlns   string   `xml:"xmlns,attr"`
@@ -182,4 +199,27 @@ type DeleteError struct {
 	Key     string `xml:"Key"`
 	Code    string `xml:"Code"`
 	Message string `xml:"Message"`
+}
+
+type AuthIdentity struct {
+	AccessKeyID string `json:"access_key_id"`
+	SecretEnc   string `json:"secret_enc"`
+	SecretNonce string `json:"secret_nonce"`
+	EncAlg      string `json:"enc_alg"`
+	KeyVersion  string `json:"key_version"`
+	Status      string `json:"status"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+}
+
+type AuthPolicy struct {
+	Principal  string                `json:"principal"`
+	Statements []AuthPolicyStatement `json:"statements"`
+}
+
+type AuthPolicyStatement struct {
+	Effect  string   `json:"effect"`
+	Actions []string `json:"actions"`
+	Bucket  string   `json:"bucket"`
+	Prefix  string   `json:"prefix"`
 }

@@ -3,7 +3,9 @@ package api
 import (
 	"encoding/xml"
 	"errors"
+	"fs/auth"
 	"fs/metadata"
+	"fs/metrics"
 	"fs/models"
 	"fs/service"
 	"net/http"
@@ -58,6 +60,11 @@ var (
 		Code:    "InvalidRange",
 		Message: "The requested range is not satisfiable.",
 	}
+	s3ErrPreconditionFailed = s3APIError{
+		Status:  http.StatusPreconditionFailed,
+		Code:    "PreconditionFailed",
+		Message: "At least one of the pre-conditions you specified did not hold.",
+	}
 	s3ErrEntityTooSmall = s3APIError{
 		Status:  http.StatusBadRequest,
 		Code:    "EntityTooSmall",
@@ -72,6 +79,41 @@ var (
 		Status:  http.StatusBadRequest,
 		Code:    "MalformedXML",
 		Message: "The request must contain no more than 1000 object identifiers.",
+	}
+	s3ErrAccessDenied = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "AccessDenied",
+		Message: "Access Denied.",
+	}
+	s3ErrInvalidAccessKeyID = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "InvalidAccessKeyId",
+		Message: "The AWS Access Key Id you provided does not exist in our records.",
+	}
+	s3ErrSignatureDoesNotMatch = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "SignatureDoesNotMatch",
+		Message: "The request signature we calculated does not match the signature you provided.",
+	}
+	s3ErrAuthorizationHeaderMalformed = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "AuthorizationHeaderMalformed",
+		Message: "The authorization header is malformed; the region/service/date is wrong or missing.",
+	}
+	s3ErrRequestTimeTooSkewed = s3APIError{
+		Status:  http.StatusForbidden,
+		Code:    "RequestTimeTooSkewed",
+		Message: "The difference between the request time and the server's time is too large.",
+	}
+	s3ErrExpiredToken = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "ExpiredToken",
+		Message: "The provided token has expired.",
+	}
+	s3ErrInvalidPresign = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "AuthorizationQueryParametersError",
+		Message: "Error parsing the X-Amz-Credential parameter.",
 	}
 	s3ErrInternal = s3APIError{
 		Status:  http.StatusInternalServerError,
@@ -132,6 +174,26 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrMalformedXML
 	case errors.Is(err, service.ErrEntityTooSmall):
 		return s3ErrEntityTooSmall
+	case errors.Is(err, auth.ErrAccessDenied):
+		return s3ErrAccessDenied
+	case errors.Is(err, auth.ErrInvalidAccessKeyID):
+		return s3ErrInvalidAccessKeyID
+	case errors.Is(err, auth.ErrSignatureDoesNotMatch):
+		return s3ErrSignatureDoesNotMatch
+	case errors.Is(err, auth.ErrAuthorizationHeaderMalformed):
+		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, auth.ErrRequestTimeTooSkewed):
+		return s3ErrRequestTimeTooSkewed
+	case errors.Is(err, auth.ErrExpiredToken):
+		return s3ErrExpiredToken
+	case errors.Is(err, auth.ErrCredentialDisabled):
+		return s3ErrAccessDenied
+	case errors.Is(err, auth.ErrNoAuthCredentials):
+		return s3ErrAccessDenied
+	case errors.Is(err, auth.ErrUnsupportedAuthScheme):
+		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, auth.ErrInvalidPresign):
+		return s3ErrInvalidPresign
 	default:
 		return s3ErrInternal
 	}
@@ -139,12 +201,19 @@ func mapToS3Error(err error) s3APIError {
 
 func writeS3Error(w http.ResponseWriter, r *http.Request, apiErr s3APIError, resource string) {
 	requestID := ""
+	op := "other"
 	if r != nil {
 		requestID = middleware.GetReqID(r.Context())
+		isDeletePost := false
+		if r.Method == http.MethodPost {
+			_, isDeletePost = r.URL.Query()["delete"]
+		}
+		op = metrics.NormalizeHTTPOperation(r.Method, isDeletePost)
 		if requestID != "" {
 			w.Header().Set("x-amz-request-id", requestID)
 		}
 	}
+	metrics.Default.ObserveError(op, apiErr.Code)
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(apiErr.Status)
 

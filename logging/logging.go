@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"fs/metrics"
 	"log/slog"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
@@ -86,6 +88,11 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			op := metricOperationLabel(r)
+			metrics.Default.IncHTTPInFlightOp(op)
+			defer func() {
+				metrics.Default.DecHTTPInFlightOp(op)
+			}()
 			requestID := middleware.GetReqID(r.Context())
 			if requestID != "" {
 				ww.Header().Set("x-amz-request-id", requestID)
@@ -93,15 +100,18 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 
 			next.ServeHTTP(ww, r)
 
-			if !cfg.Audit && !cfg.DebugMode {
-				return
-			}
-
 			elapsed := time.Since(start)
 			status := ww.Status()
 			if status == 0 {
 				status = http.StatusOK
 			}
+			route := metricRouteLabel(r)
+			metrics.Default.ObserveHTTPRequestDetailed(r.Method, route, op, status, elapsed, ww.BytesWritten())
+
+			if !cfg.Audit && !cfg.DebugMode {
+				return
+			}
+
 			attrs := []any{
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -129,6 +139,46 @@ func HTTPMiddleware(logger *slog.Logger, cfg Config) func(http.Handler) http.Han
 			logger.Info("http_request", attrs...)
 		})
 	}
+}
+
+func metricRouteLabel(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return "/unknown"
+	}
+
+	if routeCtx := chi.RouteContext(r.Context()); routeCtx != nil {
+		if pattern := strings.TrimSpace(routeCtx.RoutePattern()); pattern != "" {
+			return pattern
+		}
+	}
+
+	path := strings.TrimSpace(r.URL.Path)
+	if path == "" || path == "/" {
+		return "/"
+	}
+	if path == "/healthz" || path == "/metrics" {
+		return path
+	}
+
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return "/"
+	}
+	if !strings.Contains(trimmed, "/") {
+		return "/{bucket}"
+	}
+	return "/{bucket}/*"
+}
+
+func metricOperationLabel(r *http.Request) string {
+	if r == nil {
+		return "other"
+	}
+	isDeletePost := false
+	if r.Method == http.MethodPost && r.URL != nil {
+		_, isDeletePost = r.URL.Query()["delete"]
+	}
+	return metrics.NormalizeHTTPOperation(r.Method, isDeletePost)
 }
 
 func envBool(key string, defaultValue bool) bool {
