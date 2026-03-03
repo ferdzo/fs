@@ -48,14 +48,14 @@ func NewConfig() *Config {
 		MultipartCleanupRetention: time.Duration(
 			envIntRange("MULTIPART_RETENTION_HOURS", 24, 1, 24*30),
 		) * time.Hour,
-		AuthEnabled:            envBool("AUTH_ENABLED", false),
-		AuthRegion:             firstNonEmpty(strings.TrimSpace(os.Getenv("AUTH_REGION")), "us-east-1"),
-		AuthSkew:               time.Duration(envIntRange("AUTH_SKEW_SECONDS", 300, 30, 3600)) * time.Second,
-		AuthMaxPresign:         time.Duration(envIntRange("AUTH_MAX_PRESIGN_SECONDS", 86400, 60, 86400)) * time.Second,
-		AuthMasterKey:          strings.TrimSpace(os.Getenv("AUTH_MASTER_KEY")),
-		AuthBootstrapAccessKey: strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_ACCESS_KEY")),
-		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_SECRET_KEY")),
-		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("AUTH_BOOTSTRAP_POLICY")),
+		AuthEnabled:            envBool("FS_AUTH_ENABLED", false),
+		AuthRegion:             firstNonEmpty(strings.TrimSpace(os.Getenv("FS_AUTH_REGION")), "us-east-1"),
+		AuthSkew:               time.Duration(envIntRange("FS_AUTH_CLOCK_SKEW_SECONDS", 300, 30, 3600)) * time.Second,
+		AuthMaxPresign:         time.Duration(envIntRange("FS_AUTH_MAX_PRESIGN_SECONDS", 86400, 60, 86400)) * time.Second,
+		AuthMasterKey:          strings.TrimSpace(os.Getenv("FS_MASTER_KEY")),
+		AuthBootstrapAccessKey: strings.TrimSpace(os.Getenv("FS_ROOT_USER")),
+		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("FS_ROOT_PASSWORD")),
+		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("FS_ROOT_POLICY_JSON")),
 		AdminAPIEnabled:        envBool("ADMIN_API_ENABLED", true),
 	}
 
