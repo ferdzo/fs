@@ -40,18 +40,18 @@ This folder implements S3-compatible request authentication using AWS Signature 
 ## Config Model
 Auth is configured through env (read in `utils/config.go`, converted in `auth/config.go`):
 
-- `AUTH_ENABLED`
-- `AUTH_REGION`
-- `AUTH_SKEW_SECONDS`
-- `AUTH_MAX_PRESIGN_SECONDS`
-- `AUTH_MASTER_KEY`
-- `AUTH_BOOTSTRAP_ACCESS_KEY`
-- `AUTH_BOOTSTRAP_SECRET_KEY`
-- `AUTH_BOOTSTRAP_POLICY` (optional JSON)
+- `FS_AUTH_ENABLED`
+- `FS_AUTH_REGION`
+- `FS_AUTH_CLOCK_SKEW_SECONDS`
+- `FS_AUTH_MAX_PRESIGN_SECONDS`
+- `FS_MASTER_KEY`
+- `FS_ROOT_USER`
+- `FS_ROOT_PASSWORD`
+- `FS_ROOT_POLICY_JSON` (optional JSON)
 
 Important:
-- If `AUTH_ENABLED=true`, `AUTH_MASTER_KEY` is required.
-- `AUTH_MASTER_KEY` must be base64 that decodes to exactly 32 bytes (AES-256 key).
+- If `FS_AUTH_ENABLED=true`, `FS_MASTER_KEY` is required.
+- `FS_MASTER_KEY` must be base64 that decodes to exactly 32 bytes (AES-256 key).
 
 ## Persistence Model (bbolt)
 Implemented in metadata layer:
@@ -75,7 +75,7 @@ If bootstrap env key/secret are set:
 - secret is encrypted with AES-GCM and stored
 - policy is created:
   - default: full access (`s3:*`, `bucket=*`, `prefix=*`)
-  - or overridden by `AUTH_BOOTSTRAP_POLICY`
+  - or overridden by `FS_ROOT_POLICY_JSON`
 
 ## Request Authentication Flow
 For each non-health request:
@@ -87,8 +87,8 @@ For each non-health request:
   - region must match config
 3. Validate time:
   - `x-amz-date` format
-  - skew within `AUTH_SKEW_SECONDS`
-  - presigned expiry within `AUTH_MAX_PRESIGN_SECONDS`
+  - skew within `FS_AUTH_CLOCK_SKEW_SECONDS`
+  - presigned expiry within `FS_AUTH_MAX_PRESIGN_SECONDS`
 4. Load identity by access key id.
 5. Ensure identity status is active.
 6. Decrypt stored secret using master key.
@@ -133,7 +133,7 @@ Each audit entry includes method, path, remote IP, and request ID (if present). 
 - Secret keys are recoverable by server design (required for SigV4 verification).
 - They are encrypted at rest, not hashed.
 - Master key rotation is not implemented yet.
-- Keep `AUTH_MASTER_KEY` protected (secret manager/systemd env file/etc.).
+- Keep `FS_MASTER_KEY` protected (secret manager/systemd env file/etc.).
 
 ## Current Scope / Limitations
 - No STS/session-token auth yet.

@@ -44,9 +44,9 @@ Admin API (JSON):
 
 ## Auth Setup
 
-Required when `AUTH_ENABLED=true`:
-- `AUTH_MASTER_KEY` must be base64 for 32 decoded bytes (AES-256 key), e.g. `openssl rand -base64 32`
-- `AUTH_BOOTSTRAP_ACCESS_KEY` and `AUTH_BOOTSTRAP_SECRET_KEY` define initial credentials
+Required when `FS_AUTH_ENABLED=true`:
+- `FS_MASTER_KEY` must be base64 for 32 decoded bytes (AES-256 key), e.g. `openssl rand -base64 32`
+- `FS_ROOT_USER` and `FS_ROOT_PASSWORD` define initial credentials
 - `ADMIN_API_ENABLED=true` enables `/_admin/v1/*` routes (bootstrap key only)
 
 Reference: `auth/README.md`
