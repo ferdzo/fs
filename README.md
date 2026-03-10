@@ -49,6 +49,61 @@ Admin API (JSON):
 - `PUT /_admin/v1/users/{accessKeyId}/status`
 - `DELETE /_admin/v1/users/{accessKeyId}`
 
+Admin API policy examples (SigV4):
+```bash
+ENDPOINT="http://localhost:3000"
+REGION="us-east-1"
+ADMIN_ACCESS_KEY="${FS_ROOT_USER}"
+ADMIN_SECRET_KEY="${FS_ROOT_PASSWORD}"
+SIGV4="aws:amz:${REGION}:s3"
+```
+
+Replace user policy with one scoped statement:
+```bash
+curl --aws-sigv4 "$SIGV4" \
+  --user "${ADMIN_ACCESS_KEY}:${ADMIN_SECRET_KEY}" \
+  -H "Content-Type: application/json" \
+  -X PUT "${ENDPOINT}/_admin/v1/users/test-user/policy" \
+  -d '{
+    "policy": {
+      "statements": [
+        {
+          "effect": "allow",
+          "actions": ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+          "bucket": "backup",
+          "prefix": "restic/*"
+        }
+      ]
+    }
+  }'
+```
+
+Set multiple statements (for multiple buckets):
+```bash
+curl --aws-sigv4 "$SIGV4" \
+  --user "${ADMIN_ACCESS_KEY}:${ADMIN_SECRET_KEY}" \
+  -H "Content-Type: application/json" \
+  -X PUT "${ENDPOINT}/_admin/v1/users/test-user/policy" \
+  -d '{
+    "policy": {
+      "statements": [
+        {
+          "effect": "allow",
+          "actions": ["s3:ListBucket", "s3:GetObject"],
+          "bucket": "test-bucket",
+          "prefix": "*"
+        },
+        {
+          "effect": "allow",
+          "actions": ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+          "bucket": "test-bucket-2",
+          "prefix": "*"
+        }
+      ]
+    }
+  }'
+```
+
 Admin CLI:
 - `fs admin user create --access-key backup-user --role readwrite`
 - `fs admin user list`
