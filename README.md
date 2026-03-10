@@ -56,6 +56,7 @@ Admin CLI:
 - `fs admin user set-status backup-user --status disabled`
 - `fs admin user set-role backup-user --role readonly --bucket backup-bucket --prefix restic/`
 - `fs admin user set-role backup-user --role readwrite --bucket backups-2` (appends another statement)
+- `fs admin user remove-role backup-user --role readonly --bucket backup-bucket --prefix restic/`
 - `fs admin user set-role backup-user --role admin --replace` (replaces all statements)
 - `fs admin user delete backup-user`
 - `fs admin diag health`

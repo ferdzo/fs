@@ -22,6 +22,7 @@ func newAdminUserCommand(opts *adminOptions) *cobra.Command {
 	cmd.AddCommand(newAdminUserDeleteCommand(opts))
 	cmd.AddCommand(newAdminUserSetStatusCommand(opts))
 	cmd.AddCommand(newAdminUserSetRoleCommand(opts))
+	cmd.AddCommand(newAdminUserRemoveRoleCommand(opts))
 	return cmd
 }
 
@@ -253,6 +254,68 @@ func newAdminUserSetRoleCommand(opts *adminOptions) *cobra.Command {
 	return cmd
 }
 
+func newAdminUserRemoveRoleCommand(opts *adminOptions) *cobra.Command {
+	var (
+		role   string
+		bucket string
+		prefix string
+	)
+	cmd := &cobra.Command{
+		Use:   "remove-role <access-key-id>",
+		Short: "Remove one role policy statement from user",
+		Args:  requireAccessKeyArg("fs admin user remove-role <access-key-id> --role admin|readwrite|readonly [--bucket <name>] [--prefix <path>]"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			policy, err := buildPolicyFromRole(rolePolicyOptions{
+				Role:   role,
+				Bucket: bucket,
+				Prefix: prefix,
+			})
+			if err != nil {
+				return usageError("fs admin user remove-role <access-key-id> --role admin|readwrite|readonly [--bucket <name>] [--prefix <path>]", err.Error())
+			}
+			if len(policy.Statements) == 0 {
+				return usageError("fs admin user remove-role <access-key-id> --role admin|readwrite|readonly [--bucket <name>] [--prefix <path>]", "no statement to remove")
+			}
+
+			client, err := newAdminAPIClient(opts, true)
+			if err != nil {
+				return err
+			}
+
+			existing, err := client.GetUser(context.Background(), args[0])
+			if err != nil {
+				return err
+			}
+			if existing.Policy == nil || len(existing.Policy.Statements) == 0 {
+				return fmt.Errorf("user %q has no policy statements", args[0])
+			}
+
+			target := policy.Statements[0]
+			nextPolicy, removed := removePolicyStatements(existing.Policy, target)
+			if removed == 0 {
+				return fmt.Errorf("no matching statement found for role=%s bucket=%s prefix=%s", role, bucket, prefix)
+			}
+			if len(nextPolicy.Statements) == 0 {
+				return fmt.Errorf("cannot remove the last policy statement; add another role first or use set-role --replace")
+			}
+
+			out, err := client.SetUserPolicy(context.Background(), args[0], nextPolicy)
+			if err != nil {
+				return err
+			}
+			if opts.JSON {
+				return writeJSON(cmd.OutOrStdout(), out)
+			}
+			return writeUserTable(cmd.OutOrStdout(), out, false)
+		},
+	}
+
+	cmd.Flags().StringVar(&role, "role", "readwrite", "Role: admin|readwrite|readonly")
+	cmd.Flags().StringVar(&bucket, "bucket", "*", "Bucket scope, defaults to *")
+	cmd.Flags().StringVar(&prefix, "prefix", "*", "Prefix scope, defaults to *")
+	return cmd
+}
+
 func mergePolicyStatements(existing *adminPolicy, addition adminPolicy) adminPolicy {
 	merged := adminPolicy{}
 	if existing != nil {
@@ -287,6 +350,25 @@ func policyStatementsEqual(a, b adminPolicyStatement) bool {
 		}
 	}
 	return true
+}
+
+func removePolicyStatements(existing *adminPolicy, target adminPolicyStatement) (adminPolicy, int) {
+	out := adminPolicy{}
+	if existing == nil {
+		return out, 0
+	}
+	out.Principal = existing.Principal
+	out.Statements = make([]adminPolicyStatement, 0, len(existing.Statements))
+
+	removed := 0
+	for _, stmt := range existing.Statements {
+		if policyStatementsEqual(stmt, target) {
+			removed++
+			continue
+		}
+		out.Statements = append(out.Statements, stmt)
+	}
+	return out, removed
 }
 
 func requireAccessKeyArg(usage string) cobra.PositionalArgs {
