@@ -2,6 +2,13 @@
 
 An experimental Object Storage written in Go that should be partially compatible with S3
 
+## Running
+
+Single binary, two modes:
+- `fs` (no subcommand) starts the server (backward compatible)
+- `fs server` starts the server explicitly
+- `fs admin ...` runs admin CLI commands
+
 ## Features
 
 Bucket operations:
@@ -42,6 +49,18 @@ Admin API (JSON):
 - `PUT /_admin/v1/users/{accessKeyId}/status`
 - `DELETE /_admin/v1/users/{accessKeyId}`
 
+Admin CLI:
+- `fs admin user create --access-key backup-user --role readwrite`
+- `fs admin user list`
+- `fs admin user get backup-user`
+- `fs admin user set-status backup-user --status disabled`
+- `fs admin user set-role backup-user --role readonly --bucket backup-bucket --prefix restic/`
+- `fs admin user set-role backup-user --role readwrite --bucket backups-2` (appends another statement)
+- `fs admin user set-role backup-user --role admin --replace` (replaces all statements)
+- `fs admin user delete backup-user`
+- `fs admin diag health`
+- `fs admin diag version`
+
 ## Auth Setup
 
 Required when `FS_AUTH_ENABLED=true`:
@@ -54,6 +73,15 @@ Reference: `auth/README.md`
 Additional docs:
 - Admin OpenAPI spec: `docs/admin-api-openapi.yaml`
 - S3 compatibility matrix: `docs/s3-compatibility.md`
+
+CLI credential/env resolution for `fs admin`:
+- Flags: `--access-key`, `--secret-key`, `--endpoint`, `--region`
+- Env fallback:
+  - `FS_ROOT_USER` / `FS_ROOT_PASSWORD` (same defaults as server bootstrap)
+  - `FSCLI_ACCESS_KEY` / `FSCLI_SECRET_KEY`
+  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+  - `FSCLI_ENDPOINT` (fallback to `ADDRESS` + `PORT`, then `http://localhost:3000`)
+  - `FSCLI_REGION` (fallback `FS_AUTH_REGION`, default `us-east-1`)
 
 Health:
 - `GET /healthz`
