@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	defaultAdminEndpoint = "http://localhost:3000"
+	defaultAdminEndpoint = "http://localhost:2600"
 	defaultAdminRegion   = "us-east-1"
 )
 
@@ -108,7 +108,7 @@ func endpointFromServerConfig(address string, port int) string {
 		host = "localhost"
 	}
 	if port <= 0 || port > 65535 {
-		port = 3000
+		port = 2600
 	}
 	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
 }
