@@ -9,19 +9,6 @@ Single binary, two modes:
 - `fs server` starts the server explicitly
 - `fs admin ...` runs admin CLI commands
 
-## Versioning and Releases
-
-- Versioning follows SemVer tags: `vMAJOR.MINOR.PATCH` (example: `v0.4.2`).
-- `fs version` shows build metadata (`version`, `commit`, `date`).
-- Pushing a tag like `v0.4.2` triggers Docker image build/push via GitHub Actions.
-- Published images: `ghcr.io/<owner>/<repo>:v0.4.2` and related semver tags.
-
-Tag release example:
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
 ## Features
 
 Bucket operations:
