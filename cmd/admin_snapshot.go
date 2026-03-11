@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	snapshotManifestPath = "manifest.json"
+	snapshotManifestPath = ".fs-snapshot/manifest.json"
 	snapshotFormat       = 1
 )
 
