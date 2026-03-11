@@ -390,7 +390,10 @@ func ensureDataPathOffline(dataPath string) error {
 		}
 		return err
 	}
-	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 100 * time.Millisecond})
+	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{
+		Timeout:  100 * time.Millisecond,
+		ReadOnly: true,
+	})
 	if err != nil {
 		return fmt.Errorf("data path appears in use (metadata.db locked): %w", err)
 	}
