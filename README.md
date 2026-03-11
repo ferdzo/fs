@@ -114,6 +114,9 @@ Admin CLI:
 - `fs admin user remove-role backup-user --role readonly --bucket backup-bucket --prefix restic/`
 - `fs admin user set-role backup-user --role admin --replace` (replaces all statements)
 - `fs admin user delete backup-user`
+- `fs admin snapshot create --data-path /var/lib/fs --out /backup/fs-20260311.tar.gz`
+- `fs admin snapshot inspect --file /backup/fs-20260311.tar.gz`
+- `fs admin snapshot restore --file /backup/fs-20260311.tar.gz --data-path /var/lib/fs --force`
 - `fs admin diag health`
 - `fs admin diag version`
 
@@ -138,6 +141,9 @@ CLI credential/env resolution for `fs admin`:
   - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
   - `FSCLI_ENDPOINT` (fallback to `ADDRESS` + `PORT`, then `http://localhost:3000`)
   - `FSCLI_REGION` (fallback `FS_AUTH_REGION`, default `us-east-1`)
+
+Note:
+- `fs admin snapshot ...` commands operate locally on filesystem paths and do not require endpoint or auth credentials.
 
 Health:
 - `GET /healthz`
