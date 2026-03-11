@@ -38,7 +38,7 @@ func NewConfig() *Config {
 	config := &Config{
 		DataPath:   sanitizeDataPath(os.Getenv("DATA_PATH")),
 		Address:    firstNonEmpty(strings.TrimSpace(os.Getenv("ADDRESS")), "0.0.0.0"),
-		Port:       envIntRange("PORT", 3000, 1, 65535),
+		Port:       envIntRange("PORT", 2600, 1, 65535),
 		ChunkSize:  envIntRange("CHUNK_SIZE", 8192000, 1, 64*1024*1024),
 		LogLevel:   strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),
 		LogFormat:  strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_FORMAT")), strings.TrimSpace(os.Getenv("LOG_TYPE")), "text")),

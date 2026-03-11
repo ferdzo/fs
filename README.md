@@ -9,6 +9,19 @@ Single binary, two modes:
 - `fs server` starts the server explicitly
 - `fs admin ...` runs admin CLI commands
 
+## Versioning and Releases
+
+- Versioning follows SemVer tags: `vMAJOR.MINOR.PATCH` (example: `v0.4.2`).
+- `fs version` shows build metadata (`version`, `commit`, `date`).
+- Pushing a tag like `v0.4.2` triggers Docker image build/push via GitHub Actions.
+- Published images: `ghcr.io/<owner>/<repo>:v0.4.2` and related semver tags.
+
+Tag release example:
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Features
 
 Bucket operations:
@@ -51,7 +64,7 @@ Admin API (JSON):
 
 Admin API policy examples (SigV4):
 ```bash
-ENDPOINT="http://localhost:3000"
+ENDPOINT="http://localhost:2600"
 REGION="us-east-1"
 ADMIN_ACCESS_KEY="${FS_ROOT_USER}"
 ADMIN_SECRET_KEY="${FS_ROOT_PASSWORD}"
@@ -139,7 +152,7 @@ CLI credential/env resolution for `fs admin`:
   - `FS_ROOT_USER` / `FS_ROOT_PASSWORD` (same defaults as server bootstrap)
   - `FSCLI_ACCESS_KEY` / `FSCLI_SECRET_KEY`
   - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-  - `FSCLI_ENDPOINT` (fallback to `ADDRESS` + `PORT`, then `http://localhost:3000`)
+  - `FSCLI_ENDPOINT` (fallback to `ADDRESS` + `PORT`, then `http://localhost:2600`)
   - `FSCLI_REGION` (fallback `FS_AUTH_REGION`, default `us-east-1`)
 
 Note:
