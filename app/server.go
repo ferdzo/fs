@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"fmt"
 	"fs/api"
 	"fs/auth"
 	"fs/logging"
@@ -85,7 +84,7 @@ func RunServer(ctx context.Context) error {
 
 	if err := handler.Start(ctx, addr); err != nil {
 		logger.Error("server_stopped_with_error", "error", err)
-		return fmt.Errorf("server start failed: %w", err)
+		return err
 	}
 	return nil
 }
