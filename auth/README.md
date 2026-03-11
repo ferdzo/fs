@@ -137,14 +137,6 @@ Each audit entry includes method, path, remote IP, and request ID (if present). 
 
 ## Current Scope / Limitations
 - No STS/session-token auth yet.
-- No admin API for managing multiple users yet.
 - Policy language is intentionally minimal, not full IAM.
 - No automatic key rotation workflows.
-
-## Practical Next Step
-To support multiple users cleanly, add admin operations in auth service + API:
-- create user
-- rotate secret
-- set policy
-- disable/enable
-- delete user
+- No key rotation endpoint for existing users yet.
