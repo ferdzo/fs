@@ -48,6 +48,7 @@ func newAdminCommand(build BuildInfo) *cobra.Command {
 
 	cmd.AddCommand(newAdminUserCommand(opts))
 	cmd.AddCommand(newAdminDiagCommand(opts, build))
+	cmd.AddCommand(newAdminSnapshotCommand(opts))
 	return cmd
 }
 
