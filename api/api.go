@@ -488,7 +488,7 @@ func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusCreated)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request) {
