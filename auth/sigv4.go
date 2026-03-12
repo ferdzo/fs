@@ -259,7 +259,57 @@ func canonicalPath(u *url.URL) string {
 	if path == "" {
 		return "/"
 	}
-	return path
+	return awsEncodePath(path)
+}
+
+func awsEncodePath(path string) string {
+	var b strings.Builder
+	b.Grow(len(path))
+	for i := 0; i < len(path); i++ {
+		ch := path[i]
+		if ch == '/' || isUnreserved(ch) {
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == '%' && i+2 < len(path) && isHex(path[i+1]) && isHex(path[i+2]) {
+			b.WriteByte('%')
+			b.WriteByte(toUpperHex(path[i+1]))
+			b.WriteByte(toUpperHex(path[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hexUpper(ch >> 4))
+		b.WriteByte(hexUpper(ch & 0x0F))
+	}
+	return b.String()
+}
+
+func isUnreserved(ch byte) bool {
+	return (ch >= 'A' && ch <= 'Z') ||
+		(ch >= 'a' && ch <= 'z') ||
+		(ch >= '0' && ch <= '9') ||
+		ch == '-' || ch == '_' || ch == '.' || ch == '~'
+}
+
+func isHex(ch byte) bool {
+	return (ch >= '0' && ch <= '9') ||
+		(ch >= 'a' && ch <= 'f') ||
+		(ch >= 'A' && ch <= 'F')
+}
+
+func toUpperHex(ch byte) byte {
+	if ch >= 'a' && ch <= 'f' {
+		return ch - ('a' - 'A')
+	}
+	return ch
+}
+
+func hexUpper(nibble byte) byte {
+	if nibble < 10 {
+		return '0' + nibble
+	}
+	return 'A' + (nibble - 10)
 }
 
 type queryPair struct {
