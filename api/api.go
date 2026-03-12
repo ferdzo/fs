@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/xml"
@@ -400,19 +401,51 @@ func shouldDecodeAWSChunkedPayload(r *http.Request) bool {
 		return true
 	}
 	signingMode := strings.ToLower(r.Header.Get("x-amz-content-sha256"))
-	return strings.HasPrefix(signingMode, "streaming-aws4-hmac-sha256-payload")
+	if strings.HasPrefix(signingMode, "streaming-aws4-hmac-sha256-payload") {
+		return true
+	}
+	return strings.HasPrefix(signingMode, "streaming-unsigned-payload")
 }
 
 func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {
+	probedReader, isAWSChunked := probeAWSChunkedPayload(src)
+	if !isAWSChunked {
+		return io.NopCloser(probedReader)
+	}
+
 	pr, pw := io.Pipe()
 	go func() {
-		if err := decodeAWSChunkedPayload(src, pw); err != nil {
+		if err := decodeAWSChunkedPayload(probedReader, pw); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
 		_ = pw.Close()
 	}()
 	return pr
+}
+
+func probeAWSChunkedPayload(src io.Reader) (io.Reader, bool) {
+	reader := bufio.NewReaderSize(src, 512)
+	headerLine, err := reader.ReadSlice('\n')
+	replay := io.MultiReader(bytes.NewReader(headerLine), reader)
+	if err != nil {
+		return replay, false
+	}
+
+	line := strings.TrimRight(string(headerLine), "\r\n")
+	chunkSizeToken := line
+	if idx := strings.IndexByte(chunkSizeToken, ';'); idx >= 0 {
+		chunkSizeToken = chunkSizeToken[:idx]
+	}
+	chunkSizeToken = strings.TrimSpace(chunkSizeToken)
+	if chunkSizeToken == "" {
+		return replay, false
+	}
+	size, parseErr := strconv.ParseInt(chunkSizeToken, 16, 64)
+	if parseErr != nil || size < 0 {
+		return replay, false
+	}
+	return replay, true
 }
 
 func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
