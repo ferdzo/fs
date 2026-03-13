@@ -139,11 +139,83 @@ func validateObjectKey(key string) *s3APIError {
 	return nil
 }
 
+func objectKeyFromRequest(r *http.Request) (string, *s3APIError) {
+	rawKey := rawObjectKeyFromRequest(r)
+	key, err := normalizeObjectKey(rawKey)
+	if err != nil {
+		apiErr := s3ErrInvalidArgument
+		return "", &apiErr
+	}
+	if apiErr := validateObjectKey(key); apiErr != nil {
+		return "", apiErr
+	}
+	return key, nil
+}
+
+func rawObjectKeyFromRequest(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	bucket := chi.URLParam(r, "bucket")
+	if bucket == "" {
+		return chi.URLParam(r, "*")
+	}
+	escapedPath := r.URL.EscapedPath()
+	prefix := "/" + bucket + "/"
+	if strings.HasPrefix(escapedPath, prefix) {
+		return strings.TrimPrefix(escapedPath, prefix)
+	}
+	return chi.URLParam(r, "*")
+}
+
+func normalizeObjectKey(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	return url.PathUnescape(raw)
+}
+
+func parseCopySource(raw string) (string, string, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "/")
+	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	bucket, rawKey, found := strings.Cut(raw, "/")
+	if !found || strings.TrimSpace(bucket) == "" || rawKey == "" {
+		return "", "", errors.New("invalid copy source")
+	}
+	key, err := normalizeObjectKey(rawKey)
+	if err != nil {
+		return "", "", err
+	}
+	if apiErr := validateObjectKey(key); apiErr != nil {
+		return "", "", errors.New(apiErr.Code)
+	}
+	return bucket, key, nil
+}
+
+func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error {
+	if h.authSvc == nil || !h.authSvc.Config().Enabled {
+		return nil
+	}
+
+	authCtx, ok := auth.GetRequestContext(r.Context())
+	if !ok || !authCtx.Authenticated {
+		return auth.ErrAccessDenied
+	}
+
+	return h.authSvc.Authorize(authCtx.AccessKeyID, auth.RequestTarget{
+		Action: auth.ActionGetObject,
+		Bucket: bucket,
+		Key:    key,
+	})
+}
+
 func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-
-	if apiErr := validateObjectKey(key); apiErr != nil {
+	key, apiErr := objectKeyFromRequest(r)
+	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
 		return
 	}
@@ -200,8 +272,8 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-	if apiErr := validateObjectKey(key); apiErr != nil {
+	key, apiErr := objectKeyFromRequest(r)
+	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
 		return
 	}
@@ -276,8 +348,8 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-	if apiErr := validateObjectKey(key); apiErr != nil {
+	key, apiErr := objectKeyFromRequest(r)
+	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
 		return
 	}
@@ -288,6 +360,10 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	if uploadID != "" || partNumberRaw != "" {
 		if uploadID == "" || partNumberRaw == "" {
 			writeS3Error(w, r, s3ErrInvalidPart, r.URL.Path)
+			return
+		}
+		if strings.TrimSpace(r.Header.Get("x-amz-copy-source")) != "" {
+			writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 			return
 		}
 
@@ -332,6 +408,42 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 			writeS3Error(w, r, s3ErrPreconditionFailed, r.URL.Path)
 			return
 		}
+	}
+
+	if copySourceRaw := strings.TrimSpace(r.Header.Get("x-amz-copy-source")); copySourceRaw != "" {
+		srcBucket, srcKey, err := parseCopySource(copySourceRaw)
+		if err != nil {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+		if err := h.authorizeCopySource(r, srcBucket, srcKey); err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		manifest, err := h.svc.CopyObject(srcBucket, srcKey, bucket, key)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		response := models.CopyObjectResult{
+			Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
+			LastModified: time.Unix(manifest.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
+			ETag:         `"` + manifest.ETag + `"`,
+		}
+		payload, err := xml.MarshalIndent(response, "", "    ")
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(payload)
+		return
 	}
 
 	contentType := r.Header.Get("Content-Type")
@@ -617,8 +729,8 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-	if apiErr := validateObjectKey(key); apiErr != nil {
+	key, apiErr := objectKeyFromRequest(r)
+	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
 		return
 	}
@@ -654,8 +766,8 @@ func (h *Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-	if apiErr := validateObjectKey(key); apiErr != nil {
+	key, apiErr := objectKeyFromRequest(r)
+	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
 		return
 	}

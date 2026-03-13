@@ -158,6 +158,13 @@ type CompleteMultipartUploadResult struct {
 	Location string   `xml:"Location,omitempty"`
 }
 
+type CopyObjectResult struct {
+	XMLName      xml.Name `xml:"CopyObjectResult"`
+	Xmlns        string   `xml:"xmlns,attr,omitempty"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+}
+
 type ListPartsResult struct {
 	XMLName  xml.Name   `xml:"ListPartsResult"`
 	Xmlns    string     `xml:"xmlns,attr"`

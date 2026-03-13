@@ -104,6 +104,38 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 	return manifest, nil
 }
 
+func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) (*models.ObjectManifest, error) {
+	start := time.Now()
+	success := false
+	defer func() {
+		metrics.Default.ObserveService("copy_object", time.Since(start), success)
+	}()
+
+	unlock := s.acquireGCRLock()
+	defer unlock()
+
+	source, err := s.metadata.GetManifest(srcBucket, srcKey)
+	if err != nil {
+		return nil, err
+	}
+
+	manifest := &models.ObjectManifest{
+		Bucket:      dstBucket,
+		Key:         dstKey,
+		Size:        source.Size,
+		ContentType: source.ContentType,
+		ETag:        source.ETag,
+		Chunks:      append([]string(nil), source.Chunks...),
+		CreatedAt:   time.Now().Unix(),
+	}
+	if err := s.metadata.PutManifest(manifest); err != nil {
+		return nil, err
+	}
+
+	success = true
+	return manifest, nil
+}
+
 func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.ObjectManifest, error) {
 	start := time.Now()
 
