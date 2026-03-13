@@ -205,6 +205,29 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	}, nil
 }
 
+func (s *Service) Authorize(accessKeyID string, target RequestTarget) error {
+	if !s.cfg.Enabled {
+		return nil
+	}
+
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return ErrAccessDenied
+	}
+	if target.Action == "" {
+		return ErrAccessDenied
+	}
+
+	policy, err := s.store.GetAuthPolicy(accessKeyID)
+	if err != nil {
+		return ErrAccessDenied
+	}
+	if !isAllowed(policy, target) {
+		return ErrAccessDenied
+	}
+	return nil
+}
+
 func (s *Service) CreateUser(input CreateUserInput) (*CreateUserResult, error) {
 	if !s.cfg.Enabled {
 		return nil, ErrAuthNotEnabled
