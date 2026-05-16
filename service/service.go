@@ -21,6 +21,7 @@ type ObjectService struct {
 	metadata           *metadata.MetadataHandler
 	blob               *storage.BlobStore
 	multipartRetention time.Duration
+	maxUploadSize      int64
 	gcMu               sync.RWMutex
 }
 
@@ -29,16 +30,24 @@ var (
 	ErrInvalidPartOrder       = errors.New("invalid multipart part order")
 	ErrInvalidCompleteRequest = errors.New("invalid complete multipart request")
 	ErrEntityTooSmall         = errors.New("multipart entity too small")
+	ErrEntityTooLarge         = errors.New("entity too large")
 )
 
-func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *storage.BlobStore, multipartRetention time.Duration) *ObjectService {
+const DefaultMaxUploadSize int64 = 5 * 1024 * 1024 * 1024
+
+func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *storage.BlobStore, multipartRetention time.Duration, maxUploadSize ...int64) *ObjectService {
 	if multipartRetention <= 0 {
 		multipartRetention = 24 * time.Hour
+	}
+	limit := DefaultMaxUploadSize
+	if len(maxUploadSize) > 0 {
+		limit = maxUploadSize[0]
 	}
 	return &ObjectService{
 		metadata:           metadataHandler,
 		blob:               blobHandler,
 		multipartRetention: multipartRetention,
+		maxUploadSize:      limit,
 	}
 }
 
@@ -74,7 +83,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 	unlock := s.acquireGCRLock()
 	defer unlock()
 
-	chunks, size, etag, err := s.blob.IngestStream(input)
+	chunks, size, etag, err := s.blob.IngestStream(s.limitUpload(input))
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +167,9 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 		defer func() {
 			metrics.Default.ObserveService("get_object", time.Since(start), streamOK)
 		}()
-		defer metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
+		defer func() {
+			metrics.Default.ObserveLockHold("gc_mu_read", time.Since(holdStart))
+		}()
 		defer s.gcMu.RUnlock()
 		if err := s.blob.AssembleStream(manifest.Chunks, pw); err != nil {
 			_ = pw.CloseWithError(err)
@@ -311,7 +322,7 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 	}
 
 	var uploadedPart models.UploadedPart
-	chunkIds, totalSize, etag, err := s.blob.IngestStream(input)
+	chunkIds, totalSize, etag, err := s.blob.IngestStream(s.limitUpload(input))
 	if err != nil {
 		return "", err
 	}
@@ -400,6 +411,9 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		orderedParts = append(orderedParts, storedPart)
 		chunks = append(chunks, storedPart.Chunks...)
 		totalSize += storedPart.Size
+		if s.maxUploadSize > 0 && totalSize > s.maxUploadSize {
+			return nil, ErrEntityTooLarge
+		}
 	}
 
 	finalETag := buildMultipartETag(orderedParts)
@@ -433,6 +447,40 @@ func (s *ObjectService) AbortMultipartUpload(bucket, key, uploadID string) error
 		return metadata.ErrMultipartNotFound
 	}
 	return s.metadata.AbortMultipartUpload(uploadID)
+}
+
+func (s *ObjectService) limitUpload(input io.Reader) io.Reader {
+	if s.maxUploadSize <= 0 || input == nil {
+		return input
+	}
+	return &maxBytesReader{inner: input, remaining: s.maxUploadSize}
+}
+
+type maxBytesReader struct {
+	inner     io.Reader
+	remaining int64
+	tooLarge  bool
+}
+
+func (r *maxBytesReader) Read(p []byte) (int, error) {
+	if r.tooLarge {
+		return 0, ErrEntityTooLarge
+	}
+	if r.remaining <= 0 {
+		var probe [1]byte
+		n, err := r.inner.Read(probe[:])
+		if n > 0 {
+			r.tooLarge = true
+			return 0, ErrEntityTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.inner.Read(p)
+	r.remaining -= int64(n)
+	return n, err
 }
 
 func normalizeETag(etag string) string {
@@ -469,6 +517,12 @@ func (s *ObjectService) GarbageCollect() error {
 	unlock := s.acquireGCLock()
 	defer unlock()
 
+	var err error
+	cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention)
+	if err != nil {
+		return err
+	}
+
 	referencedChunkSet, err := s.metadata.GetReferencedChunkSet()
 	if err != nil {
 		return err
@@ -489,11 +543,6 @@ func (s *ObjectService) GarbageCollect() error {
 		deletedChunks++
 		return nil
 	}); err != nil {
-		return err
-	}
-
-	cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention)
-	if err != nil {
 		return err
 	}
 
