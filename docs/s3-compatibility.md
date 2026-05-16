@@ -32,12 +32,15 @@ This project is S3-compatible for a focused subset of operations.
 ### Authentication
 - AWS SigV4 header auth
 - AWS SigV4 presigned query auth
-- `aws-chunked` payload decode for streaming uploads
+- `aws-chunked` payload decode for unsigned streaming upload modes
+- SigV4 payload hash verification for fixed-size signed payloads
 
 ## Partially Implemented / Differences
 - Exact parity with AWS S3 error codes/headers is still evolving.
 - Some S3 edge-case behaviors may differ (especially uncommon query/header combinations).
 - Admin API is custom JSON (`/_admin/v1/*`).
+- Object and upload-part payloads are limited by `FS_MAX_OBJECT_UPLOAD_BYTES` (default 5 GiB).
+- Signed `aws-chunked` payload modes that require per-chunk signature verification are rejected until chunk-signature validation is implemented.
 
 ## Not Implemented (Current)
 - Bucket versioning
