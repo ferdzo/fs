@@ -33,12 +33,14 @@ func statementMatches(stmt models.AuthPolicyStatement, target RequestTarget) boo
 	if !bucketMatches(stmt.Bucket, target.Bucket) {
 		return false
 	}
-	if target.Key == "" {
-		return true
-	}
-
 	prefix := strings.TrimSpace(stmt.Prefix)
 	if prefix == "" || prefix == "*" {
+		return true
+	}
+	if target.Key == "" {
+		if target.Action == ActionListBucket {
+			return strings.HasPrefix(target.Prefix, prefix)
+		}
 		return true
 	}
 	return strings.HasPrefix(target.Key, prefix)

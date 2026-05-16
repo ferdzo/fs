@@ -196,6 +196,10 @@ func parseCopySource(raw string) (string, string, error) {
 }
 
 func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error {
+	return h.authorizeObjectAction(r, auth.ActionGetObject, bucket, key)
+}
+
+func (h *Handler) authorizeObjectAction(r *http.Request, action auth.Action, bucket, key string) error {
 	if h.authSvc == nil || !h.authSvc.Config().Enabled {
 		return nil
 	}
@@ -206,7 +210,7 @@ func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error
 	}
 
 	return h.authSvc.Authorize(authCtx.AccessKeyID, auth.RequestTarget{
-		Action: auth.ActionGetObject,
+		Action: action,
 		Bucket: bucket,
 		Key:    key,
 	})
@@ -307,6 +311,10 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxXMLBodyBytes)
 		var req models.CompleteMultipartUploadRequest
 		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
+			if errors.Is(err, auth.ErrSignatureDoesNotMatch) {
+				writeMappedS3Error(w, r, err)
+				return
+			}
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
 				writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
@@ -664,6 +672,10 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 
 	var req models.DeleteObjectsRequest
 	if err := xml.NewDecoder(bodyReader).Decode(&req); err != nil {
+		if errors.Is(err, auth.ErrSignatureDoesNotMatch) {
+			writeMappedS3Error(w, r, err)
+			return
+		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
@@ -696,6 +708,15 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 				Key:     obj.Key,
 				Code:    s3ErrKeyTooLong.Code,
 				Message: s3ErrKeyTooLong.Message,
+			})
+			continue
+		}
+		if err := h.authorizeObjectAction(r, auth.ActionDeleteObject, bucket, obj.Key); err != nil {
+			apiErr := mapToS3Error(err)
+			response.Errors = append(response.Errors, models.DeleteError{
+				Key:     obj.Key,
+				Code:    apiErr.Code,
+				Message: apiErr.Message,
 			})
 			continue
 		}

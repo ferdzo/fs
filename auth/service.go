@@ -152,6 +152,9 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	if err := validateSigV4Input(s.now(), s.cfg, input); err != nil {
 		return RequestContext{}, err
 	}
+	if err := validatePayloadSigningMode(r, input); err != nil {
+		return RequestContext{}, err
+	}
 
 	identity, err := s.store.GetAuthIdentity(input.AccessKeyID)
 	if err != nil {
