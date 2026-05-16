@@ -94,9 +94,11 @@ For each non-health request:
 6. Decrypt stored secret using master key.
 7. Recompute canonical request and expected signature.
 8. Compare signatures.
-9. Resolve target action from request.
-10. Evaluate policy; deny overrides allow.
-11. Store auth result in request context and continue.
+9. Reject signed streaming payload modes that require per-chunk signature verification.
+10. Wrap fixed-size signed payloads so the actual body must match `x-amz-content-sha256`.
+11. Resolve target action from request.
+12. Evaluate policy; deny overrides allow.
+13. Store auth result in request context and continue.
 
 ## Authorization Semantics
 Policy evaluator rules:
@@ -106,6 +108,9 @@ Policy evaluator rules:
   - action: `*` or `s3:*`
   - bucket: `*`
   - prefix: `*`
+- Object actions apply `prefix` to the object key.
+- `ListBucket` applies `prefix` to the requested list `prefix` query value; a scoped list policy such as `prefix=backups/` does not allow an empty-prefix or sibling-prefix bucket listing.
+- Multi-object delete is authorized per object key after the XML body is parsed; denied keys are returned as per-key `AccessDenied` errors and are not deleted.
 
 Action resolution includes:
 - bucket APIs (`CreateBucket`, `ListBucket`, `HeadBucket`, `DeleteBucket`)
@@ -137,6 +142,7 @@ Each audit entry includes method, path, remote IP, and request ID (if present). 
 
 ## Current Scope / Limitations
 - No STS/session-token auth yet.
+- Signed aws-chunked streaming payloads are not accepted until per-chunk signature verification is implemented. Unsigned streaming payload modes can still be decoded by the API layer.
 - Policy language is intentionally minimal, not full IAM.
 - No automatic key rotation workflows.
 - No key rotation endpoint for existing users yet.
