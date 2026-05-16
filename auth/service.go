@@ -188,6 +188,13 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 			AuthType:      authType,
 		}, nil
 	}
+	if RequiresHandlerAuthorization(r) {
+		return RequestContext{
+			Authenticated: true,
+			AccessKeyID:   identity.AccessKeyID,
+			AuthType:      authType,
+		}, nil
+	}
 
 	policy, err := s.store.GetAuthPolicy(identity.AccessKeyID)
 	if err != nil {

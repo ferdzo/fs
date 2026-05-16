@@ -30,6 +30,17 @@ type RequestTarget struct {
 	Prefix string
 }
 
+func RequiresHandlerAuthorization(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	if r.Method == http.MethodPost {
+		_, isDelete := r.URL.Query()["delete"]
+		return isDelete
+	}
+	return false
+}
+
 func resolveTarget(r *http.Request) RequestTarget {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	if path == "" {
