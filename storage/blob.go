@@ -17,6 +17,8 @@ import (
 const blobRoot = "blobs"
 const maxChunkSize = 64 * 1024 * 1024
 
+var ErrChunkIntegrity = errors.New("chunk integrity check failed")
+
 type BlobStore struct {
 	dataRoot  string
 	chunkSize int
@@ -184,6 +186,11 @@ func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {
 	data, err := os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
 	if err != nil {
 		return nil, err
+	}
+	chunkHash := sha256.Sum256(data)
+	actualChunkID := hex.EncodeToString(chunkHash[:])
+	if actualChunkID != chunkID {
+		return nil, fmt.Errorf("%w: expected %s, got %s", ErrChunkIntegrity, chunkID, actualChunkID)
 	}
 	size = int64(len(data))
 	success = true

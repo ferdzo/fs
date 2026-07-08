@@ -210,6 +210,17 @@ func validateSigV4Input(now time.Time, cfg Config, input *sigV4Input) error {
 	return nil
 }
 
+func validatePayloadSigningMode(r *http.Request, input *sigV4Input) error {
+	payloadHash := resolvePayloadHash(r, input.Presigned)
+	if isSignedStreamingPayloadHash(payloadHash) {
+		return fmt.Errorf("%w: signed streaming payload verification is not supported", ErrAuthorizationHeaderMalformed)
+	}
+	if payloadHashRequiresVerification(payloadHash) && !isHexSHA256(payloadHash) {
+		return fmt.Errorf("%w: invalid x-amz-content-sha256", ErrAuthorizationHeaderMalformed)
+	}
+	return nil
+}
+
 func signatureMatches(secret string, r *http.Request, input *sigV4Input) (bool, error) {
 	payloadHash := resolvePayloadHash(r, input.Presigned)
 	canonicalRequest, err := buildCanonicalRequest(r, input.SignedHeaders, payloadHash, input.Presigned)
@@ -231,6 +242,34 @@ func resolvePayloadHash(r *http.Request, presigned bool) string {
 		return "UNSIGNED-PAYLOAD"
 	}
 	return hash
+}
+
+func isSignedStreamingPayloadHash(payloadHash string) bool {
+	payloadHash = strings.ToUpper(strings.TrimSpace(payloadHash))
+	return strings.HasPrefix(payloadHash, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+}
+
+func payloadHashRequiresVerification(payloadHash string) bool {
+	payloadHash = strings.ToUpper(strings.TrimSpace(payloadHash))
+	if payloadHash == "" || payloadHash == "UNSIGNED-PAYLOAD" {
+		return false
+	}
+	if strings.HasPrefix(payloadHash, "STREAMING-UNSIGNED-PAYLOAD") {
+		return false
+	}
+	return true
+}
+
+func isHexSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') && (ch < 'A' || ch > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash string, presigned bool) (string, error) {
