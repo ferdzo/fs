@@ -39,6 +39,7 @@ func RunServer(ctx context.Context) error {
 		"audit_log", logConfig.Audit,
 		"data_path", config.DataPath,
 		"multipart_retention_hours", int(config.MultipartCleanupRetention/time.Hour),
+		"max_object_upload_bytes", config.MaxObjectUploadBytes,
 		"auth_enabled", authConfig.Enabled,
 		"auth_region", authConfig.Region,
 		"admin_api_enabled", config.AdminAPIEnabled,
@@ -63,7 +64,7 @@ func RunServer(ctx context.Context) error {
 		return err
 	}
 
-	objectService := service.NewObjectService(metadataHandler, blobHandler, config.MultipartCleanupRetention)
+	objectService := service.NewObjectService(metadataHandler, blobHandler, config.MultipartCleanupRetention, config.MaxObjectUploadBytes)
 	authService, err := auth.NewService(authConfig, metadataHandler)
 	if err != nil {
 		_ = metadataHandler.Close()

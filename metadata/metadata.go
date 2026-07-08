@@ -902,9 +902,6 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 			if err := json.Unmarshal(v, &upload); err != nil {
 				return err
 			}
-			if upload.State == "pending" {
-				return nil
-			}
 			createdAt, err := time.Parse(time.RFC3339, upload.CreatedAt)
 			if err != nil {
 				return nil

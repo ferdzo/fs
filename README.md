@@ -127,6 +127,9 @@ Required when `FS_AUTH_ENABLED=true`:
 - `FS_ROOT_USER` and `FS_ROOT_PASSWORD` define initial credentials
 - `ADMIN_API_ENABLED=true` enables `/_admin/v1/*` routes (bootstrap key only)
 
+Upload limits:
+- `FS_MAX_OBJECT_UPLOAD_BYTES` limits object PUT payloads, multipart upload parts, and completed multipart object size (default 5 GiB).
+
 Reference: `auth/README.md`
 
 Additional docs:

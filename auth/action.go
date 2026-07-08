@@ -27,6 +27,18 @@ type RequestTarget struct {
 	Action Action
 	Bucket string
 	Key    string
+	Prefix string
+}
+
+func RequiresHandlerAuthorization(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	if r.Method == http.MethodPost {
+		_, isDelete := r.URL.Query()["delete"]
+		return isDelete
+	}
+	return false
 }
 
 func resolveTarget(r *http.Request) RequestTarget {
@@ -51,7 +63,7 @@ func resolveTarget(r *http.Request) RequestTarget {
 		case http.MethodDelete:
 			return RequestTarget{Action: ActionDeleteBucket, Bucket: bucket}
 		case http.MethodGet:
-			return RequestTarget{Action: ActionListBucket, Bucket: bucket}
+			return RequestTarget{Action: ActionListBucket, Bucket: bucket, Prefix: r.URL.Query().Get("prefix")}
 		case http.MethodPost:
 			if _, ok := r.URL.Query()["delete"]; ok {
 				return RequestTarget{Action: ActionDeleteObject, Bucket: bucket}

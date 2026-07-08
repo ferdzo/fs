@@ -41,6 +41,7 @@ const (
 	maxXMLBodyBytes         int64 = 1 << 20
 	maxDeleteObjects              = 1000
 	maxObjectKeyBytes             = 1024
+	maxAWSChunkedLineBytes        = 8 << 10
 	serverReadHeaderTimeout       = 5 * time.Second
 	serverReadTimeout             = 60 * time.Second
 	serverWriteTimeout            = 120 * time.Second
@@ -196,6 +197,10 @@ func parseCopySource(raw string) (string, string, error) {
 }
 
 func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error {
+	return h.authorizeObjectAction(r, auth.ActionGetObject, bucket, key)
+}
+
+func (h *Handler) authorizeObjectAction(r *http.Request, action auth.Action, bucket, key string) error {
 	if h.authSvc == nil || !h.authSvc.Config().Enabled {
 		return nil
 	}
@@ -206,7 +211,7 @@ func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error
 	}
 
 	return h.authSvc.Authorize(authCtx.AccessKeyID, auth.RequestTarget{
-		Action: auth.ActionGetObject,
+		Action: action,
 		Bucket: bucket,
 		Key:    key,
 	})
@@ -307,6 +312,10 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxXMLBodyBytes)
 		var req models.CompleteMultipartUploadRequest
 		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
+			if errors.Is(err, auth.ErrSignatureDoesNotMatch) {
+				writeMappedS3Error(w, r, err)
+				return
+			}
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
 				writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
@@ -379,6 +388,10 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 
 		bodyReader := io.Reader(r.Body)
 		var decodeStream io.ReadCloser
+		if hasUnsupportedAWSChunkedPayload(r) {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
 		if shouldDecodeAWSChunkedPayload(r) {
 			decodeStream = newAWSChunkedDecodingReader(r.Body)
 			defer decodeStream.Close()
@@ -453,6 +466,10 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 
 	bodyReader := io.Reader(r.Body)
 	var decodeStream io.ReadCloser
+	if hasUnsupportedAWSChunkedPayload(r) {
+		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+		return
+	}
 	if shouldDecodeAWSChunkedPayload(r) {
 		decodeStream = newAWSChunkedDecodingReader(r.Body)
 		defer decodeStream.Close()
@@ -508,15 +525,16 @@ func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Reques
 }
 
 func shouldDecodeAWSChunkedPayload(r *http.Request) bool {
-	contentEncoding := strings.ToLower(r.Header.Get("Content-Encoding"))
-	if strings.Contains(contentEncoding, "aws-chunked") {
-		return true
-	}
 	signingMode := strings.ToLower(r.Header.Get("x-amz-content-sha256"))
-	if strings.HasPrefix(signingMode, "streaming-aws4-hmac-sha256-payload") {
-		return true
-	}
 	return strings.HasPrefix(signingMode, "streaming-unsigned-payload")
+}
+
+func hasUnsupportedAWSChunkedPayload(r *http.Request) bool {
+	contentEncoding := strings.ToLower(r.Header.Get("Content-Encoding"))
+	if !strings.Contains(contentEncoding, "aws-chunked") {
+		return false
+	}
+	return !shouldDecodeAWSChunkedPayload(r)
 }
 
 func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {
@@ -537,9 +555,12 @@ func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {
 }
 
 func probeAWSChunkedPayload(src io.Reader) (io.Reader, bool) {
-	reader := bufio.NewReaderSize(src, 512)
+	reader := bufio.NewReaderSize(src, maxAWSChunkedLineBytes)
 	headerLine, err := reader.ReadSlice('\n')
 	replay := io.MultiReader(bytes.NewReader(headerLine), reader)
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return replay, true
+	}
 	if err != nil {
 		return replay, false
 	}
@@ -561,9 +582,9 @@ func probeAWSChunkedPayload(src io.Reader) (io.Reader, bool) {
 }
 
 func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
-	reader := bufio.NewReader(src)
+	reader := bufio.NewReaderSize(src, maxAWSChunkedLineBytes)
 	for {
-		headerLine, err := reader.ReadString('\n')
+		headerLine, err := readAWSChunkedLine(reader)
 		if err != nil {
 			return err
 		}
@@ -580,6 +601,17 @@ func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
 		if chunkSize < 0 {
 			return fmt.Errorf("invalid aws-chunked size: %d", chunkSize)
 		}
+		if chunkSize == 0 {
+			for {
+				line, err := readAWSChunkedLine(reader)
+				if err != nil {
+					return err
+				}
+				if line == "\r\n" || line == "\n" {
+					return nil
+				}
+			}
+		}
 		if chunkSize > 0 {
 			if _, err := io.CopyN(dst, reader, chunkSize); err != nil {
 				return err
@@ -593,19 +625,18 @@ func decodeAWSChunkedPayload(src io.Reader, dst io.Writer) error {
 		if crlf[0] != '\r' || crlf[1] != '\n' {
 			return errors.New("invalid aws-chunked payload terminator")
 		}
-
-		if chunkSize == 0 {
-			for {
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					return err
-				}
-				if line == "\r\n" || line == "\n" {
-					return nil
-				}
-			}
-		}
 	}
+}
+
+func readAWSChunkedLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return "", service.ErrEntityTooLarge
+	}
+	if len(line) > maxAWSChunkedLineBytes {
+		return "", service.ErrEntityTooLarge
+	}
+	return string(line), err
 }
 
 func ifNoneMatchPreconditionFailed(headerValue, etag string) bool {
@@ -664,6 +695,10 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 
 	var req models.DeleteObjectsRequest
 	if err := xml.NewDecoder(bodyReader).Decode(&req); err != nil {
+		if errors.Is(err, auth.ErrSignatureDoesNotMatch) {
+			writeMappedS3Error(w, r, err)
+			return
+		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
@@ -696,6 +731,15 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 				Key:     obj.Key,
 				Code:    s3ErrKeyTooLong.Code,
 				Message: s3ErrKeyTooLong.Message,
+			})
+			continue
+		}
+		if err := h.authorizeObjectAction(r, auth.ActionDeleteObject, bucket, obj.Key); err != nil {
+			apiErr := mapToS3Error(err)
+			response.Errors = append(response.Errors, models.DeleteError{
+				Key:     obj.Key,
+				Code:    apiErr.Code,
+				Message: apiErr.Message,
 			})
 			continue
 		}

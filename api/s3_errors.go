@@ -174,6 +174,8 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrMalformedXML
 	case errors.Is(err, service.ErrEntityTooSmall):
 		return s3ErrEntityTooSmall
+	case errors.Is(err, service.ErrEntityTooLarge):
+		return s3ErrEntityTooLarge
 	case errors.Is(err, auth.ErrAccessDenied):
 		return s3ErrAccessDenied
 	case errors.Is(err, auth.ErrInvalidAccessKeyID):
