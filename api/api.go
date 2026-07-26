@@ -43,11 +43,17 @@ const (
 	maxObjectKeyBytes             = 1024
 	maxAWSChunkedLineBytes        = 8 << 10
 	serverReadHeaderTimeout       = 5 * time.Second
-	serverReadTimeout             = 60 * time.Second
-	serverWriteTimeout            = 120 * time.Second
-	serverIdleTimeout             = 120 * time.Second
-	serverMaxHeaderBytes          = 1 << 20
-	serverMaxConnections          = 1024
+	// serverReadTimeout and serverWriteTimeout are disabled on purpose: both
+	// cover the full request/response lifetime including streaming bodies, so a
+	// finite value truncates large uploads and downloads mid-flight. Read and
+	// idle liveness are still enforced by serverReadHeaderTimeout (header
+	// phase) and serverIdleTimeout (between keepalive requests), and concurrent
+	// load is bounded by serverMaxConnections.
+	serverReadTimeout    = 0
+	serverWriteTimeout   = 0
+	serverIdleTimeout    = 120 * time.Second
+	serverMaxHeaderBytes = 1 << 20
+	serverMaxConnections = 1024
 )
 
 func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service, adminAPI bool) *Handler {
@@ -271,8 +277,14 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusOK)
-	_, err = io.Copy(w, stream)
-
+	if _, err = io.Copy(w, stream); err != nil && !errors.Is(err, context.Canceled) {
+		h.logger.Warn("get_object_stream_failed",
+			"bucket", bucket,
+			"key", key,
+			"etag", manifest.ETag,
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
