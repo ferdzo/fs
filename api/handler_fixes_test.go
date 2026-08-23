@@ -148,3 +148,19 @@ func extractUploadID(t *testing.T, xmlBody string) string {
 	}
 	return xmlBody[start : start+end]
 }
+
+func TestPutObjectRejectsSignedStreamingPayloadWithoutAuth(t *testing.T) {
+	handler, _ := newTestObjectHandler(t)
+
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket/streamed.bin", strings.NewReader("fake-framed-body"))
+	req.Header.Set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")
+	rec := httptest.NewRecorder()
+	handler.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "NotImplemented") {
+		t.Fatalf("expected NotImplemented error XML, got: %s", rec.Body.String())
+	}
+}
