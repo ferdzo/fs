@@ -33,10 +33,7 @@ func statementMatches(stmt models.AuthPolicyStatement, target RequestTarget) boo
 	if !bucketMatches(stmt.Bucket, target.Bucket) {
 		return false
 	}
-	prefix := strings.TrimSpace(stmt.Prefix)
-	if prefix == "" || prefix == "*" {
-		return true
-	}
+	prefix := normalizePrefixPattern(stmt.Prefix)
 	if target.Key == "" {
 		if target.Action == ActionListBucket {
 			return strings.HasPrefix(target.Prefix, prefix)
@@ -44,6 +41,12 @@ func statementMatches(stmt models.AuthPolicyStatement, target RequestTarget) boo
 		return true
 	}
 	return strings.HasPrefix(target.Key, prefix)
+}
+
+// A single trailing "*" in a policy prefix is a wildcard marker; everything
+// before it is matched literally. An empty remainder matches any key.
+func normalizePrefixPattern(raw string) string {
+	return strings.TrimSuffix(strings.TrimSpace(raw), "*")
 }
 
 func actionMatches(actions []string, action Action) bool {
