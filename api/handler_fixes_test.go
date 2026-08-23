@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"fs/logging"
+	"fs/models"
 )
 
 func TestGetObjectAcceptsCaseInsensitiveRangeUnit(t *testing.T) {
@@ -162,5 +163,45 @@ func TestPutObjectRejectsSignedStreamingPayloadWithoutAuth(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "NotImplemented") {
 		t.Fatalf("expected NotImplemented error XML, got: %s", rec.Body.String())
+	}
+}
+
+func TestPostObjectUploadsCannotRideDeleteBypass(t *testing.T) {
+	handler, svc, authSvc := newAuthorizedDeleteHandler(t)
+	handler.setupRoutes()
+	if err := svc.CreateBucket("test-bucket"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	createDeleteUserWithStatements(t, authSvc, []models.AuthPolicyStatement{
+		{Effect: "allow", Actions: []string{"s3:DeleteObject"}, Bucket: "test-bucket"},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/test-bucket/big.bin?uploads&delete=1", nil)
+	signTestSigV4Request(t, req, "delete-user", "delete-secret-1")
+	rec := httptest.NewRecorder()
+	handler.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 AccessDenied; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostObjectCompleteCannotRideDeleteBypass(t *testing.T) {
+	handler, svc, authSvc := newAuthorizedDeleteHandler(t)
+	handler.setupRoutes()
+	if err := svc.CreateBucket("test-bucket"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	createDeleteUserWithStatements(t, authSvc, []models.AuthPolicyStatement{
+		{Effect: "allow", Actions: []string{"s3:DeleteObject"}, Bucket: "test-bucket"},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/test-bucket/big.bin?uploadId=some-id&delete=1", strings.NewReader("<CompleteMultipartUpload/>"))
+	signTestSigV4Request(t, req, "delete-user", "delete-secret-1")
+	rec := httptest.NewRecorder()
+	handler.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 AccessDenied; body=%s", rec.Code, rec.Body.String())
 	}
 }

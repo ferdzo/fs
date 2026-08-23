@@ -317,6 +317,10 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	if _, ok := r.URL.Query()["uploads"]; ok {
+		if err := h.authorizeObjectAction(r, auth.ActionCreateMultipartUpload, bucket, key); err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
 		upload, err := h.svc.CreateMultipartUpload(bucket, key)
 		if err != nil {
 			writeMappedS3Error(w, r, err)
@@ -342,6 +346,10 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+		if err := h.authorizeObjectAction(r, auth.ActionCompleteMultipart, bucket, key); err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxXMLBodyBytes)
 		var req models.CompleteMultipartUploadRequest
 		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
