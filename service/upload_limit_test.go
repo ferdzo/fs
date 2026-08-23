@@ -117,3 +117,18 @@ func newTestObjectService(t *testing.T, maxUploadSize int64) *ObjectService {
 	})
 	return svc
 }
+
+func TestNormalizeETagHandlesUppercaseAndQuotes(t *testing.T) {
+	cases := map[string]string{
+		`"ABC123"`:                           "abc123",
+		"ABC123":                             "abc123",
+		`"abc123"`:                           "abc123",
+		`""`:                                 "",
+		`"D41D8CD98F00B204E9800998ECF8427E"`: "d41d8cd98f00b204e9800998ecf8427e",
+	}
+	for input, want := range cases {
+		if got := normalizeETag(input); got != want {
+			t.Fatalf("normalizeETag(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
