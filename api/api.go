@@ -59,7 +59,7 @@ const (
 func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service, adminAPI bool) *Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.Recoverer)
+	r.Use(s3Recoverer)
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -73,6 +73,26 @@ func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig loggi
 		adminAPI:  adminAPI,
 	}
 	return h
+}
+
+// s3Recoverer converts handler panics into S3-style XML InternalError
+// responses; plain-text 500s break AWS SDK error parsing.
+func s3Recoverer(next http.Handler) http.Handler {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil && rec != http.ErrAbortHandler {
+				slog.Error("panic_recovered",
+					"panic", fmt.Sprintf("%v", rec),
+					"method", r.Method,
+					"path", r.URL.Path,
+					"request_id", middleware.GetReqID(r.Context()),
+				)
+				writeS3Error(w, r, s3ErrInternal, r.URL.Path)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(fn)
 }
 
 func (h *Handler) setupRoutes() {
@@ -314,6 +334,7 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(xml.Header))
 		_, _ = w.Write(payload)
@@ -324,10 +345,6 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxXMLBodyBytes)
 		var req models.CompleteMultipartUploadRequest
 		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
-			if errors.Is(err, auth.ErrSignatureDoesNotMatch) {
-				writeMappedS3Error(w, r, err)
-				return
-			}
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
 				writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
@@ -358,6 +375,7 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(xml.Header))
 		_, _ = w.Write(payload)
@@ -465,6 +483,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(xml.Header))
 		_, _ = w.Write(payload)
@@ -531,6 +550,7 @@ func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(xml.Header))
 	_, _ = w.Write(payload)
@@ -676,6 +696,7 @@ func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -707,10 +728,6 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 
 	var req models.DeleteObjectsRequest
 	if err := xml.NewDecoder(bodyReader).Decode(&req); err != nil {
-		if errors.Is(err, auth.ErrSignatureDoesNotMatch) {
-			writeMappedS3Error(w, r, err)
-			return
-		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
@@ -778,6 +795,7 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(xml.Header))
 	_, _ = w.Write(payload)
@@ -817,6 +835,11 @@ func (h *Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request) {
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	if h.authSvc != nil {
+		if region := strings.TrimSpace(h.authSvc.Config().Region); region != "" {
+			w.Header().Set("x-amz-bucket-region", region)
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -836,7 +859,13 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 	etag := manifest.ETag
 	size := strconv.FormatInt(manifest.Size, 10)
 
+	contentType := manifest.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Length", size)
 	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusOK)
@@ -931,6 +960,7 @@ func (h *Handler) handleGetBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(xml.Header))
 	_, _ = w.Write(payload)
@@ -1318,10 +1348,10 @@ func s3EncodeIfNeeded(value, encodingType string) string {
 }
 
 func parseSingleByteRange(rangeHeader string, size int64) (int64, int64, error) {
-	if size <= 0 || !strings.HasPrefix(rangeHeader, "bytes=") {
+	if size <= 0 || len(rangeHeader) < len("bytes=") || !strings.EqualFold(rangeHeader[:len("bytes=")], "bytes=") {
 		return 0, 0, errors.New("invalid range")
 	}
-	spec := strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
+	spec := strings.TrimSpace(rangeHeader[len("bytes="):])
 	if spec == "" || strings.Contains(spec, ",") {
 		return 0, 0, errors.New("invalid range")
 	}
