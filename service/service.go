@@ -484,7 +484,7 @@ func (r *maxBytesReader) Read(p []byte) (int, error) {
 }
 
 func normalizeETag(etag string) string {
-	return strings.Trim(etag, "\"")
+	return strings.ToLower(strings.Trim(etag, "\""))
 }
 
 func buildMultipartETag(parts []models.UploadedPart) string {
