@@ -1,0 +1,48 @@
+# systemd unit for running fs as a system service.
+#
+# Install:
+#   sudo useradd --system --home-dir /var/lib/fs --shell /usr/sbin/nologin fs
+#   sudo install -m 0755 fs /usr/local/bin/fs
+#   sudo mkdir -p /etc/fs
+#   sudo cp .env.example /etc/fs/fs.env   # then edit keys/secrets
+#   sudo cp contrib/systemd/fs.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fs
+#
+# Data lives in /var/lib/fs (managed by StateDirectory); configuration and
+# secrets come from /etc/fs/fs.env (same variables as .env.example).
+
+[Unit]
+Description=fs object storage server
+Documentation=https://github.com/ferdzo/fs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=fs
+Group=fs
+StateDirectory=fs
+Environment=DATA_PATH=/var/lib/fs
+EnvironmentFile=/etc/fs/fs.env
+ExecStart=/usr/local/bin/fs server
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30
+LimitNOFILE=65535
+
+# Hardening: the process only ever needs its own state directory and network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

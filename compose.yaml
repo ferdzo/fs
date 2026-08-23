@@ -1,0 +1,27 @@
+# Single-node deployment example for fs.
+#
+# The container runs as UID/GID 10001. For host bind mounts, fix ownership once:
+#   sudo chown -R 10001:10001 ./data
+#
+# Secrets: prefer an env_file over inline environment values:
+#   cp .env.example .env   # then edit FS_MASTER_KEY etc.
+# and uncomment the env_file line below.
+
+services:
+  fs:
+    # build: .
+    image: ghcr.io/ferdzo/fs:latest
+    ports:
+      - "2600:2600"
+    # env_file:
+    #   - .env
+    environment:
+      FS_AUTH_ENABLED: "true"
+      # Generate with: openssl rand -base64 32
+      FS_MASTER_KEY: "REPLACE_WITH_SECURE_RANDOM_KEY"
+      FS_ROOT_USER: "admin"
+      FS_ROOT_PASSWORD: "REPLACE_ME"
+      ADMIN_API_ENABLED: "true"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
