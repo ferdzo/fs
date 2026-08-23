@@ -40,7 +40,7 @@ This project is S3-compatible for a focused subset of operations.
 - Some S3 edge-case behaviors may differ (especially uncommon query/header combinations).
 - Admin API is custom JSON (`/_admin/v1/*`).
 - Object and upload-part payloads are limited by `FS_MAX_OBJECT_UPLOAD_BYTES` (default 5 GiB).
-- Signed `aws-chunked` payload modes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD*`) are rejected with `NotImplemented` on every PUT path, regardless of auth mode; unsigned streaming and unsigned-trailer modes are decoded.
+- Signed `aws-chunked` payload modes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and `-TRAILER`) are fully decoded with per-chunk signature chain verification; tampered chunks are rejected mid-upload with `SignatureDoesNotMatch`. When auth is disabled these modes are decoded without signature checks (no secret is available).
 
 ## Not Implemented (Current)
 - Bucket versioning

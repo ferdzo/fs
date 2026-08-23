@@ -226,25 +226,33 @@ func validateSigV4Input(now time.Time, cfg Config, input *sigV4Input) error {
 
 func validatePayloadSigningMode(r *http.Request, input *sigV4Input) error {
 	payloadHash := resolvePayloadHash(r, input.Presigned)
-	if isSignedStreamingPayloadHash(payloadHash) {
-		return fmt.Errorf("%w: signed streaming payload verification is not supported", ErrAuthorizationHeaderMalformed)
-	}
-	if payloadHashRequiresVerification(payloadHash) && !isHexSHA256(payloadHash) {
+	if payloadHashRequiresVerification(payloadHash) && !isHexSHA256(payloadHash) && !isSignedStreamingPayloadHash(payloadHash) {
 		return fmt.Errorf("%w: invalid x-amz-content-sha256", ErrAuthorizationHeaderMalformed)
 	}
 	return nil
 }
 
 func signatureMatches(secret string, r *http.Request, input *sigV4Input) (bool, error) {
+	key, ok, err := signatureMatchsWithKey(secret, r, input)
+	if err != nil {
+		return false, err
+	}
+	_ = key
+	return ok, nil
+}
+
+// signatureMatchsWithKey verifies the envelope signature and additionally
+// returns the derived signing key so streamed-chunk signatures can be chained.
+func signatureMatchsWithKey(secret string, r *http.Request, input *sigV4Input) ([]byte, bool, error) {
 	payloadHash := resolvePayloadHash(r, input.Presigned)
 	canonicalRequest, err := buildCanonicalRequest(r, input.SignedHeaders, payloadHash, input.Presigned)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	stringToSign := buildStringToSign(input.AmzDate, input.Scope, canonicalRequest)
 	signingKey := deriveSigningKey(secret, input.Date, input.Region, input.Service)
 	expectedSig := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
-	return hmac.Equal([]byte(expectedSig), []byte(input.SignatureHex)), nil
+	return signingKey, hmac.Equal([]byte(expectedSig), []byte(input.SignatureHex)), nil
 }
 
 func resolvePayloadHash(r *http.Request, presigned bool) string {

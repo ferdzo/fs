@@ -194,6 +194,8 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrAccessDenied
 	case errors.Is(err, auth.ErrUnsupportedAuthScheme):
 		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, auth.ErrChunkSignatureMismatch):
+		return s3ErrSignatureDoesNotMatch
 	case errors.Is(err, auth.ErrInvalidPresign):
 		return s3ErrInvalidPresign
 	default:

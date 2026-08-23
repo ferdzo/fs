@@ -60,7 +60,7 @@ func Middleware(
 				return
 			}
 
-			if err := wrapPayloadHashVerifier(r); err != nil {
+			if err := wrapRequestBody(r, resolvedCtx); err != nil {
 				metrics.Default.ObserveAuth("error", "sigv4", authErrorClass(err))
 				if onError != nil {
 					onError(w, r, err)
@@ -90,10 +90,15 @@ func Middleware(
 	}
 }
 
-func wrapPayloadHashVerifier(r *http.Request) error {
+func wrapRequestBody(r *http.Request, ctx RequestContext) error {
 	if r == nil || r.Body == nil || r.Body == http.NoBody {
 		return nil
 	}
+	if ctx.Streaming != nil && isSignedStreamingPayloadHash(resolvePayloadHash(r, false)) {
+		r.Body = NewSignedChunkedReader(r.Body, ctx.Streaming)
+		return nil
+	}
+	println("DBG streaming wrap installed")
 	payloadHash := resolvePayloadHash(r, false)
 	if !payloadHashRequiresVerification(payloadHash) {
 		return nil

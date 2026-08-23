@@ -4,8 +4,11 @@ import "context"
 
 type RequestContext struct {
 	Authenticated bool
-	AccessKeyID   string
-	AuthType      string
+	// Streaming carries chunk-signature material for STREAMING-AWS4-HMAC-SHA256*
+	// request bodies; nil unless auth verified such an upload.
+	Streaming   *StreamingAuth
+	AccessKeyID string
+	AuthType    string
 }
 
 type contextKey int

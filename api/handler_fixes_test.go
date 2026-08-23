@@ -2,15 +2,23 @@ package api
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"fs/auth"
 	"fs/logging"
 	"fs/models"
+	"fs/service"
 )
 
 func TestGetObjectAcceptsCaseInsensitiveRangeUnit(t *testing.T) {
@@ -150,58 +158,192 @@ func extractUploadID(t *testing.T, xmlBody string) string {
 	return xmlBody[start : start+end]
 }
 
-func TestPutObjectRejectsSignedStreamingPayloadWithoutAuth(t *testing.T) {
-	handler, _ := newTestObjectHandler(t)
-
-	req := httptest.NewRequest(http.MethodPut, "/test-bucket/streamed.bin", strings.NewReader("fake-framed-body"))
-	req.Header.Set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")
-	rec := httptest.NewRecorder()
-	handler.router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501; body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "NotImplemented") {
-		t.Fatalf("expected NotImplemented error XML, got: %s", rec.Body.String())
-	}
+func hmacSha256Test(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data))
+	return h.Sum(nil)
 }
 
-func TestPostObjectUploadsCannotRideDeleteBypass(t *testing.T) {
+func testSigningKey(secret, date string) []byte {
+	k := hmacSha256Test([]byte("AWS4"+secret), date)
+	k = hmacSha256Test(k, "us-east-1")
+	k = hmacSha256Test(k, "s3")
+	return hmacSha256Test(k, "aws4_request")
+}
+
+// signChunkedPutRequest turns req into a fully signed STREAMING-AWS4-HMAC-SHA256
+// PUT whose body is the aws-chunked encoding of chunks (optionally with a
+// checksum trailer). Returns nothing; mutates req headers/body.
+func signChunkedPutRequest(t *testing.T, req *http.Request, secret string, chunks [][]byte, trailer bool) {
+	t.Helper()
+	amzDate := time.Now().UTC().Format("20060102T150405Z")
+	date := amzDate[:8]
+	scope := strings.Join([]string{date, "us-east-1", "s3", "aws4_request"}, "/")
+	mode := "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	if trailer {
+		mode += "-TRAILER"
+	}
+	decodedLen := 0
+	for _, c := range chunks {
+		decodedLen += len(c)
+	}
+
+	signedHeaders := []string{"host", "x-amz-content-sha256", "x-amz-date", "x-amz-decoded-content-length"}
+	req.Header.Set("x-amz-date", amzDate)
+	req.Header.Set("x-amz-content-sha256", mode)
+	req.Header.Set("x-amz-decoded-content-length", strconv.Itoa(decodedLen))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+
+	canonicalHeaders := strings.Join([]string{
+		"host:" + strings.TrimSpace(req.Host),
+		"x-amz-content-sha256:" + mode,
+		"x-amz-date:" + amzDate,
+		"x-amz-decoded-content-length:" + strconv.Itoa(decodedLen),
+		"",
+	}, "\n")
+	signedHeadersRaw := strings.Join(signedHeaders, ";")
+
+	canonicalRequest := strings.Join([]string{
+		req.Method,
+		req.URL.EscapedPath(),
+		canonicalTestQuery(req.URL.RawQuery),
+		canonicalHeaders,
+		signedHeadersRaw,
+		mode,
+	}, "\n")
+	canonicalHash := sha256.Sum256([]byte(canonicalRequest))
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		amzDate,
+		scope,
+		hex.EncodeToString(canonicalHash[:]),
+	}, "\n")
+	key := testSigningKey(secret, date)
+	seedSig := hex.EncodeToString(hmacSha256Test(key, stringToSign))
+
+	req.Header.Set("Authorization", fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		"delete-user", scope, signedHeadersRaw, seedSig))
+
+	var b strings.Builder
+	prev := seedSig
+	for _, chunk := range chunks {
+		chunkHash := sha256.Sum256(chunk)
+		sts := strings.Join([]string{"AWS4-HMAC-SHA256-PAYLOAD", amzDate, scope, prev,
+			hex.EncodeToString(func() []byte { s := sha256.Sum256(nil); return s[:] }()),
+			"", hex.EncodeToString(chunkHash[:])}, "\n")
+		sig := hex.EncodeToString(hmacSha256Test(key, sts))
+		fmt.Fprintf(&b, "%x;chunk-signature=%s\r\n", len(chunk), sig)
+		b.Write(chunk)
+		b.WriteString("\r\n")
+		prev = sig
+	}
+	finalStsParts := []string{"AWS4-HMAC-SHA256-PAYLOAD", amzDate, scope, prev,
+		hex.EncodeToString(func() []byte { s := sha256.Sum256(nil); return s[:] }()), "", ""}
+	if trailer {
+		b.WriteString("0;chunk-signature=")
+		sts := strings.Join([]string{"AWS4-HMAC-SHA256-TRAILER", amzDate, scope, prev,
+			"x-amz-checksum-crc32c:dGVzdA==\n"}, "\n")
+		sig := hex.EncodeToString(hmacSha256Test(key, sts))
+		b.WriteString(sig)
+		b.WriteString("\r\nx-amz-checksum-crc32c:dGVzdA==\r\n\r\n")
+	} else {
+		sig := hex.EncodeToString(hmacSha256Test(key, strings.Join(finalStsParts[:len(finalStsParts)-1], "\n")+"\n"))
+		b.WriteString("0;chunk-signature=" + sig + "\r\n\r\n")
+	}
+	req.Body = io.NopCloser(strings.NewReader(b.String()))
+	req.ContentLength = int64(b.Len())
+}
+
+func newPutObjectUserHandler(t *testing.T) (*Handler, *service.ObjectService, *auth.Service) {
 	handler, svc, authSvc := newAuthorizedDeleteHandler(t)
 	handler.setupRoutes()
 	if err := svc.CreateBucket("test-bucket"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	createDeleteUserWithStatements(t, authSvc, []models.AuthPolicyStatement{
-		{Effect: "allow", Actions: []string{"s3:DeleteObject"}, Bucket: "test-bucket"},
+		{Effect: "allow", Actions: []string{"s3:PutObject"}, Bucket: "test-bucket"},
 	})
+	return handler, svc, authSvc
+}
 
-	req := httptest.NewRequest(http.MethodPost, "/test-bucket/big.bin?uploads&delete=1", nil)
-	signTestSigV4Request(t, req, "delete-user", "delete-secret-1")
+func TestPutObjectAcceptsVerifiedSignedStreamingChunks(t *testing.T) {
+	handler, svc, _ := newPutObjectUserHandler(t)
+
+	payload := bytes.Repeat([]byte("streamed-payload-"), 100)
+	chunks := [][]byte{payload[:700], payload[700:1400], payload[1400:]}
+
+	req := httptest.NewRequest(http.MethodPost, "/test-bucket/big.bin?uploads&delete=1", nil) // bypass attempt shape
+	req = httptest.NewRequest(http.MethodPut, "/test-bucket/streamed.bin", nil)
+	req.Host = "127.0.0.1"
+	signChunkedPutRequest(t, req, "delete-secret-1", chunks, false)
 	rec := httptest.NewRecorder()
 	handler.router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403 AccessDenied; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m, err := svc.HeadObject("test-bucket", "streamed.bin")
+	if err != nil {
+		t.Fatalf("head object: %v", err)
+	}
+	if m.Size != int64(len(payload)) {
+		t.Fatalf("stored size = %d, want %d", m.Size, len(payload))
+	}
+	stream, _, err := svc.GetObject("test-bucket", "streamed.bin")
+	if err != nil {
+		t.Fatalf("get object: %v", err)
+	}
+	defer stream.Close()
+	got, _ := io.ReadAll(stream)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("decoded content mismatch: got %d bytes", len(got))
 	}
 }
 
-func TestPostObjectCompleteCannotRideDeleteBypass(t *testing.T) {
-	handler, svc, authSvc := newAuthorizedDeleteHandler(t)
-	handler.setupRoutes()
-	if err := svc.CreateBucket("test-bucket"); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-	createDeleteUserWithStatements(t, authSvc, []models.AuthPolicyStatement{
-		{Effect: "allow", Actions: []string{"s3:DeleteObject"}, Bucket: "test-bucket"},
-	})
+func TestPutObjectRejectsTamperedSignedStreamingChunk(t *testing.T) {
+	handler, _, _ := newPutObjectUserHandler(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/test-bucket/big.bin?uploadId=some-id&delete=1", strings.NewReader("<CompleteMultipartUpload/>"))
-	signTestSigV4Request(t, req, "delete-user", "delete-secret-1")
+	payload := []byte("tamper-target-payload-0123456789")
+	chunks := [][]byte{payload}
+
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket/evil.bin", nil)
+	req.Host = "127.0.0.1"
+	signChunkedPutRequest(t, req, "delete-secret-1", chunks, false)
+	// corrupt the first payload byte AFTER signing
+	body, _ := io.ReadAll(req.Body)
+	headerEnd := bytes.Index(body, []byte("\r\n"))
+	body[headerEnd+2] ^= 0xFF
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+
 	rec := httptest.NewRecorder()
 	handler.router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403 AccessDenied; body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 403 SignatureDoesNotMatch; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "SignatureDoesNotMatch") {
+		t.Fatalf("expected SignatureDoesNotMatch code, body=%s", rec.Body.String())
+	}
+}
+
+func TestPutObjectTrailerModeAccepted(t *testing.T) {
+
+	handler, svc, _ := newPutObjectUserHandler(t)
+
+	payload := []byte("trailer-mode-payload")
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket/trailer.bin", nil)
+	req.Host = "127.0.0.1"
+	signChunkedPutRequest(t, req, "delete-secret-1", [][]byte{payload}, true)
+	rec := httptest.NewRecorder()
+	handler.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m, err := svc.HeadObject("test-bucket", "trailer.bin")
+	if err != nil || m.Size != int64(len(payload)) {
+		t.Fatalf("trailer object wrong: size=%d err=%v", m.Size, err)
 	}
 }

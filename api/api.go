@@ -404,10 +404,6 @@ func hasSignedStreamingPayload(r *http.Request) bool {
 
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
-	if hasSignedStreamingPayload(r) {
-		writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
-		return
-	}
 	key, apiErr := objectKeyFromRequest(r)
 	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
@@ -437,16 +433,14 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		bodyReader := io.Reader(r.Body)
 		var decodeStream io.ReadCloser
-		if hasUnsupportedAWSChunkedPayload(r) {
+		bodyReader := selectBodyReader(r, &decodeStream)
+		if bodyReader == nil {
 			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
 			return
 		}
-		if shouldDecodeAWSChunkedPayload(r) {
-			decodeStream = newAWSChunkedDecodingReader(r.Body)
+		if decodeStream != nil {
 			defer decodeStream.Close()
-			bodyReader = decodeStream
 		}
 
 		etag, err := h.svc.UploadPart(bucket, key, uploadID, partNumber, bodyReader)
@@ -516,16 +510,14 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		contentType = "application/octet-stream"
 	}
 
-	bodyReader := io.Reader(r.Body)
 	var decodeStream io.ReadCloser
-	if hasUnsupportedAWSChunkedPayload(r) {
+	bodyReader := selectBodyReader(r, &decodeStream)
+	if bodyReader == nil {
 		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
 		return
 	}
-	if shouldDecodeAWSChunkedPayload(r) {
-		decodeStream = newAWSChunkedDecodingReader(r.Body)
+	if decodeStream != nil {
 		defer decodeStream.Close()
-		bodyReader = decodeStream
 	}
 
 	manifest, err := h.svc.PutObject(bucket, key, contentType, bodyReader)
@@ -577,6 +569,21 @@ func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Reques
 	_, _ = w.Write(payload)
 }
 
+// selectBodyReader picks the decoded stream for a PUT: aws-chunked
+// unsigned decoder or the raw body. Signed-stream bodies were already
+// wrapped by the auth middleware.
+func selectBodyReader(r *http.Request, decodeOut *io.ReadCloser) io.Reader {
+	if hasUnsupportedAWSChunkedPayload(r) {
+		return nil
+	}
+	if shouldDecodeAWSChunkedPayload(r) {
+		ds := newAWSChunkedDecodingReader(r.Body)
+		*decodeOut = ds
+		return ds
+	}
+	return r.Body
+}
+
 func shouldDecodeAWSChunkedPayload(r *http.Request) bool {
 	signingMode := strings.ToLower(r.Header.Get("x-amz-content-sha256"))
 	return strings.HasPrefix(signingMode, "streaming-unsigned-payload")
@@ -587,7 +594,7 @@ func hasUnsupportedAWSChunkedPayload(r *http.Request) bool {
 	if !strings.Contains(contentEncoding, "aws-chunked") {
 		return false
 	}
-	return !shouldDecodeAWSChunkedPayload(r)
+	return !shouldDecodeAWSChunkedPayload(r) && !hasSignedStreamingPayload(r)
 }
 
 func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {

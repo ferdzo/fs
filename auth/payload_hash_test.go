@@ -14,7 +14,7 @@ func TestPayloadHashVerifierAllowsMatchingBody(t *testing.T) {
 	body := "payload"
 	req := newPayloadHashRequest(t, body, body)
 
-	if err := wrapPayloadHashVerifier(req); err != nil {
+	if err := wrapRequestBody(req, RequestContext{}); err != nil {
 		t.Fatalf("wrapPayloadHashVerifier returned error: %v", err)
 	}
 	got, err := io.ReadAll(req.Body)
@@ -29,7 +29,7 @@ func TestPayloadHashVerifierAllowsMatchingBody(t *testing.T) {
 func TestPayloadHashVerifierRejectsMismatchedBody(t *testing.T) {
 	req := newPayloadHashRequest(t, "signed-payload", "actual-payload")
 
-	if err := wrapPayloadHashVerifier(req); err != nil {
+	if err := wrapRequestBody(req, RequestContext{}); err != nil {
 		t.Fatalf("wrapPayloadHashVerifier returned error: %v", err)
 	}
 	_, err := io.ReadAll(req.Body)
@@ -38,16 +38,15 @@ func TestPayloadHashVerifierRejectsMismatchedBody(t *testing.T) {
 	}
 }
 
-func TestPayloadSigningRejectsSignedStreamingMode(t *testing.T) {
+func TestPayloadSigningAllowsSignedStreamingMode(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPut, "http://example.com/b/k", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
 
-	err = validatePayloadSigningMode(req, &sigV4Input{})
-	if !errors.Is(err, ErrAuthorizationHeaderMalformed) {
-		t.Fatalf("validatePayloadSigningMode error = %v, want ErrAuthorizationHeaderMalformed", err)
+	if err := validatePayloadSigningMode(req, &sigV4Input{}); err != nil {
+		t.Fatalf("validatePayloadSigningMode error = %v, want nil", err)
 	}
 }
 
