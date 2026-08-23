@@ -385,8 +385,21 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 }
 
+// hasSignedStreamingPayload reports whether the request declares a
+// chunk-signature streaming mode that fs cannot verify yet.
+func hasSignedStreamingPayload(r *http.Request) bool {
+	return strings.HasPrefix(
+		strings.ToUpper(strings.TrimSpace(r.Header.Get("x-amz-content-sha256"))),
+		"STREAMING-AWS4-HMAC-SHA256",
+	)
+}
+
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
+	if hasSignedStreamingPayload(r) {
+		writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+		return
+	}
 	key, apiErr := objectKeyFromRequest(r)
 	if apiErr != nil {
 		writeS3Error(w, r, *apiErr, r.URL.Path)
