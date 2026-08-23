@@ -34,11 +34,22 @@ func RequiresHandlerAuthorization(r *http.Request) bool {
 	if r == nil || r.URL == nil {
 		return false
 	}
-	if r.Method == http.MethodPost {
-		_, isDelete := r.URL.Query()["delete"]
-		return isDelete
+	if r.Method != http.MethodPost {
+		return false
 	}
-	return false
+	query := r.URL.Query()
+	if _, isDelete := query["delete"]; !isDelete {
+		return false
+	}
+	// Multipart lifecycle requests are policy-checked here like every other
+	// API call; only multi-object delete defers to per-key handler checks.
+	if _, ok := query["uploads"]; ok {
+		return false
+	}
+	if _, ok := query["uploadId"]; ok {
+		return false
+	}
+	return true
 }
 
 func resolveTarget(r *http.Request) RequestTarget {

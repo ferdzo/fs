@@ -37,3 +37,25 @@ func TestResolveTargetListBucketWithoutPrefix(t *testing.T) {
 		t.Fatalf("prefix = %q, want empty", target.Prefix)
 	}
 }
+
+func TestRequiresHandlerAuthorizationOnlyForMultiDelete(t *testing.T) {
+	cases := []struct {
+		url    string
+		method string
+		want   bool
+	}{
+		{"/bucket?delete", http.MethodPost, true},
+		{"/bucket?delete&other=1", http.MethodPost, true},
+		{"/bucket/key?uploads&delete=1", http.MethodPost, false},
+		{"/bucket/key?uploadId=x&delete=1", http.MethodPost, false},
+		{"/bucket?key=delete", http.MethodPost, false},
+		{"/bucket?delete", http.MethodGet, false},
+		{"/bucket", http.MethodPost, false},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(tc.method, tc.url, nil)
+		if got := RequiresHandlerAuthorization(req); got != tc.want {
+			t.Errorf("RequiresHandlerAuthorization(%s %s) = %v, want %v", tc.method, tc.url, got, tc.want)
+		}
+	}
+}
