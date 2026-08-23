@@ -1,4 +1,12 @@
+.git
+.env
+.idea
+.vscode
 *.md
 .gocache/
+.gomodcache/
+.omo/
+.codegraph/
 blobs/
 data/
+coverage*

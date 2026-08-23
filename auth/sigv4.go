@@ -15,6 +15,8 @@ import (
 
 const (
 	sigV4Algorithm = "AWS4-HMAC-SHA256"
+	// AWS SigV4 caps X-Amz-Expires at 7 days regardless of server policy.
+	maxPresignedExpiresSeconds = 7 * 24 * time.Hour / time.Second
 )
 
 type sigV4Input struct {
@@ -101,7 +103,7 @@ func parsePresignedSigV4(r *http.Request) (*sigV4Input, error) {
 		return nil, fmt.Errorf("%w: missing presigned query fields", ErrInvalidPresign)
 	}
 	expires, err := strconv.Atoi(expiresRaw)
-	if err != nil || expires < 0 {
+	if err != nil || expires < 1 || int64(expires) > int64(maxPresignedExpiresSeconds) {
 		return nil, fmt.Errorf("%w: invalid X-Amz-Expires", ErrInvalidPresign)
 	}
 
@@ -112,6 +114,9 @@ func parsePresignedSigV4(r *http.Request) (*sigV4Input, error) {
 	signedHeaders := splitSignedHeaders(signedHeadersRaw)
 	if len(signedHeaders) == 0 {
 		return nil, fmt.Errorf("%w: signed headers are required", ErrInvalidPresign)
+	}
+	if !containsString(signedHeaders, "host") {
+		return nil, fmt.Errorf("%w: host must be a signed header", ErrInvalidPresign)
 	}
 
 	return &sigV4Input{
@@ -161,6 +166,15 @@ func splitSignedHeaders(raw string) []string {
 		headers = append(headers, current)
 	}
 	return headers
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func parseAuthorizationParams(raw string) map[string]string {

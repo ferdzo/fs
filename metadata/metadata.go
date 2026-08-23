@@ -337,7 +337,10 @@ func (h *MetadataHandler) CreateBucket(bucketName string) error {
 			Name:      bucketName,
 			CreatedAt: time.Now(),
 		}
-		data, _ := json.Marshal(manifest)
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			return err
+		}
 
 		return indexBucket.Put([]byte(bucketName), data)
 	})
@@ -900,10 +903,12 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 		if err := uploadsBucket.ForEach(func(k, v []byte) error {
 			upload := models.MultipartUpload{}
 			if err := json.Unmarshal(v, &upload); err != nil {
-				return err
+				keysToDelete = append(keysToDelete, string(k))
+				return nil
 			}
 			createdAt, err := time.Parse(time.RFC3339, upload.CreatedAt)
 			if err != nil {
+				keysToDelete = append(keysToDelete, string(k))
 				return nil
 			}
 			if now.Sub(createdAt) >= retention {

@@ -463,6 +463,10 @@ func (s *Service) SetUserStatus(accessKeyID, status string) (*UserDetails, error
 		return nil, fmt.Errorf("%w: status must be active or disabled", ErrInvalidUserInput)
 	}
 
+	if bootstrap := strings.TrimSpace(s.cfg.BootstrapAccessKey); bootstrap != "" && accessKeyID == bootstrap && normalizedStatus != "active" {
+		return nil, fmt.Errorf("%w: bootstrap user cannot be disabled", ErrInvalidUserInput)
+	}
+
 	identity, err := s.store.GetAuthIdentity(accessKeyID)
 	if err != nil {
 		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
