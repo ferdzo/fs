@@ -145,6 +145,10 @@ func (bs *BlobStore) saveBlob(chunkID string, data []byte) error {
 	cleanup = false
 
 	if err := syncDir(dir); err != nil {
+		// A rename without a synced parent directory may be lost on crash;
+		// drop the chunk so dedup never trusts a possibly-non-durable file.
+		_ = os.Remove(fullPath)
+		cleanup = true
 		return err
 	}
 	writtenBytes = int64(len(data))
