@@ -13,6 +13,7 @@ var (
 	ErrRequestTimeTooSkewed         = errors.New("request time too skewed")
 	ErrExpiredToken                 = errors.New("expired token")
 	ErrCredentialDisabled           = errors.New("credential disabled")
+	ErrRateLimited                  = errors.New("authentication rate limited")
 	ErrAuthNotEnabled               = errors.New("authentication is not enabled")
 	ErrMasterKeyRequired            = errors.New("auth master key is required")
 	ErrInvalidMasterKey             = errors.New("invalid auth master key")

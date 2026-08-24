@@ -57,6 +57,7 @@ type Service struct {
 	cfg       Config
 	store     Store
 	masterKey []byte
+	failures  *failureLimiter
 	now       func() time.Time
 }
 
@@ -66,9 +67,10 @@ func NewService(cfg Config, store Store) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:   cfg,
-		store: store,
-		now:   func() time.Time { return time.Now().UTC() },
+		cfg:      cfg,
+		store:    store,
+		failures: newFailureLimiter(cfg.FailureLimitPerMinute, time.Minute),
+		now:      func() time.Time { return time.Now().UTC() },
 	}
 	if !cfg.Enabled {
 		return svc, nil
@@ -87,6 +89,12 @@ func NewService(cfg Config, store Store) (*Service, error) {
 
 func (s *Service) Config() Config {
 	return s.cfg
+}
+
+// AllowAuthFailure records a failed authentication for the given key and
+// reports whether further attempts from it are still accepted.
+func (s *Service) AllowAuthFailure(key string) bool {
+	return s.failures.allow(key)
 }
 
 func (s *Service) EnsureBootstrap() error {

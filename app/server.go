@@ -31,6 +31,7 @@ func RunServer(ctx context.Context) error {
 		config.AuthBootstrapAccessKey,
 		config.AuthBootstrapSecretKey,
 		config.AuthBootstrapPolicy,
+		config.AuthFailureLimitPerMin,
 	)
 	logger := logging.NewLogger(logConfig)
 	logger.Info("boot",

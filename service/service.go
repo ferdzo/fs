@@ -28,6 +28,7 @@ type ObjectService struct {
 }
 
 var (
+	ErrChunkMissing           = errors.New("chunk file missing from blob store")
 	ErrInvalidPart            = errors.New("invalid multipart part")
 	ErrInvalidPartOrder       = errors.New("invalid multipart part order")
 	ErrInvalidCompleteRequest = errors.New("invalid complete multipart request")
@@ -182,6 +183,19 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 		return nil, nil, mErr
 	}
 	defer release()
+
+	// Pre-flight: fail before a 200 header is committed when any referenced
+	// chunk is missing on disk. In-chunk bitrot still surfaces mid-stream via
+	// the reader's sha256 check; absent files are the silent-truncation class
+	// this pass eliminates.
+	for _, id := range manifest.Chunks {
+		if _, ok := s.blob.StatChunk(id); !ok {
+			release()
+			err := fmt.Errorf("%w: chunk %s", ErrChunkMissing, id)
+			metrics.Default.ObserveService("get_object", time.Since(start), false)
+			return nil, nil, err
+		}
+	}
 
 	pr, pw := io.Pipe()
 	go func() {
