@@ -35,6 +35,8 @@ type Handler struct {
 	logConfig logging.Config
 	authSvc   *auth.Service
 	adminAPI  bool
+
+	bodyReadTimeout time.Duration
 }
 
 const (
@@ -56,7 +58,11 @@ const (
 	serverMaxConnections = 1024
 )
 
-func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service, adminAPI bool) *Handler {
+func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service, adminAPI bool, bodyReadTimeout ...time.Duration) *Handler {
+	timeout := time.Minute
+	if len(bodyReadTimeout) > 0 && bodyReadTimeout[0] > 0 {
+		timeout = bodyReadTimeout[0]
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s3Recoverer)
@@ -71,6 +77,8 @@ func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig loggi
 		logConfig: logConfig,
 		authSvc:   authSvc,
 		adminAPI:  adminAPI,
+
+		bodyReadTimeout: timeout,
 	}
 	return h
 }
@@ -96,6 +104,7 @@ func s3Recoverer(next http.Handler) http.Handler {
 }
 
 func (h *Handler) setupRoutes() {
+	h.router.Use(bodyReadTimeoutMiddleware(h.bodyReadTimeout))
 	h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
 	h.router.Use(auth.Middleware(h.authSvc, h.logger, h.logConfig.Audit, writeMappedS3Error))
 

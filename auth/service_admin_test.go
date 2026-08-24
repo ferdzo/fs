@@ -214,6 +214,7 @@ func newTestAuthService(t *testing.T) (*metadata.MetadataHandler, *Service) {
 		"root-user",
 		"root-secret-123",
 		"",
+		0,
 	)
 	svc, err := NewService(cfg, meta)
 	if err != nil {

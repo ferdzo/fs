@@ -56,6 +56,7 @@ func newAuthorizedDeleteHandler(t *testing.T) (*Handler, *service.ObjectService,
 		"",
 		"",
 		"",
+		0,
 	), md)
 	if err != nil {
 		t.Fatalf("new auth service: %v", err)

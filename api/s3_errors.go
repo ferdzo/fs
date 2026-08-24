@@ -8,7 +8,10 @@ import (
 	"fs/metrics"
 	"fs/models"
 	"fs/service"
+	"fs/storage"
 	"net/http"
+	"os"
+	"syscall"
 
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -20,6 +23,16 @@ type s3APIError struct {
 }
 
 var (
+	s3ErrSlowDown = s3APIError{
+		Status:  http.StatusServiceUnavailable,
+		Code:    "SlowDown",
+		Message: "Please reduce your request rate.",
+	}
+	s3ErrRequestTimeout = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "RequestTimeout",
+		Message: "Your socket connection to the server was not read from or written to within the timeout period.",
+	}
 	s3ErrInvalidObjectKey = s3APIError{
 		Status:  http.StatusBadRequest,
 		Code:    "InvalidArgument",
@@ -194,6 +207,18 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrAccessDenied
 	case errors.Is(err, auth.ErrUnsupportedAuthScheme):
 		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, auth.ErrRateLimited):
+		return s3ErrSlowDown
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return s3ErrRequestTimeout
+	case errors.Is(err, syscall.ECONNRESET):
+		return s3ErrRequestTimeout
+	case errors.Is(err, service.ErrChunkMissing), errors.Is(err, storage.ErrChunkIntegrity):
+		return s3APIError{
+			Status:  http.StatusInternalServerError,
+			Code:    "InternalError",
+			Message: "The object data failed an integrity check. Please retry.",
+		}
 	case errors.Is(err, auth.ErrChunkSignatureMismatch):
 		return s3ErrSignatureDoesNotMatch
 	case errors.Is(err, auth.ErrInvalidPresign):

@@ -19,6 +19,9 @@ const maxChunkSize = 64 * 1024 * 1024
 
 var ErrChunkIntegrity = errors.New("chunk integrity check failed")
 
+// ErrChunkMissing is returned when a referenced chunk file does not exist.
+var ErrChunkMissing = errors.New("chunk file missing")
+
 type BlobStore struct {
 	dataRoot  string
 	chunkSize int
@@ -189,6 +192,9 @@ func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {
 	}
 	data, err := os.ReadFile(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrChunkMissing
+		}
 		return nil, err
 	}
 	chunkHash := sha256.Sum256(data)

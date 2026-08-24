@@ -19,11 +19,13 @@ type Config struct {
 	LogLevel                  string
 	LogFormat                 string
 	AuditLog                  bool
+	BodyReadTimeoutSeconds    int64
 	GcInterval                time.Duration
 	GcEnabled                 bool
 	MultipartCleanupRetention time.Duration
 	AuthEnabled               bool
 	AuthRegion                string
+	AuthFailureLimitPerMin    int
 	AuthSkew                  time.Duration
 	AuthMaxPresign            time.Duration
 	AuthMasterKey             string
@@ -54,11 +56,13 @@ func NewConfig() *Config {
 		AuthRegion:             firstNonEmpty(strings.TrimSpace(os.Getenv("FS_AUTH_REGION")), "us-east-1"),
 		AuthSkew:               time.Duration(envIntRange("FS_AUTH_CLOCK_SKEW_SECONDS", 300, 30, 3600)) * time.Second,
 		AuthMaxPresign:         time.Duration(envIntRange("FS_AUTH_MAX_PRESIGN_SECONDS", 86400, 60, 86400)) * time.Second,
+		AuthFailureLimitPerMin: int(envInt64Range("FS_AUTH_FAILURE_LIMIT_PER_MIN", 600, 0, 100000)),
 		AuthMasterKey:          strings.TrimSpace(os.Getenv("FS_MASTER_KEY")),
 		AuthBootstrapAccessKey: strings.TrimSpace(os.Getenv("FS_ROOT_USER")),
 		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("FS_ROOT_PASSWORD")),
 		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("FS_ROOT_POLICY_JSON")),
 		AdminAPIEnabled:        envBool("ADMIN_API_ENABLED", true),
+		BodyReadTimeoutSeconds: envInt64Range("FS_BODY_READ_TIMEOUT_SECONDS", 60, 0, 86400),
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {
@@ -131,3 +135,5 @@ func sanitizeDataPath(raw string) string {
 	}
 	return cleaned
 }
+
+// fallback: parsed in LoadConfig caller

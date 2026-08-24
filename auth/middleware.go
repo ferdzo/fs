@@ -38,6 +38,16 @@ func Middleware(
 
 			resolvedCtx, err := svc.AuthenticateRequest(r)
 			if err != nil {
+				if errors.Is(err, ErrRateLimited) || !svc.AllowAuthFailure(clientIP(r.RemoteAddr)) {
+					metrics.Default.ObserveAuth("limited", "sigv4", "rate_limited")
+					w.Header().Set("Retry-After", "5")
+					if onError != nil {
+						onError(w, r, ErrRateLimited)
+						return
+					}
+					http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+					return
+				}
 				metrics.Default.ObserveAuth("error", "sigv4", authErrorClass(err))
 				if auditEnabled && logger != nil {
 					requestID := middleware.GetReqID(r.Context())

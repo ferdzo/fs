@@ -39,6 +39,9 @@ This project is S3-compatible for a focused subset of operations.
 - Exact parity with AWS S3 error codes/headers is still evolving.
 - Some S3 edge-case behaviors may differ (especially uncommon query/header combinations).
 - Admin API is custom JSON (`/_admin/v1/*`).
+- Write-only principals can infer key existence via `If-None-Match` preconditions (PUT returns 412 for existing vs proceeding for absent keys). This matches real S3 behaviour for write-only IAM policies.
+- Repeated failed authentications from one source are throttled with `503 SlowDown` + `Retry-After` (tunable via `FS_AUTH_FAILURE_LIMIT_PER_MIN`, 0 disables).
+
 - Object and upload-part payloads are limited by `FS_MAX_OBJECT_UPLOAD_BYTES` (default 5 GiB).
 - Signed `aws-chunked` payload modes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and `-TRAILER`) are fully decoded with per-chunk signature chain verification; tampered chunks are rejected mid-upload with `SignatureDoesNotMatch`. When auth is disabled these modes are decoded without signature checks (no secret is available).
 

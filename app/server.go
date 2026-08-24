@@ -31,6 +31,7 @@ func RunServer(ctx context.Context) error {
 		config.AuthBootstrapAccessKey,
 		config.AuthBootstrapSecretKey,
 		config.AuthBootstrapPolicy,
+		config.AuthFailureLimitPerMin,
 	)
 	logger := logging.NewLogger(logConfig)
 	logger.Info("boot",
@@ -77,7 +78,8 @@ func RunServer(ctx context.Context) error {
 		return err
 	}
 
-	handler := api.NewHandler(objectService, logger, logConfig, authService, config.AdminAPIEnabled)
+	handler := api.NewHandler(objectService, logger, logConfig, authService, config.AdminAPIEnabled,
+		time.Duration(config.BodyReadTimeoutSeconds)*time.Second)
 	addr := config.Address + ":" + strconv.Itoa(config.Port)
 	if config.GcEnabled {
 		go objectService.RunGC(ctx, config.GcInterval)

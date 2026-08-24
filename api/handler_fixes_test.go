@@ -15,10 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"encoding/base64"
 	"fs/auth"
 	"fs/logging"
+	"fs/metadata"
 	"fs/models"
 	"fs/service"
+	"fs/storage"
 )
 
 func TestGetObjectAcceptsCaseInsensitiveRangeUnit(t *testing.T) {
@@ -345,5 +348,59 @@ func TestPutObjectTrailerModeAccepted(t *testing.T) {
 	m, err := svc.HeadObject("test-bucket", "trailer.bin")
 	if err != nil || m.Size != int64(len(payload)) {
 		t.Fatalf("trailer object wrong: size=%d err=%v", m.Size, err)
+	}
+}
+
+func TestAuthFailuresRateLimitedPerSource(t *testing.T) {
+	root := t.TempDir()
+	md, err := metadata.NewMetadataHandler(root + "/metadata.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := storage.NewBlobStore(root, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objSvc := service.NewObjectService(md, blob, time.Hour)
+	t.Cleanup(func() { _ = objSvc.Close() })
+
+	masterKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	authSvc, err := auth.NewService(auth.ConfigFromValues(
+		true, "us-east-1", 0, 0, masterKey,
+		"limit-user", "limit-secret-123456789", "",
+		3, // three failures per minute, per source
+	), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := NewHandler(objSvc, logger, logging.Config{}, authSvc, false, time.Minute)
+	handler.setupRoutes()
+
+	if err := objSvc.CreateBucket("test-bucket"); err != nil {
+		t.Fatal(err)
+	}
+
+	sawSlowDown := false
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/test-bucket/probe.bin", nil)
+		signTestSigV4Request(t, req, "limit-user", "wrong-secret")
+		rec := httptest.NewRecorder()
+		handler.router.ServeHTTP(rec, req)
+
+		if rec.Code == http.StatusServiceUnavailable && strings.Contains(rec.Body.String(), "SlowDown") {
+			if rec.Header().Get("Retry-After") == "" {
+				t.Fatal("SlowDown missing Retry-After header")
+			}
+			sawSlowDown = true
+			break
+		}
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("attempt %d unexpected status %d body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if !sawSlowDown {
+		t.Fatal("expected 503 SlowDown once failure limit exceeded")
 	}
 }
