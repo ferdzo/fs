@@ -19,6 +19,7 @@ type Config struct {
 	LogLevel                  string
 	LogFormat                 string
 	AuditLog                  bool
+	BodyReadTimeoutSeconds    int64
 	GcInterval                time.Duration
 	GcEnabled                 bool
 	MultipartCleanupRetention time.Duration
@@ -59,6 +60,7 @@ func NewConfig() *Config {
 		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("FS_ROOT_PASSWORD")),
 		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("FS_ROOT_POLICY_JSON")),
 		AdminAPIEnabled:        envBool("ADMIN_API_ENABLED", true),
+		BodyReadTimeoutSeconds: envInt64Range("FS_BODY_READ_TIMEOUT_SECONDS", 60, 0, 86400),
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {
@@ -131,3 +133,5 @@ func sanitizeDataPath(raw string) string {
 	}
 	return cleaned
 }
+
+// fallback: parsed in LoadConfig caller

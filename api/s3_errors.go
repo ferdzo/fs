@@ -9,6 +9,8 @@ import (
 	"fs/models"
 	"fs/service"
 	"net/http"
+	"os"
+	"syscall"
 
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -20,6 +22,11 @@ type s3APIError struct {
 }
 
 var (
+	s3ErrRequestTimeout = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "RequestTimeout",
+		Message: "Your socket connection to the server was not read from or written to within the timeout period.",
+	}
 	s3ErrInvalidObjectKey = s3APIError{
 		Status:  http.StatusBadRequest,
 		Code:    "InvalidArgument",
@@ -194,6 +201,10 @@ func mapToS3Error(err error) s3APIError {
 		return s3ErrAccessDenied
 	case errors.Is(err, auth.ErrUnsupportedAuthScheme):
 		return s3ErrAuthorizationHeaderMalformed
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return s3ErrRequestTimeout
+	case errors.Is(err, syscall.ECONNRESET):
+		return s3ErrRequestTimeout
 	case errors.Is(err, auth.ErrChunkSignatureMismatch):
 		return s3ErrSignatureDoesNotMatch
 	case errors.Is(err, auth.ErrInvalidPresign):
