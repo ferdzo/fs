@@ -168,12 +168,23 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	if err != nil {
 		return RequestContext{}, ErrSignatureDoesNotMatch
 	}
-	ok, err := signatureMatches(secret, r, input)
+	signingKey, ok, err := signatureMatchsWithKey(secret, r, input)
 	if err != nil {
 		return RequestContext{}, err
 	}
 	if !ok {
 		return RequestContext{}, ErrSignatureDoesNotMatch
+	}
+
+	var streaming *StreamingAuth
+	payloadMode := resolvePayloadHash(r, input.Presigned)
+	if isSignedStreamingPayloadHash(payloadMode) && !input.Presigned {
+		streaming = &StreamingAuth{
+			SigningKey:    signingKey,
+			AmzDate:       input.AmzDate,
+			Scope:         input.Scope,
+			SeedSignature: strings.ToLower(input.SignatureHex),
+		}
 	}
 
 	authType := "sigv4-header"
@@ -186,6 +197,7 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 			Authenticated: true,
 			AccessKeyID:   identity.AccessKeyID,
 			AuthType:      authType,
+			Streaming:     streaming,
 		}, nil
 	}
 	if RequiresHandlerAuthorization(r) {
@@ -193,6 +205,7 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 			Authenticated: true,
 			AccessKeyID:   identity.AccessKeyID,
 			AuthType:      authType,
+			Streaming:     streaming,
 		}, nil
 	}
 
@@ -212,6 +225,7 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 		Authenticated: true,
 		AccessKeyID:   identity.AccessKeyID,
 		AuthType:      authType,
+		Streaming:     streaming,
 	}, nil
 }
 
