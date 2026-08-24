@@ -260,3 +260,15 @@ func syncDir(dirPath string) error {
 	defer dir.Close()
 	return dir.Sync()
 }
+
+// StatChunk returns the modification time of a stored chunk.
+func (bs *BlobStore) StatChunk(chunkID string) (time.Time, bool) {
+	if !isValidChunkID(chunkID) {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(filepath.Join(bs.dataRoot, blobRoot, chunkID[:2], chunkID[2:4], chunkID))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
+}

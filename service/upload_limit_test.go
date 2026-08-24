@@ -66,6 +66,7 @@ func TestUploadPartRejectsOversizedUpload(t *testing.T) {
 func TestGarbageCollectRemovesExpiredPendingMultipartChunks(t *testing.T) {
 	svc := newTestObjectService(t, 1024)
 	svc.multipartRetention = time.Nanosecond
+	svc.gcGrace = time.Nanosecond
 	if err := svc.CreateBucket("test-bucket"); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
