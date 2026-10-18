@@ -10,6 +10,7 @@ import (
 	"fs/models"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -187,11 +188,46 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	var streaming *StreamingAuth
 	payloadMode := resolvePayloadHash(r, input.Presigned)
 	if isSignedStreamingPayloadHash(payloadMode) && !input.Presigned {
+		trailerMode, ok := resolveSignedStreamingMode(payloadMode)
+		if !ok {
+			return RequestContext{}, fmt.Errorf("%w: unsupported signed streaming payload mode %q",
+				ErrAuthorizationHeaderMalformed, payloadMode)
+		}
+		if !signedHeaderListed(input, "x-amz-decoded-content-length") {
+			return RequestContext{}, fmt.Errorf(
+				"%w: x-amz-decoded-content-length must be a signed header for signed streaming",
+				ErrAuthorizationHeaderMalformed)
+		}
+		decodedLength, err := requiredDecodedContentLength(r)
+		if err != nil {
+			return RequestContext{}, err
+		}
+
+		var trailerNames []string
+		if trailerMode {
+			if !signedHeaderListed(input, "x-amz-trailer") {
+				return RequestContext{}, fmt.Errorf(
+					"%w: x-amz-trailer must be a signed header for trailer streaming",
+					ErrAuthorizationHeaderMalformed)
+			}
+			trailerNames, err = requiredTrailerNames(r)
+			if err != nil {
+				return RequestContext{}, err
+			}
+		} else if strings.TrimSpace(r.Header.Get("x-amz-trailer")) != "" {
+			return RequestContext{}, fmt.Errorf("%w: x-amz-trailer requires trailer streaming mode",
+				ErrAuthorizationHeaderMalformed)
+		}
+
 		streaming = &StreamingAuth{
-			SigningKey:    signingKey,
-			AmzDate:       input.AmzDate,
-			Scope:         input.Scope,
-			SeedSignature: strings.ToLower(input.SignatureHex),
+			SigningKey:              signingKey,
+			AmzDate:                 input.AmzDate,
+			Scope:                   input.Scope,
+			SeedSignature:           strings.ToLower(input.SignatureHex),
+			DecodedContentLength:    decodedLength,
+			HasDecodedContentLength: true,
+			TrailerMode:             trailerMode,
+			TrailerNames:            trailerNames,
 		}
 	}
 
@@ -235,6 +271,64 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 		AuthType:      authType,
 		Streaming:     streaming,
 	}, nil
+}
+
+// requiredDecodedContentLength reads the x-amz-decoded-content-length header
+// that every signed streaming upload must carry, per the SigV4 chunked-upload
+// specification. It rejects a missing, non-integer, or negative value.
+func requiredDecodedContentLength(r *http.Request) (int64, error) {
+	raw := strings.TrimSpace(r.Header.Get("x-amz-decoded-content-length"))
+	if raw == "" {
+		return 0, fmt.Errorf("%w: x-amz-decoded-content-length is required for signed streaming",
+			ErrAuthorizationHeaderMalformed)
+	}
+	length, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || length < 0 {
+		return 0, fmt.Errorf("%w: invalid x-amz-decoded-content-length %q",
+			ErrAuthorizationHeaderMalformed, raw)
+	}
+	return length, nil
+}
+
+// signedHeaderListed reports whether name is part of the request's signed
+// header list. Header names are case-insensitive per SigV4.
+func signedHeaderListed(input *sigV4Input, name string) bool {
+	if input == nil {
+		return false
+	}
+	for _, header := range input.SignedHeaders {
+		if strings.EqualFold(strings.TrimSpace(header), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// requiredTrailerNames parses the signed x-amz-trailer header into the
+// lowercased, deduplicated list of declared trailer names. It rejects empty,
+// duplicate, or reserved names.
+func requiredTrailerNames(r *http.Request) ([]string, error) {
+	raw := strings.TrimSpace(r.Header.Get("x-amz-trailer"))
+	if raw == "" {
+		return nil, fmt.Errorf("%w: x-amz-trailer is required for trailer streaming",
+			ErrAuthorizationHeaderMalformed)
+	}
+	seen := make(map[string]struct{})
+	var names []string
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.ToLower(strings.TrimSpace(part))
+		if name == "" || name == trailerSignatureHeader {
+			return nil, fmt.Errorf("%w: invalid x-amz-trailer entry %q",
+				ErrAuthorizationHeaderMalformed, part)
+		}
+		if _, dup := seen[name]; dup {
+			return nil, fmt.Errorf("%w: duplicate x-amz-trailer name %q",
+				ErrAuthorizationHeaderMalformed, name)
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func (s *Service) Authorize(accessKeyID string, target RequestTarget) error {
