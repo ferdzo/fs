@@ -70,6 +70,90 @@ func TestAssembleStreamDetectsCorruptedChunk(t *testing.T) {
 	}
 }
 
+func TestIngestStreamWithPinCallsBeforeSave(t *testing.T) {
+	root := t.TempDir()
+	bs, err := NewBlobStore(root, 4)
+	if err != nil {
+		t.Fatalf("new blob store: %v", err)
+	}
+
+	var seen []string
+	if _, _, _, err := bs.IngestStreamWithPin(strings.NewReader("abcd"), func(chunkID string) error {
+		if _, ok := bs.StatChunk(chunkID); ok {
+			t.Fatalf("chunk %s was saved before the pin callback", chunkID)
+		}
+		seen = append(seen, chunkID)
+		return nil
+	}); err != nil {
+		t.Fatalf("IngestStreamWithPin: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("callback calls = %d, want 1", len(seen))
+	}
+	if _, ok := bs.StatChunk(seen[0]); !ok {
+		t.Fatalf("chunk %s was not saved after the callback", seen[0])
+	}
+}
+
+func TestIngestStreamWithPinCallsBeforeDedupStat(t *testing.T) {
+	root := t.TempDir()
+	bs, err := NewBlobStore(root, 4)
+	if err != nil {
+		t.Fatalf("new blob store: %v", err)
+	}
+	first, _, _, err := bs.IngestStream(strings.NewReader("abcd"))
+	if err != nil {
+		t.Fatalf("initial ingest: %v", err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("initial chunk count = %d, want 1", len(first))
+	}
+
+	calls := 0
+	second, _, _, err := bs.IngestStreamWithPin(strings.NewReader("abcd"), func(chunkID string) error {
+		calls++
+		if chunkID != first[0] {
+			t.Fatalf("callback chunk = %s, want %s", chunkID, first[0])
+		}
+		if _, ok := bs.StatChunk(chunkID); !ok {
+			t.Fatalf("dedup callback should run even when chunk already exists")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("duplicate IngestStreamWithPin: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("callback calls on duplicate ingest = %d, want 1", calls)
+	}
+	if len(second) != 1 || second[0] != first[0] {
+		t.Fatalf("duplicate chunks = %v, want [%s]", second, first[0])
+	}
+}
+
+func TestIngestStreamWithPinErrorAbortsSave(t *testing.T) {
+	root := t.TempDir()
+	bs, err := NewBlobStore(root, 4)
+	if err != nil {
+		t.Fatalf("new blob store: %v", err)
+	}
+
+	var attempted string
+	_, _, _, err = bs.IngestStreamWithPin(strings.NewReader("abcd"), func(chunkID string) error {
+		attempted = chunkID
+		return errors.New("pin failed")
+	})
+	if err == nil {
+		t.Fatal("IngestStreamWithPin succeeded despite callback error")
+	}
+	if attempted == "" {
+		t.Fatal("callback was not invoked")
+	}
+	if _, ok := bs.StatChunk(attempted); ok {
+		t.Fatalf("chunk %s was saved after callback failure", attempted)
+	}
+}
+
 func corruptChunk(t *testing.T, root, chunkID string, data []byte) {
 	t.Helper()
 	path := filepath.Join(root, blobRoot, chunkID[:2], chunkID[2:4], chunkID)
