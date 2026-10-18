@@ -14,6 +14,7 @@ import (
 	"fs/metrics"
 	"fs/models"
 	"fs/service"
+	"fs/utils"
 	"io"
 	"log/slog"
 	"net"
@@ -613,13 +614,13 @@ func newAWSChunkedDecodingReader(src io.Reader) io.ReadCloser {
 	}
 
 	pr, pw := io.Pipe()
-	go func() {
+	utils.Go("aws-chunked-decode", func() {
 		if err := decodeAWSChunkedPayload(probedReader, pw); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
 		_ = pw.Close()
-	}()
+	})
 	return pr
 }
 
@@ -1461,13 +1462,13 @@ func (h *Handler) Start(ctx context.Context, address string) error {
 	}
 	limitedListener := newLimitedListener(listener, serverMaxConnections)
 
-	go func() {
+	utils.Go("http-serve", func() {
 		if err := server.Serve(limitedListener); err != nil {
 			if !errors.Is(err, http.ErrServerClosed) {
 				errCh <- err
 			}
 		}
-	}()
+	})
 
 	select {
 	case <-ctx.Done():

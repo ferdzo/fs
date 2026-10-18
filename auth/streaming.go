@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"fs/utils"
 	"io"
 	"strconv"
 	"strings"
@@ -31,7 +33,15 @@ const (
 	trailerSigLabel      = "AWS4-HMAC-SHA256-TRAILER"
 	chunkSigPrefix       = ";chunk-signature="
 	maxChunkHeaderLength = 8 << 10
+	// maxStreamingChunkBytes caps a single aws-chunked data chunk per the
+	// AWS SigV4 streaming spec (64KiB). Without a cap a peer can declare a
+	// multi-GB chunk and force a matching allocation via make([]byte, size).
+	maxStreamingChunkBytes = 64 << 10
 )
+
+// ErrChunkTooLarge is returned when a streamed chunk declares a size above
+// maxStreamingChunkBytes.
+var ErrChunkTooLarge = errors.New("streaming chunk too large")
 
 var emptyStringSHA256 = hex.EncodeToString(func() []byte {
 	sum := sha256.Sum256(nil)
@@ -44,15 +54,14 @@ var emptyStringSHA256 = hex.EncodeToString(func() []byte {
 // disabled deployments have no secret to check against).
 func NewSignedChunkedReader(src io.ReadCloser, sa *StreamingAuth) io.ReadCloser {
 	pr, pw := io.Pipe()
-	go func() {
+	utils.Go("signed-chunked-pump", func() {
 		err := pumpSignedChunks(src, pw, sa != nil, sa)
 		if err == nil {
 			_ = pw.Close()
 			return
 		}
-		println("DBG pump err:", err.Error())
 		_ = pw.CloseWithError(err)
-	}()
+	})
 	return pr
 }
 
@@ -87,7 +96,7 @@ func pumpSignedChunks(src io.Reader, dst io.Writer, verify bool, sa *StreamingAu
 
 		if sa != nil && size > 0 {
 			sig := computeChunkSignature(sa, prevSig, payload, nil)
-			if sig != chunkSig {
+			if !equalSignature(sig, chunkSig) {
 				return fmt.Errorf("%w: expected %s got %s", ErrChunkSignatureMismatch, sig, chunkSig)
 			}
 			prevSig = sig
@@ -106,7 +115,7 @@ func pumpSignedChunks(src io.Reader, dst io.Writer, verify bool, sa *StreamingAu
 		}
 		if sa != nil && len(trailers) > 0 {
 			sig := computeChunkSignature(sa, prevSig, nil, trailers)
-			if sig != chunkSig {
+			if !equalSignature(sig, chunkSig) {
 				return fmt.Errorf("%w: trailer signature expected %s got %s",
 					ErrChunkSignatureMismatch, sig, chunkSig)
 			}
@@ -129,6 +138,9 @@ func parseChunkHeader(line string, requireSig bool) (int64, string, error) {
 	size, err := strconv.ParseInt(sizeToken, 16, 64)
 	if err != nil || size < 0 {
 		return 0, "", fmt.Errorf("invalid chunk size %q", sizeToken)
+	}
+	if size > maxStreamingChunkBytes {
+		return 0, "", fmt.Errorf("%w: declared %d exceeds maximum %d", ErrChunkTooLarge, size, maxStreamingChunkBytes)
 	}
 	if sig != "" && len(sig) != sha256.Size*2 {
 		return 0, "", fmt.Errorf("invalid chunk signature length %d", len(sig))
@@ -154,6 +166,13 @@ func computeChunkSignature(sa *StreamingAuth, prevSig string, payload []byte, tr
 	mac := hmac.New(sha256.New, sa.SigningKey)
 	mac.Write([]byte(stringToSign))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func equalSignature(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func canonicalTrailerBlock(trailers []string) string {

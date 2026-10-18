@@ -108,7 +108,6 @@ func wrapRequestBody(r *http.Request, ctx RequestContext) error {
 		r.Body = NewSignedChunkedReader(r.Body, ctx.Streaming)
 		return nil
 	}
-	println("DBG streaming wrap installed")
 	payloadHash := resolvePayloadHash(r, false)
 	if !payloadHashRequiresVerification(payloadHash) {
 		return nil

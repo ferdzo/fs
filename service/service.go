@@ -10,6 +10,7 @@ import (
 	"fs/metrics"
 	"fs/models"
 	"fs/storage"
+	"fs/utils"
 	"io"
 	"log/slog"
 	"strings"
@@ -198,7 +199,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	}
 
 	pr, pw := io.Pipe()
-	go func() {
+	utils.Go("get-object-stream", func() {
 		streamOK := false
 		defer func() {
 			metrics.Default.ObserveService("get_object", time.Since(start), streamOK)
@@ -211,7 +212,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 			return
 		}
 		streamOK = true
-	}()
+	})
 	return pr, manifest, nil
 }
 
