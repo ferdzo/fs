@@ -1,0 +1,123 @@
+name: Release
+
+# Publishing a version tag is the only trigger: a GitHub Release is created
+# from an already-reviewed tag, never from a branch.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: |
+          export GOCACHE=/tmp/go-build-cache
+          go test ./... -count=1
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          date_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          binary="fs"
+          [ "${GOOS}" = "windows" ] && binary="fs.exe"
+          archive="fs_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${date_utc}" \
+            -o "dist/${binary}" .
+          cp README.md LICENSE.md dist/
+          if [ "${GOOS}" = "windows" ]; then
+            (cd dist && zip -q "${archive}.zip" "${binary}" README.md LICENSE.md)
+          else
+            (cd dist && tar -czf "${archive}.tar.gz" "${binary}" README.md LICENSE.md)
+          fi
+          rm -f "dist/${binary}" dist/README.md dist/LICENSE.md
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Released ${GITHUB_REF_NAME}"
+            echo
+            echo "- Binaries: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64"
+            echo "- Container image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}\` (built by the Release Image workflow)"
+          } >> "$GITHUB_STEP_SUMMARY"
