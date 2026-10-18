@@ -23,9 +23,15 @@ type ObjectService struct {
 	blob               *storage.BlobStore
 	multipartRetention time.Duration
 	maxUploadSize      int64
-	gcMu               sync.RWMutex
 	chunkPins          *chunkPinRegistry
+	gcRunMu            sync.Mutex
 	gcGrace            time.Duration
+
+	// Narrow, unexported test hooks used only to make ordering races
+	// deterministic in tests. They are nil in production.
+	testHookAfterGCSnapshot  func()
+	testHookCopyAfterPin     func()
+	testHookCompleteAfterPin func()
 }
 
 var (
@@ -57,46 +63,146 @@ func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *st
 	}
 }
 
-// chunkPinRegistry tracks chunk sets actively being streamed so the garbage
-// collector never deletes data mid-read. Pins are registered under the
-// manifest lock and released when the response completes.
+// chunkPinRegistry tracks chunk sets actively needed by in-flight operations so
+// the garbage collector never unlinks a chunk that a reader or writer still
+// depends on. Pins are refcounted; each per-operation lease deduplicates IDs so
+// repeated chunk IDs in one stream count once and release exactly once.
 type chunkPinRegistry struct {
-	mu   sync.Mutex
-	next int64
-	pins map[int64]map[string]struct{}
+	mu     sync.Mutex
+	next   uint64
+	counts map[string]int
+	leases map[uint64]*chunkLease
+	epoch  *gcEpoch
+}
+
+type chunkLease struct {
+	registry *chunkPinRegistry
+	id       uint64
+	write    bool
+	held     map[string]struct{}
+	released bool
+}
+
+// gcEpoch records chunk IDs that a write lease pinned while a GC pass was in
+// flight. Entries are retained until the pass ends even if the writer releases,
+// so a chunk written after the metadata snapshot cannot be unlinked on this
+// same pass after its manifest becomes visible.
+type gcEpoch struct {
+	born map[string]struct{}
 }
 
 func newChunkPinRegistry() *chunkPinRegistry {
-	return &chunkPinRegistry{pins: map[int64]map[string]struct{}{}}
+	return &chunkPinRegistry{
+		counts: map[string]int{},
+		leases: map[uint64]*chunkLease{},
+	}
 }
 
-func (r *chunkPinRegistry) add(chunkIDs []string) (int64, func()) {
-	set := make(map[string]struct{}, len(chunkIDs))
-	for _, id := range chunkIDs {
-		set[id] = struct{}{}
-	}
-	r.mu.Lock()
-	id := r.next
-	r.next++
-	r.pins[id] = set
-	r.mu.Unlock()
-	release := func() {
-		r.mu.Lock()
-		delete(r.pins, id)
-		r.mu.Unlock()
-	}
-	return id, release
-}
-
-func (r *chunkPinRegistry) isPinned(chunkID string) bool {
+func (r *chunkPinRegistry) newLease(write bool) *chunkLease {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, set := range r.pins {
-		if _, ok := set[chunkID]; ok {
-			return true
+	return r.newLeaseLocked(write)
+}
+
+func (r *chunkPinRegistry) newLeaseLocked(write bool) *chunkLease {
+	lease := &chunkLease{
+		registry: r,
+		id:       r.next,
+		write:    write,
+		held:     map[string]struct{}{},
+	}
+	r.next++
+	r.leases[lease.id] = lease
+	return lease
+}
+
+func (l *chunkLease) Pin(chunkID string) {
+	l.registry.mu.Lock()
+	defer l.registry.mu.Unlock()
+	l.pinLocked(chunkID)
+}
+
+func (l *chunkLease) pinAllLocked(chunkIDs []string) {
+	if l.released {
+		return
+	}
+	for _, chunkID := range chunkIDs {
+		l.pinLocked(chunkID)
+	}
+}
+
+func (l *chunkLease) pinLocked(chunkID string) {
+	if l.released {
+		return
+	}
+	if _, ok := l.held[chunkID]; ok {
+		return
+	}
+	l.held[chunkID] = struct{}{}
+	l.registry.counts[chunkID]++
+	if l.write && l.registry.epoch != nil {
+		l.registry.epoch.born[chunkID] = struct{}{}
+	}
+}
+
+func (l *chunkLease) Release() {
+	r := l.registry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l.released {
+		return
+	}
+	l.released = true
+	for chunkID := range l.held {
+		if count := r.counts[chunkID]; count <= 1 {
+			delete(r.counts, chunkID)
+		} else {
+			r.counts[chunkID] = count - 1
 		}
 	}
-	return false
+	delete(r.leases, l.id)
+	l.held = nil
+}
+
+func (r *chunkPinRegistry) beginEpochLocked() *gcEpoch {
+	epoch := &gcEpoch{born: map[string]struct{}{}}
+	for _, lease := range r.leases {
+		if !lease.write {
+			continue
+		}
+		for chunkID := range lease.held {
+			epoch.born[chunkID] = struct{}{}
+		}
+	}
+	r.epoch = epoch
+	return epoch
+}
+
+func (r *chunkPinRegistry) endEpoch(epoch *gcEpoch) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.epoch == epoch {
+		r.epoch = nil
+	}
+}
+
+func (r *chunkPinRegistry) protectedLocked(epoch *gcEpoch, chunkID string) bool {
+	if _, ok := epoch.born[chunkID]; ok {
+		return true
+	}
+	return r.counts[chunkID] > 0
+}
+
+// pinCount reports the total refcount across leases. It is unexported and used
+// by focused tests to prove leases are released on every exit path.
+func (r *chunkPinRegistry) pinCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	total := 0
+	for _, count := range r.counts {
+		total += count
+	}
+	return total
 }
 
 func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
@@ -106,7 +212,13 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		metrics.Default.ObserveService("put_object", time.Since(start), success)
 	}()
 
-	chunks, size, etag, err := s.blob.IngestStream(s.limitUpload(input))
+	writeLease := s.chunkPins.newLease(true)
+	defer writeLease.Release()
+
+	chunks, size, etag, err := s.blob.IngestStreamWithPin(s.limitUpload(input), func(chunkID string) error {
+		writeLease.Pin(chunkID)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -143,9 +255,20 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 		metrics.Default.ObserveService("copy_object", time.Since(start), success)
 	}()
 
+	s.chunkPins.mu.Lock()
+	writeLease := s.chunkPins.newLeaseLocked(true)
 	source, err := s.metadata.GetManifest(srcBucket, srcKey)
+	if err == nil {
+		writeLease.pinAllLocked(source.Chunks)
+	}
+	s.chunkPins.mu.Unlock()
 	if err != nil {
+		writeLease.Release()
 		return nil, err
+	}
+	defer writeLease.Release()
+	if s.testHookCopyAfterPin != nil {
+		s.testHookCopyAfterPin()
 	}
 
 	manifest := &models.ObjectManifest{
@@ -168,14 +291,18 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.ObjectManifest, error) {
 	start := time.Now()
 
+	// Snapshot the manifest and pin its chunks under the registry mutex so a GC
+	// final check either observes this read lease or runs after it. The registry
+	// mutex is released before any pipe I/O.
 	waitStart := time.Now()
-	s.gcMu.RLock()
+	s.chunkPins.mu.Lock()
 	manifest, mErr := s.metadata.GetManifest(bucket, key)
-	var release func()
+	var readLease *chunkLease
 	if mErr == nil {
-		_, release = s.chunkPins.add(manifest.Chunks)
+		readLease = s.chunkPins.newLeaseLocked(false)
+		readLease.pinAllLocked(manifest.Chunks)
 	}
-	s.gcMu.RUnlock()
+	s.chunkPins.mu.Unlock()
 	metrics.Default.ObserveLockWait("gc_mu_read", waitStart.Sub(start))
 	metrics.Default.ObserveLockHold("gc_mu_read", time.Since(waitStart))
 
@@ -183,7 +310,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 		metrics.Default.ObserveService("get_object", time.Since(start), false)
 		return nil, nil, mErr
 	}
-	defer release()
+	release := readLease.Release
 
 	// Pre-flight: fail before a 200 header is committed when any referenced
 	// chunk is missing on disk. In-chunk bitrot still surfaces mid-stream via
@@ -202,6 +329,13 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	utils.Go("get-object-stream", func() {
 		streamOK := false
 		defer func() {
+			if r := recover(); r != nil {
+				_ = pw.CloseWithError(fmt.Errorf("get-object-stream panic: %v", r))
+				release()
+				metrics.Default.ObserveService("get_object", time.Since(start), false)
+				panic(r)
+			}
+			release()
 			metrics.Default.ObserveService("get_object", time.Since(start), streamOK)
 		}()
 		if err := s.blob.AssembleStream(manifest.Chunks, pw); err != nil {
@@ -213,7 +347,21 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 		}
 		streamOK = true
 	})
-	return pr, manifest, nil
+	return &leasedReadCloser{PipeReader: pr, release: release}, manifest, nil
+}
+
+// leasedReadCloser releases the stream's read lease when the client closes the
+// body, covering clients that abort before the pump finishes. The pump also
+// releases on completion/error; chunkLease.Release is idempotent.
+type leasedReadCloser struct {
+	*io.PipeReader
+	release func()
+	once    sync.Once
+}
+
+func (r *leasedReadCloser) Close() error {
+	r.once.Do(r.release)
+	return r.PipeReader.Close()
 }
 
 func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, error) {
@@ -326,8 +474,14 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 		return "", metadata.ErrMultipartNotFound
 	}
 
+	writeLease := s.chunkPins.newLease(true)
+	defer writeLease.Release()
+
 	var uploadedPart models.UploadedPart
-	chunkIds, totalSize, etag, err := s.blob.IngestStream(s.limitUpload(input))
+	chunkIds, totalSize, etag, err := s.blob.IngestStreamWithPin(s.limitUpload(input), func(chunkID string) error {
+		writeLease.Pin(chunkID)
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
@@ -377,10 +531,24 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		return nil, metadata.ErrMultipartNotFound
 	}
 
+	s.chunkPins.mu.Lock()
+	writeLease := s.chunkPins.newLeaseLocked(true)
 	storedParts, err := s.metadata.ListMultipartParts(uploadID)
+	if err == nil {
+		for _, part := range storedParts {
+			writeLease.pinAllLocked(part.Chunks)
+		}
+	}
+	s.chunkPins.mu.Unlock()
 	if err != nil {
+		writeLease.Release()
 		return nil, err
 	}
+	defer writeLease.Release()
+	if s.testHookCompleteAfterPin != nil {
+		s.testHookCompleteAfterPin()
+	}
+
 	partsByNumber := make(map[int]models.UploadedPart, len(storedParts))
 	for _, part := range storedParts {
 		partsByNumber[part.PartNumber] = part
@@ -514,15 +682,29 @@ func (s *ObjectService) GarbageCollect() error {
 		metrics.Default.ObserveGC(time.Since(start), deletedChunks, deleteErrors, cleanedUploads, success)
 	}()
 
+	s.gcRunMu.Lock()
+	defer s.gcRunMu.Unlock()
+
 	var err error
-	cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention)
-	if err != nil {
+	if cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention); err != nil {
 		return err
 	}
+
+	// Start the epoch before the metadata scan. Live write leases are seeded so
+	// chunks they already pinned survive this pass even though their manifests
+	// are not visible yet; later write pins add themselves to the same epoch.
+	s.chunkPins.mu.Lock()
+	epoch := s.chunkPins.beginEpochLocked()
+	s.chunkPins.mu.Unlock()
+	defer s.chunkPins.endEpoch(epoch)
 
 	referencedChunkSet, err := s.metadata.GetReferencedChunkSet()
 	if err != nil {
 		return err
+	}
+
+	if s.testHookAfterGCSnapshot != nil {
+		s.testHookAfterGCSnapshot()
 	}
 
 	totalChunks := 0
@@ -532,7 +714,14 @@ func (s *ObjectService) GarbageCollect() error {
 		if _, found := referencedChunkSet[chunkID]; found {
 			return nil
 		}
-		if s.chunkPins.isPinned(chunkID) {
+
+		// Final born/pin check, Stat, and unlink are atomic with respect to new
+		// leases. Once released, a writer/reader must take the same mutex, so it
+		// either sees the chunk before deletion or pins it for a later pass.
+		s.chunkPins.mu.Lock()
+		defer s.chunkPins.mu.Unlock()
+
+		if s.chunkPins.protectedLocked(epoch, chunkID) {
 			skippedPinned++
 			return nil
 		}

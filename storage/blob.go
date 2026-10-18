@@ -44,6 +44,13 @@ func NewBlobStore(root string, chunkSize int) (*BlobStore, error) {
 }
 
 func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, error) {
+	return bs.IngestStreamWithPin(stream, nil)
+}
+
+// IngestStreamWithPin behaves like IngestStream but calls onChunk with each
+// computed chunk ID after hashing and before the dedup Stat/save. Callers use it
+// to pin a chunk under the GC registry before its bytes can reach disk.
+func (bs *BlobStore) IngestStreamWithPin(stream io.Reader, onChunk func(chunkID string) error) ([]string, int64, string, error) {
 	start := time.Now()
 	fullFileHasher := md5.New()
 
@@ -69,6 +76,12 @@ func (bs *BlobStore) IngestStream(stream io.Reader) ([]string, int64, string, er
 
 			chunkHash := sha256.Sum256(chunkData)
 			chunkID := hex.EncodeToString(chunkHash[:])
+
+			if onChunk != nil {
+				if err := onChunk(chunkID); err != nil {
+					return nil, 0, "", err
+				}
+			}
 
 			err := bs.saveBlob(chunkID, chunkData)
 			if err != nil {
