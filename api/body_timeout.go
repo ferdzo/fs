@@ -28,8 +28,14 @@ func bodyReadTimeoutMiddleware(d time.Duration) func(http.Handler) http.Handler 
 			}
 
 			defer func() {
-				// The deadline must not leak into the next keepalive request.
-				_ = rc.SetReadDeadline(time.Time{})
+				// Do not clear the deadline here. net/http drains any request
+				// body the handler left unread *after* the handler returns
+				// (finishRequest), and clearing it re-opens the stall this
+				// middleware exists to bound. Re-arming keeps that drain
+				// bounded; net/http installs the idle/read-header deadline
+				// before reading the next keepalive request, so the deadline
+				// does not leak across requests.
+				_ = rc.SetReadDeadline(time.Now().Add(d))
 			}()
 
 			next.ServeHTTP(w, r)
@@ -38,8 +44,9 @@ func bodyReadTimeoutMiddleware(d time.Duration) func(http.Handler) http.Handler 
 }
 
 // deadlineRefreshReader pushes the connection read deadline forward on every
-// successful read and clears it on terminal states so response writes and
-// connection teardown are unconstrained.
+// successful read. It clears the deadline on a terminal read so the rest of the
+// handler is not constrained; the middleware re-arms a bounded deadline when
+// the handler returns so net/http's post-handler drain cannot stall.
 type deadlineRefreshReader struct {
 	inner io.ReadCloser
 	rc    *http.ResponseController

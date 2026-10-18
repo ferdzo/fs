@@ -221,6 +221,10 @@ func mapToS3Error(err error) s3APIError {
 		}
 	case errors.Is(err, auth.ErrChunkSignatureMismatch):
 		return s3ErrSignatureDoesNotMatch
+	case errors.Is(err, auth.ErrDecodedContentLengthMismatch):
+		// The signed x-amz-decoded-content-length disagrees with the streamed
+		// payload. That is a client framing error, not a server fault.
+		return s3ErrInvalidArgument
 	case errors.Is(err, auth.ErrInvalidPresign):
 		return s3ErrInvalidPresign
 	default:
