@@ -174,10 +174,40 @@ func testSigningKey(secret, date string) []byte {
 	return hmacSha256Test(k, "aws4_request")
 }
 
+// Small deterministic trailer used by the signed-streaming test helper.
+const (
+	checksumTrailerName  = "x-amz-checksum-crc32c"
+	checksumTrailerValue = "dGVzdA=="
+)
+
 // signChunkedPutRequest turns req into a fully signed STREAMING-AWS4-HMAC-SHA256
 // PUT whose body is the aws-chunked encoding of chunks (optionally with a
-// checksum trailer). Returns nothing; mutates req headers/body.
+// checksum trailer). The framing and string-to-sign layouts follow the AWS
+// SigV4 streaming specification:
+//
+//   - data and zero chunks use the six-line AWS4-HMAC-SHA256-PAYLOAD form
+//     [label, date, scope, previous-signature, SHA256(""), SHA256(data)]
+//   - the zero-size terminal chunk signs an empty payload, so its last two
+//     lines are both SHA256("")
+//   - with a trailer body the terminal chunk is still signed as a normal
+//     PAYLOAD chunk; the declared x-amz-trailer header is part of the signed
+//     envelope, and the trailing headers carry a separate five-line
+//     AWS4-HMAC-SHA256-TRAILER signature over SHA256(canonicalTrailerBlock)
+//
+// Returns nothing; mutates req headers/body.
 func signChunkedPutRequest(t *testing.T, req *http.Request, secret string, chunks [][]byte, trailer bool) {
+	t.Helper()
+	decodedLen := 0
+	for _, chunk := range chunks {
+		decodedLen += len(chunk)
+	}
+	signChunkedPutRequestDeclared(t, req, secret, chunks, trailer, decodedLen)
+}
+
+// signChunkedPutRequestDeclared is signChunkedPutRequest with an explicit
+// x-amz-decoded-content-length, so tests can sign a stream whose declared
+// length disagrees with the bytes actually sent.
+func signChunkedPutRequestDeclared(t *testing.T, req *http.Request, secret string, chunks [][]byte, trailer bool, declaredDecodedLen int) {
 	t.Helper()
 	amzDate := time.Now().UTC().Format("20060102T150405Z")
 	date := amzDate[:8]
@@ -186,24 +216,29 @@ func signChunkedPutRequest(t *testing.T, req *http.Request, secret string, chunk
 	if trailer {
 		mode += "-TRAILER"
 	}
-	decodedLen := 0
-	for _, c := range chunks {
-		decodedLen += len(c)
-	}
+	decodedLenHeader := strconv.Itoa(declaredDecodedLen)
 
 	signedHeaders := []string{"host", "x-amz-content-sha256", "x-amz-date", "x-amz-decoded-content-length"}
 	req.Header.Set("x-amz-date", amzDate)
 	req.Header.Set("x-amz-content-sha256", mode)
-	req.Header.Set("x-amz-decoded-content-length", strconv.Itoa(decodedLen))
+	req.Header.Set("x-amz-decoded-content-length", decodedLenHeader)
 	req.Header.Set("Content-Encoding", "aws-chunked")
 
-	canonicalHeaders := strings.Join([]string{
+	canonicalHeaderParts := []string{
 		"host:" + strings.TrimSpace(req.Host),
 		"x-amz-content-sha256:" + mode,
 		"x-amz-date:" + amzDate,
-		"x-amz-decoded-content-length:" + strconv.Itoa(decodedLen),
-		"",
-	}, "\n")
+		"x-amz-decoded-content-length:" + decodedLenHeader,
+	}
+	if trailer {
+		// TRAILER mode must declare which trailing header it will send, and
+		// x-amz-trailer is part of the signed header set so a peer cannot
+		// rewrite the declared trailer.
+		signedHeaders = append(signedHeaders, "x-amz-trailer")
+		req.Header.Set("x-amz-trailer", checksumTrailerName)
+		canonicalHeaderParts = append(canonicalHeaderParts, "x-amz-trailer:"+checksumTrailerName)
+	}
+	canonicalHeaders := strings.Join(append(canonicalHeaderParts, ""), "\n")
 	signedHeadersRaw := strings.Join(signedHeaders, ";")
 
 	canonicalRequest := strings.Join([]string{
@@ -228,32 +263,60 @@ func signChunkedPutRequest(t *testing.T, req *http.Request, secret string, chunk
 		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		"delete-user", scope, signedHeadersRaw, seedSig))
 
+	emptySum := sha256.Sum256(nil)
+	emptyHashHex := hex.EncodeToString(emptySum[:])
+
+	// payloadSignature builds the six-line PAYLOAD string-to-sign for one
+	// chunk (data or the zero-size terminal chunk). The trailer signature is a
+	// different label and is computed separately below.
+	payloadSignature := func(prev string, data []byte) string {
+		sum := sha256.Sum256(data)
+		sts := strings.Join([]string{
+			"AWS4-HMAC-SHA256-PAYLOAD",
+			amzDate,
+			scope,
+			prev,
+			emptyHashHex,
+			hex.EncodeToString(sum[:]),
+		}, "\n")
+		return hex.EncodeToString(hmacSha256Test(key, sts))
+	}
+
 	var b strings.Builder
 	prev := seedSig
 	for _, chunk := range chunks {
-		chunkHash := sha256.Sum256(chunk)
-		sts := strings.Join([]string{"AWS4-HMAC-SHA256-PAYLOAD", amzDate, scope, prev,
-			hex.EncodeToString(func() []byte { s := sha256.Sum256(nil); return s[:] }()),
-			"", hex.EncodeToString(chunkHash[:])}, "\n")
-		sig := hex.EncodeToString(hmacSha256Test(key, sts))
+		sig := payloadSignature(prev, chunk)
 		fmt.Fprintf(&b, "%x;chunk-signature=%s\r\n", len(chunk), sig)
 		b.Write(chunk)
 		b.WriteString("\r\n")
 		prev = sig
 	}
-	finalStsParts := []string{"AWS4-HMAC-SHA256-PAYLOAD", amzDate, scope, prev,
-		hex.EncodeToString(func() []byte { s := sha256.Sum256(nil); return s[:] }()), "", ""}
+
+	// Zero-size terminal chunk: a PAYLOAD signature over an empty payload, so
+	// its final two lines are both the empty-string hash.
+	terminalSig := payloadSignature(prev, nil)
+	b.WriteString("0;chunk-signature=" + terminalSig + "\r\n")
+
 	if trailer {
-		b.WriteString("0;chunk-signature=")
-		sts := strings.Join([]string{"AWS4-HMAC-SHA256-TRAILER", amzDate, scope, prev,
-			"x-amz-checksum-crc32c:dGVzdA==\n"}, "\n")
-		sig := hex.EncodeToString(hmacSha256Test(key, sts))
-		b.WriteString(sig)
-		b.WriteString("\r\nx-amz-checksum-crc32c:dGVzdA==\r\n\r\n")
+		// The trailer headers are covered by a separate TRAILER signature that
+		// chains from the terminal chunk signature. The canonical block is the
+		// lowercased-name:normalized-value line(s) with a trailing newline.
+		checksumLine := checksumTrailerName + ":" + checksumTrailerValue
+		blockHash := sha256.Sum256([]byte(checksumLine + "\n"))
+		sts := strings.Join([]string{
+			"AWS4-HMAC-SHA256-TRAILER",
+			amzDate,
+			scope,
+			terminalSig,
+			hex.EncodeToString(blockHash[:]),
+		}, "\n")
+		trailerSig := hex.EncodeToString(hmacSha256Test(key, sts))
+		b.WriteString(checksumLine + "\r\n")
+		b.WriteString("x-amz-trailer-signature:" + trailerSig + "\r\n\r\n")
 	} else {
-		sig := hex.EncodeToString(hmacSha256Test(key, strings.Join(finalStsParts[:len(finalStsParts)-1], "\n")+"\n"))
-		b.WriteString("0;chunk-signature=" + sig + "\r\n\r\n")
+		b.WriteString("\r\n")
 	}
+
 	req.Body = io.NopCloser(strings.NewReader(b.String()))
 	req.ContentLength = int64(b.Len())
 }

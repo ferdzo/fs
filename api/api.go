@@ -362,13 +362,8 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxXMLBodyBytes)
 		var req models.CompleteMultipartUploadRequest
-		if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
-				return
-			}
-			writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+		if err := decodeBoundedXMLBody(r.Body, &req); err != nil {
+			writeBoundedXMLBodyError(w, r, err)
 			return
 		}
 		metrics.Default.ObserveBatchSize(len(req.Parts))
@@ -579,6 +574,66 @@ func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Reques
 	_, _ = w.Write(payload)
 }
 
+// errTrailingXMLContent marks well-formed XML that is followed by data the XML
+// grammar does not allow after the document element.
+var errTrailingXMLContent = errors.New("trailing content after XML document")
+
+// decodeBoundedXMLBody decodes exactly one XML document from body and then
+// consumes the remainder of the stream, allowing only trailing XML whitespace,
+// comments, and processing instructions.
+//
+// Draining to EOF is what lets a payload-hash-verifying body reach its
+// integrity check before the caller performs any mutation: the verifier in
+// auth only compares the SHA-256 when the underlying reader returns io.EOF,
+// and encoding/xml stops reading at the close of the root element. body must
+// already be bounded (for example by http.MaxBytesReader) so this drain cannot
+// run unbounded.
+func decodeBoundedXMLBody(body io.Reader, v any) error {
+	decoder := xml.NewDecoder(body)
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch value := token.(type) {
+		case xml.CharData:
+			if len(bytes.TrimSpace(value)) != 0 {
+				return errTrailingXMLContent
+			}
+		case xml.Comment, xml.ProcInst:
+			// Comments and processing instructions are legal in the
+			// miscellaneous section after the document element.
+		default:
+			return errTrailingXMLContent
+		}
+	}
+}
+
+// writeBoundedXMLBodyError maps a decodeBoundedXMLBody failure onto the S3
+// error the client should see. Auth integrity failures (payload-hash mismatch
+// for a buffered body, or chunk/trailer/decoded-length mismatch while draining
+// a signed stream) are routed through mapToS3Error rather than being reported
+// as MalformedXML, because the XML itself may be perfectly well-formed.
+func writeBoundedXMLBodyError(w http.ResponseWriter, r *http.Request, err error) {
+	var maxErr *http.MaxBytesError
+	switch {
+	case errors.As(err, &maxErr):
+		writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
+	case errors.Is(err, auth.ErrSignatureDoesNotMatch),
+		errors.Is(err, auth.ErrChunkSignatureMismatch),
+		errors.Is(err, auth.ErrDecodedContentLengthMismatch):
+		writeMappedS3Error(w, r, err)
+	default:
+		writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+	}
+}
+
 // selectBodyReader picks the decoded stream for a PUT: aws-chunked
 // unsigned decoder or the raw body. Signed-stream bodies were already
 // wrapped by the auth middleware.
@@ -765,13 +820,8 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req models.DeleteObjectsRequest
-	if err := xml.NewDecoder(bodyReader).Decode(&req); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeS3Error(w, r, s3ErrEntityTooLarge, r.URL.Path)
-			return
-		}
-		writeS3Error(w, r, s3ErrMalformedXML, r.URL.Path)
+	if err := decodeBoundedXMLBody(bodyReader, &req); err != nil {
+		writeBoundedXMLBodyError(w, r, err)
 		return
 	}
 	if len(req.Objects) > maxDeleteObjects {
