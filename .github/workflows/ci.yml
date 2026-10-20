@@ -2,12 +2,14 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["develop", "master"]
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      GOCACHE: /tmp/go-build-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,8 +19,27 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run tests
+      - name: Check gofmt
         run: |
-          export GOCACHE=/tmp/go-build-cache
-          go test ./...
+          files="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
+          if [ -n "$files" ]; then
+            echo "::error::Files are not gofmt-formatted:"
+            printf '%s\n' "$files"
+            exit 1
+          fi
 
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race ./... -count=1
+
+      - name: Test (coverage)
+        run: go test ./... -coverprofile=coverage.out -count=1
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
