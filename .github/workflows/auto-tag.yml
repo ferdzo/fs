@@ -1,0 +1,140 @@
+name: Auto Tag
+
+# Every merge to develop becomes a release. The bump is patch by default and
+# can be raised with a `release:minor` or `release:major` label on the merged
+# pull request; `skip-release` suppresses the tag entirely.
+on:
+  push:
+    branches: ["develop"]
+
+permissions:
+  contents: write
+  pull-requests: read
+  actions: write
+
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Re-runs and pushes that already carry a tag must not tag again.
+          if git describe --exact-match --tags "$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Commit is already tagged; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The PR that produced this push, if any. Direct pushes fall back to
+          # the commit subject and a patch bump.
+          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" 2>/dev/null || echo '[]')"
+          labels="$(jq -r '[.[] | select(.merged_at != null)][0].labels[]?.name' <<<"$pr_json" 2>/dev/null || true)"
+          title="$(jq -r '[.[] | select(.merged_at != null)][0].title // empty' <<<"$pr_json" 2>/dev/null || true)"
+          number="$(jq -r '[.[] | select(.merged_at != null)][0].number // empty' <<<"$pr_json" 2>/dev/null || true)"
+
+          if grep -qx 'skip-release' <<<"$labels"; then
+            echo "Pull request is labelled skip-release; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if grep -qx 'release:major' <<<"$labels"; then
+            bump=major
+          elif grep -qx 'release:minor' <<<"$labels"; then
+            bump=minor
+          else
+            bump=patch
+          fi
+
+          latest="$(git tag -l 'v*.*.*' --sort=-v:refname | head -n1)"
+          if [ -z "$latest" ]; then
+            next="v0.1.0"
+          else
+            IFS=. read -r major minor patch <<<"${latest#v}"
+            case "$bump" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="v${major}.${minor}.${patch}"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "Tag ${next} already exists; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$title" ]; then
+            title="$(git log -1 --format=%s)"
+          fi
+          if [ -n "$number" ]; then
+            title="$(printf '#%s %s' "$number" "$title")"
+          fi
+
+          {
+            echo "latest=${latest}"
+            echo "bump=${bump}"
+            echo "next=${next}"
+            echo "title=${title}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Auto Tag"
+            echo
+            echo "- Previous tag: \`${latest:-none}\`"
+            echo "- Bump: \`${bump}\`"
+            echo "- New tag: \`${next}\`"
+            echo "- Source: ${title}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create and push tag
+        if: steps.version.outputs.skip != 'true'
+        env:
+          NEXT_TAG: ${{ steps.version.outputs.next }}
+          TITLE: ${{ steps.version.outputs.title }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$NEXT_TAG" -m "$NEXT_TAG: $TITLE" "$GITHUB_SHA"
+          git push origin "$NEXT_TAG"
+
+      - name: Start release workflows
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_TAG: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          # A tag pushed with GITHUB_TOKEN does not create a `push` event, so
+          # the tag-driven workflows are dispatched explicitly.
+          for workflow in release.yml release-image.yml; do
+            started=false
+            for attempt in 1 2 3 4 5; do
+              if gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$NEXT_TAG"; then
+                started=true
+                break
+              fi
+              echo "Attempt ${attempt} to start ${workflow} failed; retrying."
+              sleep 3
+            done
+            if [ "$started" != "true" ]; then
+              echo "Could not start ${workflow} for ${NEXT_TAG}." >&2
+              exit 1
+            fi
+          done
