@@ -250,7 +250,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		"chunk_count", len(manifest.Chunks),
 		"etag", manifest.ETag,
 	)
-	if err = s.metadata.PutManifest(manifest); err != nil {
+	if _, err = s.metadata.PutObjectVersion(manifest); err != nil {
 		return nil, err
 	}
 
@@ -259,6 +259,11 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 }
 
 func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) (*models.ObjectManifest, error) {
+	return s.CopyObjectVersion(srcBucket, srcKey, "", dstBucket, dstKey)
+}
+
+// CopyObjectVersion copies an explicit source version ("" means latest).
+func (s *ObjectService) CopyObjectVersion(srcBucket, srcKey, srcVersionID, dstBucket, dstKey string) (*models.ObjectManifest, error) {
 	start := time.Now()
 	success := false
 	defer func() {
@@ -267,7 +272,7 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 
 	s.chunkPins.mu.Lock()
 	writeLease := s.chunkPins.newLeaseLocked(true)
-	source, err := s.metadata.GetManifest(srcBucket, srcKey)
+	source, err := s.getManifest(srcBucket, srcKey, srcVersionID)
 	if err == nil {
 		writeLease.pinAllLocked(source.Chunks)
 	}
@@ -291,7 +296,7 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 		ChunkSizes:  append([]int64(nil), source.ChunkSizes...),
 		CreatedAt:   time.Now().Unix(),
 	}
-	if err := s.metadata.PutManifest(manifest); err != nil {
+	if _, err := s.metadata.PutObjectVersion(manifest); err != nil {
 		return nil, err
 	}
 
@@ -300,6 +305,12 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 }
 
 func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.ObjectManifest, error) {
+	return s.GetObjectVersion(bucket, key, "")
+}
+
+// GetObjectVersion reads an explicit version ("" means latest). Delete markers
+// resolve to ErrDeleteMarker.
+func (s *ObjectService) GetObjectVersion(bucket, key, versionID string) (io.ReadCloser, *models.ObjectManifest, error) {
 	start := time.Now()
 
 	// Snapshot the manifest and pin its chunks under the registry mutex so a GC
@@ -308,7 +319,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	waitStart := time.Now()
 	s.chunkPins.mu.Lock()
 	lockAcquired := time.Now()
-	manifest, mErr := s.metadata.GetManifest(bucket, key)
+	manifest, mErr := s.getManifest(bucket, key, versionID)
 	var readLease *chunkLease
 	if mErr == nil {
 		readLease = s.chunkPins.newLeaseLocked(false)
@@ -391,6 +402,12 @@ func (r *leasedReadCloser) Close() error {
 // from the first covering chunk at its real in-chunk offset. It always emits
 // exactly length bytes on success.
 func (s *ObjectService) GetObjectRange(bucket, key string, start, length int64) (io.ReadCloser, *models.ObjectManifest, error) {
+	return s.GetObjectRangeVersion(bucket, key, "", start, length)
+}
+
+// GetObjectRangeVersion serves a byte range from an explicit version ("" means
+// latest).
+func (s *ObjectService) GetObjectRangeVersion(bucket, key, versionID string, start, length int64) (io.ReadCloser, *models.ObjectManifest, error) {
 	started := time.Now()
 	if start < 0 || length < 0 {
 		return nil, nil, ErrInvalidRange
@@ -399,7 +416,7 @@ func (s *ObjectService) GetObjectRange(bucket, key string, start, length int64) 
 	waitStart := time.Now()
 	s.chunkPins.mu.Lock()
 	lockAcquired := time.Now()
-	manifest, mErr := s.metadata.GetManifest(bucket, key)
+	manifest, mErr := s.getManifest(bucket, key, versionID)
 	var readLease *chunkLease
 	firstIdx, lastIdx := 0, -1
 	var rangeErr error
@@ -429,12 +446,12 @@ func (s *ObjectService) GetObjectRange(bucket, key string, start, length int64) 
 		return io.NopCloser(strings.NewReader("")), manifest, nil
 	}
 	if useFallback {
-		return s.getObjectRangeByPrefix(bucket, key, start, length)
+		return s.getObjectRangeByPrefix(bucket, key, versionID, start, length)
 	}
 	if rangeErr != nil {
 		metrics.Default.ObserveService("get_object_range", time.Since(started), false)
 		if errors.Is(rangeErr, errRangeChunkMismatch) {
-			return s.getObjectRangeByPrefix(bucket, key, start, length)
+			return s.getObjectRangeByPrefix(bucket, key, versionID, start, length)
 		}
 		return nil, nil, rangeErr
 	}
@@ -599,8 +616,8 @@ func (s *ObjectService) writeObjectRange(manifest *models.ObjectManifest, firstI
 // or a mixed legacy multipart upload). It reuses GetObject (with its lease and
 // preflight semantics) and discards the prefix in-process, so it is slower than
 // the mapped path but never guesses chunk offsets.
-func (s *ObjectService) getObjectRangeByPrefix(bucket, key string, start, length int64) (io.ReadCloser, *models.ObjectManifest, error) {
-	stream, manifest, err := s.GetObject(bucket, key)
+func (s *ObjectService) getObjectRangeByPrefix(bucket, key, versionID string, start, length int64) (io.ReadCloser, *models.ObjectManifest, error) {
+	stream, manifest, err := s.GetObjectVersion(bucket, key, versionID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -647,13 +664,18 @@ func (l *limitedReadCloser) Close() error {
 }
 
 func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, error) {
+	return s.HeadObjectVersion(bucket, key, "")
+}
+
+// HeadObjectVersion returns metadata for an explicit version ("" means latest).
+func (s *ObjectService) HeadObjectVersion(bucket, key, versionID string) (models.ObjectManifest, error) {
 	start := time.Now()
 	success := false
 	defer func() {
 		metrics.Default.ObserveService("head_object", time.Since(start), success)
 	}()
 
-	manifest, err := s.metadata.GetManifest(bucket, key)
+	manifest, err := s.getManifest(bucket, key, versionID)
 	if err != nil {
 		return models.ObjectManifest{}, err
 	}
@@ -662,15 +684,22 @@ func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, e
 }
 
 func (s *ObjectService) DeleteObject(bucket, key string) error {
+	_, err := s.DeleteObjectVersion(bucket, key, "")
+	return err
+}
+
+// DeleteObjectVersion deletes a specific version ("" uses bucket semantics:
+// permanent delete when unversioned, a delete marker when versioned).
+func (s *ObjectService) DeleteObjectVersion(bucket, key, versionID string) (metadata.DeleteResult, error) {
 	start := time.Now()
 	success := false
 	defer func() {
 		metrics.Default.ObserveService("delete_object", time.Since(start), success)
 	}()
 
-	err := s.metadata.DeleteManifest(bucket, key)
+	result, err := s.metadata.DeleteObject(bucket, key, versionID)
 	success = err == nil
-	return err
+	return result, err
 }
 
 func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error) {

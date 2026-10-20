@@ -119,6 +119,18 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	err = h.update(func(tx *bbolt.Tx) error {
+		for _, name := range [][]byte{versionIndex, versionOrderIndex, bucketStateIndex} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Backfill the key-ordered index from records written before it existed.
 	// Only pending uploads are listed, so only those need indexing. This runs
 	// once per handler start over the (retention-bounded) upload set and is
@@ -448,6 +460,22 @@ func (h *MetadataHandler) DeleteBucket(bucketName string) error {
 			}
 		}
 
+		for _, index := range [][]byte{versionIndex, versionOrderIndex} {
+			indexBucket := tx.Bucket(index)
+			if indexBucket == nil {
+				continue
+			}
+			prefix := []byte(bucketName + versionSeparator)
+			cursor := indexBucket.Cursor()
+			if k, _ := cursor.Seek(prefix); k != nil && strings.HasPrefix(string(k), string(prefix)) {
+				return fmt.Errorf("%w: %s", ErrBucketNotEmpty, bucketName)
+			}
+		}
+		if state := tx.Bucket(bucketStateIndex); state != nil {
+			if err := state.Delete([]byte(bucketName)); err != nil {
+				return err
+			}
+		}
 		if err := tx.DeleteBucket([]byte(bucketName)); err != nil && !errors.Is(err, bbolt.ErrBucketNotFound) {
 			return fmt.Errorf("error deleting metadata bucket %s: %w", bucketName, err)
 		}
@@ -518,6 +546,13 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 	}
 
 	err := h.update(func(tx *bbolt.Tx) error {
+		status, err := bucketVersioningTx(tx, bucket)
+		if err != nil {
+			return err
+		}
+		if status != "" {
+			return errors.New("bucket versioning is enabled: use PutObjectVersion")
+		}
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			return err
@@ -584,6 +619,9 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 			err := json.Unmarshal(v, &object)
 			if err != nil {
 				return err
+			}
+			if object.DeleteMarker {
+				return nil
 			}
 			objects = append(objects, &object)
 			return nil
@@ -1134,17 +1172,9 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 			return fmt.Errorf("%w: %s", ErrMultipartNotPending, uploadID)
 		}
 
-		metadataBucket := tx.Bucket([]byte(upload.Bucket))
-		if metadataBucket == nil {
-			return fmt.Errorf("%w: %s", ErrBucketNotFound, upload.Bucket)
-		}
 		final.Bucket = upload.Bucket
 		final.Key = upload.Key
-		finalPayload, err := json.Marshal(final)
-		if err != nil {
-			return err
-		}
-		if err := metadataBucket.Put([]byte(upload.Key), finalPayload); err != nil {
+		if _, err := putObjectVersionTx(tx, final); err != nil {
 			return err
 		}
 
@@ -1286,6 +1316,22 @@ func (h *MetadataHandler) GetReferencedChunkSet() (map[string]struct{}, error) {
 				return nil
 			})
 			if err != nil {
+				return err
+			}
+		}
+
+		versionsBucket := tx.Bucket(versionIndex)
+		if versionsBucket != nil {
+			if err := versionsBucket.ForEach(func(_, value []byte) error {
+				object := models.ObjectManifest{}
+				if err := json.Unmarshal(value, &object); err != nil {
+					return err
+				}
+				for _, chunkID := range object.Chunks {
+					chunkSet[chunkID] = struct{}{}
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
 		}
