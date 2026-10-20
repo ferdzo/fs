@@ -33,6 +33,7 @@ type Config struct {
 	AuthBootstrapSecretKey    string
 	AuthBootstrapPolicy       string
 	AdminAPIEnabled           bool
+	UIToken                   string
 }
 
 func NewConfig() *Config {
@@ -62,6 +63,7 @@ func NewConfig() *Config {
 		AuthBootstrapSecretKey: strings.TrimSpace(os.Getenv("FS_ROOT_PASSWORD")),
 		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("FS_ROOT_POLICY_JSON")),
 		AdminAPIEnabled:        envBool("ADMIN_API_ENABLED", true),
+		UIToken:                strings.TrimSpace(os.Getenv("FS_UI_TOKEN")),
 		BodyReadTimeoutSeconds: envInt64Range("FS_BODY_READ_TIMEOUT_SECONDS", 60, 0, 86400),
 	}
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"fs/metrics"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -367,6 +368,30 @@ func (bs *BlobStore) readChunk(chunkID string, pooled []byte) ([]byte, error) {
 	readBytes = int64(n)
 	success = true
 	return data[:n], nil
+}
+
+// DiskUsage returns the total size of the chunk files in the blob store.
+func (bs *BlobStore) DiskUsage() (int64, error) {
+	var total int64
+	root := filepath.Join(bs.dataRoot, blobRoot)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
 }
 
 func (bs *BlobStore) GetBlob(chunkID string) ([]byte, error) {

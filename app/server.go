@@ -80,6 +80,7 @@ func RunServer(ctx context.Context) error {
 
 	handler := api.NewHandler(objectService, logger, logConfig, authService, config.AdminAPIEnabled,
 		time.Duration(config.BodyReadTimeoutSeconds)*time.Second)
+	handler.EnableDashboard(config.UIToken)
 	addr := config.Address + ":" + strconv.Itoa(config.Port)
 	if config.GcEnabled {
 		go objectService.RunGC(ctx, config.GcInterval)
