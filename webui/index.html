@@ -93,13 +93,21 @@ button:hover{border-color:var(--accent)}
     var headers = {};
     if (token) { headers.Authorization = "Bearer " + token; }
     return fetch(base + path, { headers: headers }).then(function (res) {
-      if (res.status === 401 && !asked) {
-        asked = true;
-        var entered = window.prompt("Access token");
-        if (entered) {
-          token = entered;
-          sessionStorage.setItem("fs-ui-token", entered);
-          return request(path);
+      if (res.status === 401) {
+        var challenge = (res.headers.get("WWW-Authenticate") || "").toLowerCase();
+        if (challenge.indexOf("basic") >= 0) {
+          token = "";
+          sessionStorage.removeItem("fs-ui-token");
+          throw new Error("Sign in with your access key and secret");
+        }
+        if (!asked) {
+          asked = true;
+          var entered = window.prompt("Access token");
+          if (entered) {
+            token = entered;
+            sessionStorage.setItem("fs-ui-token", entered);
+            return request(path);
+          }
         }
       }
       if (!res.ok) {

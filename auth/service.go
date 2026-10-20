@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -329,6 +330,34 @@ func requiredTrailerNames(r *http.Request) ([]string, error) {
 		names = append(names, name)
 	}
 	return names, nil
+}
+
+// AuthenticateCredentials verifies a plaintext access key/secret pair against
+// the stored identities. It reuses the same encrypted secrets and status checks
+// as SigV4 and is intended for interactive logins (the dashboard).
+func (s *Service) AuthenticateCredentials(accessKeyID, secretKey string) error {
+	if !s.cfg.Enabled {
+		return ErrAccessDenied
+	}
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" || secretKey == "" {
+		return ErrInvalidAccessKeyID
+	}
+	identity, err := s.store.GetAuthIdentity(accessKeyID)
+	if err != nil {
+		return ErrInvalidAccessKeyID
+	}
+	if !strings.EqualFold(identity.Status, "active") {
+		return ErrCredentialDisabled
+	}
+	secret, err := decryptSecret(s.masterKey, identity.AccessKeyID, identity.SecretEnc, identity.SecretNonce)
+	if err != nil {
+		return ErrSignatureDoesNotMatch
+	}
+	if subtle.ConstantTimeCompare([]byte(secret), []byte(secretKey)) != 1 {
+		return ErrSignatureDoesNotMatch
+	}
+	return nil
 }
 
 func (s *Service) Authorize(accessKeyID string, target RequestTarget) error {

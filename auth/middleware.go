@@ -20,6 +20,7 @@ func Middleware(
 	logger *slog.Logger,
 	auditEnabled bool,
 	onError func(http.ResponseWriter, *http.Request, error),
+	public ...func(*http.Request) bool,
 ) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +31,7 @@ func Middleware(
 				return
 			}
 
-			if r.URL.Path == "/healthz" {
+			if isPublicRequest(r, public) {
 				metrics.Default.ObserveAuth("bypass", "none", "public_endpoint")
 				next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), authCtx)))
 				return
@@ -196,4 +197,19 @@ func clientIP(remoteAddr string) string {
 		return host
 	}
 	return remoteAddr
+}
+
+// isPublicRequest reports whether a request bypasses SigV4. /healthz is always
+// public; callers may supply additional checks (for example the dashboard,
+// which authenticates its API with its own credentials).
+func isPublicRequest(r *http.Request, public []func(*http.Request) bool) bool {
+	if r.URL.Path == "/healthz" {
+		return true
+	}
+	for _, allow := range public {
+		if allow != nil && allow(r) {
+			return true
+		}
+	}
+	return false
 }

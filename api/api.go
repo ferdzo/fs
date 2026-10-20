@@ -37,6 +37,8 @@ type Handler struct {
 	authSvc   *auth.Service
 	adminAPI  bool
 
+	dashboardEnabled bool
+
 	bodyReadTimeout time.Duration
 }
 
@@ -107,7 +109,7 @@ func s3Recoverer(next http.Handler) http.Handler {
 func (h *Handler) setupRoutes() {
 	h.router.Use(bodyReadTimeoutMiddleware(h.bodyReadTimeout))
 	h.router.Use(logging.HTTPMiddleware(h.logger, h.logConfig))
-	h.router.Use(auth.Middleware(h.authSvc, h.logger, h.logConfig.Audit, writeMappedS3Error))
+	h.router.Use(auth.Middleware(h.authSvc, h.logger, h.logConfig.Audit, writeMappedS3Error, h.dashboardRequest))
 
 	h.router.Get("/healthz", h.handleHealth)
 	h.router.Head("/healthz", h.handleHealth)

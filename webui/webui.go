@@ -48,13 +48,17 @@ type Provider interface {
 type Config struct {
 	BasePath string // defaults to /ui
 	Token    string // when set, /api/* requires "Authorization: Bearer <token>"
+	// Authorize replaces the static token check. It may return a request with an
+	// enriched context; Provider calls see that context.
+	Authorize func(*http.Request) (*http.Request, bool)
 }
 
 type handler struct {
-	base     string
-	token    string
-	provider Provider
-	page     []byte
+	base      string
+	token     string
+	authorize func(*http.Request) (*http.Request, bool)
+	provider  Provider
+	page      []byte
 }
 
 // NewHandler returns the dashboard handler.
@@ -70,7 +74,7 @@ func NewHandler(cfg Config, provider Provider) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &handler{base: base, token: cfg.Token, provider: provider, page: page}, nil
+	return &handler{base: base, token: cfg.Token, authorize: cfg.Authorize, provider: provider, page: page}, nil
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -84,27 +88,41 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		_, _ = w.Write(h.page)
-	case r.URL.Path == h.base+"/api/summary":
-		if !h.authorized(r) {
+	case strings.HasPrefix(r.URL.Path, h.base+"/api/"):
+		request, ok := h.authorizeRequest(r)
+		if !ok {
+			if h.authorize != nil {
+				w.Header().Set("WWW-Authenticate", `Basic realm="fs"`)
+			}
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
+		h.api(w, request)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *handler) api(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case h.base + "/api/summary":
 		h.summary(w, r)
-	case r.URL.Path == h.base+"/api/buckets":
-		if !h.authorized(r) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-			return
-		}
+	case h.base + "/api/buckets":
 		h.buckets(w, r)
-	case r.URL.Path == h.base+"/api/objects":
-		if !h.authorized(r) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-			return
-		}
+	case h.base + "/api/objects":
 		h.objects(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// authorizeRequest applies the configured Authorize hook, falling back to the
+// static bearer token.
+func (h *handler) authorizeRequest(r *http.Request) (*http.Request, bool) {
+	if h.authorize != nil {
+		return h.authorize(r)
+	}
+	return r, h.authorized(r)
 }
 
 func (h *handler) summary(w http.ResponseWriter, r *http.Request) {
