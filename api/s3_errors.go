@@ -23,6 +23,16 @@ type s3APIError struct {
 }
 
 var (
+	s3ErrNoSuchVersion = s3APIError{
+		Status:  http.StatusNotFound,
+		Code:    "NoSuchVersion",
+		Message: "The specified version does not exist.",
+	}
+	s3ErrMethodNotAllowed = s3APIError{
+		Status:  http.StatusMethodNotAllowed,
+		Code:    "MethodNotAllowed",
+		Message: "The specified method is not allowed against this resource.",
+	}
 	s3ErrSlowDown = s3APIError{
 		Status:  http.StatusServiceUnavailable,
 		Code:    "SlowDown",
@@ -177,6 +187,8 @@ func mapToS3Error(err error) s3APIError {
 			Code:    "NoSuchKey",
 			Message: "The specified key does not exist.",
 		}
+	case errors.Is(err, metadata.ErrVersionNotFound):
+		return s3ErrNoSuchVersion
 	case errors.Is(err, service.ErrNoSuchUpload), errors.Is(err, metadata.ErrMultipartNotFound):
 		return s3ErrNoSuchUpload
 	case errors.Is(err, metadata.ErrMultipartNotPending):

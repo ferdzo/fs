@@ -218,24 +218,30 @@ func normalizeObjectKey(raw string) (string, error) {
 	return url.PathUnescape(raw)
 }
 
-func parseCopySource(raw string) (string, string, error) {
+func parseCopySource(raw string) (string, string, string, error) {
 	raw = strings.TrimSpace(raw)
 	raw = strings.TrimPrefix(raw, "/")
+	versionID := ""
 	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
+		query, err := url.ParseQuery(raw[idx+1:])
+		if err != nil {
+			return "", "", "", errors.New("invalid copy source")
+		}
+		versionID = strings.TrimSpace(query.Get("versionId"))
 		raw = raw[:idx]
 	}
 	bucket, rawKey, found := strings.Cut(raw, "/")
 	if !found || strings.TrimSpace(bucket) == "" || rawKey == "" {
-		return "", "", errors.New("invalid copy source")
+		return "", "", "", errors.New("invalid copy source")
 	}
 	key, err := normalizeObjectKey(rawKey)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if apiErr := validateObjectKey(key); apiErr != nil {
-		return "", "", errors.New(apiErr.Code)
+		return "", "", "", errors.New(apiErr.Code)
 	}
-	return bucket, key, nil
+	return bucket, key, versionID, nil
 }
 
 func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error {
@@ -292,22 +298,29 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	versionID := versionIDFromRequest(r)
+
 	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
 	if rangeHeader != "" {
 		// Resolve and validate the range before opening the object stream so a
 		// suffix or mid-object range never reads the prefix, and an invalid
 		// range is rejected with 416 without touching the blob store.
-		h.handleGetObjectRange(w, r, bucket, key, rangeHeader)
+		h.handleGetObjectRange(w, r, bucket, key, versionID, rangeHeader)
 		return
 	}
 
-	stream, manifest, err := h.svc.GetObject(bucket, key)
+	stream, manifest, err := h.svc.GetObjectVersion(bucket, key, versionID)
 	if err != nil {
+		if errors.Is(err, service.ErrDeleteMarker) {
+			h.writeDeleteMarkerResponse(w, r, bucket, key, versionID, versionID != "")
+			return
+		}
 		writeMappedS3Error(w, r, err)
 		return
 	}
 	defer stream.Close()
 
+	setObjectVersionHeaders(w, manifest)
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
 	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
@@ -327,9 +340,13 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 // handleGetObjectRange serves a single-range GET. It validates the Range header
 // against the object size first, then reads only the chunks that cover the
 // requested interval.
-func (h *Handler) handleGetObjectRange(w http.ResponseWriter, r *http.Request, bucket, key, rangeHeader string) {
-	head, err := h.svc.HeadObject(bucket, key)
+func (h *Handler) handleGetObjectRange(w http.ResponseWriter, r *http.Request, bucket, key, versionID, rangeHeader string) {
+	head, err := h.svc.HeadObjectVersion(bucket, key, versionID)
 	if err != nil {
+		if errors.Is(err, service.ErrDeleteMarker) {
+			h.writeDeleteMarkerResponse(w, r, bucket, key, versionID, versionID != "")
+			return
+		}
 		writeMappedS3Error(w, r, err)
 		return
 	}
@@ -342,8 +359,12 @@ func (h *Handler) handleGetObjectRange(w http.ResponseWriter, r *http.Request, b
 	}
 	length := end - start + 1
 
-	stream, manifest, err := h.svc.GetObjectRange(bucket, key, start, length)
+	stream, manifest, err := h.svc.GetObjectRangeVersion(bucket, key, versionID, start, length)
 	if err != nil {
+		if errors.Is(err, service.ErrDeleteMarker) {
+			h.writeDeleteMarkerResponse(w, r, bucket, key, versionID, versionID != "")
+			return
+		}
 		if errors.Is(err, service.ErrInvalidRange) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", head.Size))
 			writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
@@ -354,6 +375,7 @@ func (h *Handler) handleGetObjectRange(w http.ResponseWriter, r *http.Request, b
 	}
 	defer stream.Close()
 
+	setObjectVersionHeaders(w, manifest)
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, manifest.Size))
@@ -440,6 +462,7 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		setObjectVersionHeaders(w, manifest)
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 		w.WriteHeader(http.StatusOK)
@@ -527,7 +550,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if copySourceRaw := strings.TrimSpace(r.Header.Get("x-amz-copy-source")); copySourceRaw != "" {
-		srcBucket, srcKey, err := parseCopySource(copySourceRaw)
+		srcBucket, srcKey, srcVersionID, err := parseCopySource(copySourceRaw)
 		if err != nil {
 			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
 			return
@@ -537,10 +560,19 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		manifest, err := h.svc.CopyObject(srcBucket, srcKey, bucket, key)
+		manifest, err := h.svc.CopyObjectVersion(srcBucket, srcKey, srcVersionID, bucket, key)
 		if err != nil {
+			if errors.Is(err, service.ErrDeleteMarker) {
+				writeS3Error(w, r, s3ErrInvalidRequest, r.URL.Path)
+				return
+			}
 			writeMappedS3Error(w, r, err)
 			return
+		}
+		if srcVersionID == "" {
+			if source, headErr := h.svc.HeadObjectVersion(srcBucket, srcKey, ""); headErr == nil {
+				srcVersionID = source.VersionID
+			}
 		}
 
 		response := models.CopyObjectResult{
@@ -556,6 +588,10 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+		if srcVersionID != "" {
+			w.Header().Set("x-amz-copy-source-version-id", srcVersionID)
+		}
+		setObjectVersionHeaders(w, manifest)
 		w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(xml.Header))
@@ -585,6 +621,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setObjectVersionHeaders(w, manifest)
 	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
 	w.Header().Set("Content-Length", "0")
 
@@ -914,6 +951,10 @@ func ifNoneMatchPreconditionFailed(headerValue, etag string) bool {
 
 func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
+	if r.URL.Query().Has("versioning") {
+		h.handlePutBucketVersioning(w, r, bucket)
+		return
+	}
 	if err := h.svc.CreateBucket(bucket); err != nil {
 		writeMappedS3Error(w, r, err)
 		return
@@ -1012,16 +1053,56 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 		keys = append(keys, obj.Key)
 	}
 
-	deleted, err := h.svc.DeleteObjects(bucket, keys)
-	if err != nil {
-		writeMappedS3Error(w, r, err)
-		return
+	hasVersions := false
+	for _, obj := range req.Objects {
+		if strings.TrimSpace(obj.VersionID) != "" {
+			hasVersions = true
+			break
+		}
 	}
 
-	if !req.Quiet {
-		response.Deleted = make([]models.DeletedEntry, 0, len(deleted))
-		for _, key := range deleted {
-			response.Deleted = append(response.Deleted, models.DeletedEntry{Key: key})
+	if hasVersions {
+		if !req.Quiet {
+			response.Deleted = make([]models.DeletedEntry, 0, len(keys))
+		}
+		for i, obj := range req.Objects {
+			if obj.Key == "" || len(obj.Key) > maxObjectKeyBytes || authErrs[i] != nil {
+				continue
+			}
+			result, err := h.svc.DeleteObjectVersion(bucket, obj.Key, strings.TrimSpace(obj.VersionID))
+			if err != nil {
+				apiErr := mapToS3Error(err)
+				response.Errors = append(response.Errors, models.DeleteError{
+					Key:     obj.Key,
+					Code:    apiErr.Code,
+					Message: apiErr.Message,
+				})
+				continue
+			}
+			if !req.Quiet {
+				entry := models.DeletedEntry{
+					Key:          obj.Key,
+					VersionID:    result.VersionID,
+					DeleteMarker: result.DeleteMarker,
+				}
+				if result.DeleteMarker {
+					entry.DeleteMarkerVersionID = result.VersionID
+				}
+				response.Deleted = append(response.Deleted, entry)
+			}
+		}
+	} else {
+		deleted, err := h.svc.DeleteObjects(bucket, keys)
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
+
+		if !req.Quiet {
+			response.Deleted = make([]models.DeletedEntry, 0, len(deleted))
+			for _, key := range deleted {
+				response.Deleted = append(response.Deleted, models.DeletedEntry{Key: key})
+			}
 		}
 	}
 
@@ -1054,7 +1135,8 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	err := h.svc.DeleteObject(bucket, key)
+	versionID := versionIDFromRequest(r)
+	result, err := h.svc.DeleteObjectVersion(bucket, key, versionID)
 	if err != nil {
 		if errors.Is(err, metadata.ErrObjectNotFound) {
 			w.WriteHeader(http.StatusNoContent)
@@ -1062,6 +1144,12 @@ func (h *Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request) {
 		}
 		writeMappedS3Error(w, r, err)
 		return
+	}
+	if result.VersionID != "" {
+		w.Header().Set("x-amz-version-id", result.VersionID)
+	}
+	if result.DeleteMarker {
+		w.Header().Set("x-amz-delete-marker", "true")
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1088,11 +1176,17 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	manifest, err := h.svc.HeadObject(bucket, key)
+	versionID := versionIDFromRequest(r)
+	manifest, err := h.svc.HeadObjectVersion(bucket, key, versionID)
 	if err != nil {
+		if errors.Is(err, service.ErrDeleteMarker) {
+			h.writeDeleteMarkerResponse(w, r, bucket, key, versionID, versionID != "")
+			return
+		}
 		writeMappedS3Error(w, r, err)
 		return
 	}
+	setObjectVersionHeaders(w, &manifest)
 	etag := manifest.ETag
 	size := strconv.FormatInt(manifest.Size, 10)
 
@@ -1207,6 +1301,14 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	query := r.URL.Query()
 
+	if query.Has("versioning") {
+		h.handleGetBucketVersioning(w, r, bucket)
+		return
+	}
+	if query.Has("versions") {
+		h.handleListObjectVersions(w, r, bucket)
+		return
+	}
 	if query.Has("uploads") {
 		h.handleListMultipartUploads(w, r, bucket)
 		return

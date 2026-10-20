@@ -152,7 +152,7 @@ func FuzzParseCopySource(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		raw = fuzzCapString(raw, fuzzMaxKeyInput)
 
-		bucket, key, err := parseCopySource(raw)
+		bucket, key, _, err := parseCopySource(raw)
 		if err != nil {
 			return
 		}

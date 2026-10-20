@@ -27,9 +27,10 @@ type ObjectManifest struct {
 
 // VersioningConfiguration is the S3 ?versioning request/response body.
 type VersioningConfiguration struct {
-	XMLName xml.Name `xml:"VersioningConfiguration"`
-	Xmlns   string   `xml:"xmlns,attr,omitempty"`
-	Status  string   `xml:"Status,omitempty"`
+	XMLName   xml.Name `xml:"VersioningConfiguration"`
+	Xmlns     string   `xml:"xmlns,attr,omitempty"`
+	Status    string   `xml:"Status,omitempty"`
+	MfaDelete string   `xml:"MfaDelete,omitempty"`
 }
 type BucketManifest struct {
 	Name              string    `json:"name"`
@@ -209,7 +210,8 @@ type DeleteObjectsRequest struct {
 }
 
 type DeleteObjectIdentity struct {
-	Key string `xml:"Key"`
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
 }
 
 type DeleteObjectsResult struct {
@@ -220,7 +222,10 @@ type DeleteObjectsResult struct {
 }
 
 type DeletedEntry struct {
-	Key string `xml:"Key"`
+	Key                   string `xml:"Key"`
+	VersionID             string `xml:"VersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
+	DeleteMarkerVersionID string `xml:"DeleteMarkerVersionId,omitempty"`
 }
 
 type DeleteError struct {
