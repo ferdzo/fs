@@ -24,8 +24,14 @@ type MetadataHandler struct {
 var systemIndex = []byte("__SYSTEM_BUCKETS__")
 var multipartUploadIndex = []byte("__MULTIPART_UPLOADS__")
 var multipartUploadPartsIndex = []byte("__MULTIPART_UPLOAD_PARTS__")
+var multipartUploadKeyIndex = []byte("__MULTIPART_UPLOADS_BY_KEY__")
 var authIdentitiesIndex = []byte("__AUTH_IDENTITIES__")
 var authPoliciesIndex = []byte("__AUTH_POLICIES__")
+
+// multipartKeyIndexSeparator joins bucket, key, creation time, and upload ID in
+// the forward-scannable multipart upload index. Bucket names and upload IDs
+// cannot contain it; object keys in practice do not either.
+const multipartKeyIndexSeparator = "\x00"
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
@@ -40,6 +46,23 @@ var (
 	ErrAuthIdentityNotFound = errors.New("auth identity not found")
 	ErrAuthPolicyNotFound   = errors.New("auth policy not found")
 )
+
+// errIterationStopped is an unexported sentinel used by iteration callbacks to
+// end a scan early without it being reported as a failure. Callers must obtain
+// it through StopIteration so the identity cannot be forged accidentally.
+var errIterationStopped = errors.New("metadata iteration stopped")
+
+// StopIteration asks an iterator to stop and returns nil-like success semantics
+// to the caller: the metadata transaction and service metric are recorded as
+// successful, and IsIterationStopped reports true.
+func StopIteration() error {
+	return errIterationStopped
+}
+
+// IsIterationStopped reports whether err is the normal early-stop sentinel.
+func IsIterationStopped(err error) bool {
+	return errors.Is(err, errIterationStopped)
+}
 
 func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 2 * time.Second})
@@ -88,6 +111,39 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	err = h.update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(multipartUploadKeyIndex)
+		return err
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// Backfill the key-ordered index from records written before it existed.
+	// Only pending uploads are listed, so only those need indexing. This runs
+	// once per handler start over the (retention-bounded) upload set and is
+	// idempotent for already-indexed records.
+	err = h.update(func(tx *bbolt.Tx) error {
+		uploadsBucket := tx.Bucket(multipartUploadIndex)
+		keyIndexBucket := tx.Bucket(multipartUploadKeyIndex)
+		if uploadsBucket == nil || keyIndexBucket == nil {
+			return errors.New("multipart upload index not found")
+		}
+		return uploadsBucket.ForEach(func(_, value []byte) error {
+			upload := models.MultipartUpload{}
+			if err := json.Unmarshal(value, &upload); err != nil {
+				return nil
+			}
+			if upload.State != "pending" {
+				return nil
+			}
+			return keyIndexBucket.Put(multipartUploadKeyIndexKey(&upload), []byte{})
+		})
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return h, nil
 }
@@ -123,7 +179,9 @@ func (h *MetadataHandler) Close() error {
 func (h *MetadataHandler) view(fn func(tx *bbolt.Tx) error) error {
 	start := time.Now()
 	err := h.db.View(fn)
-	metrics.Default.ObserveMetadataTx("view", time.Since(start), err == nil)
+	// A caller-requested early stop is a normal outcome for paginated scans,
+	// not a failed transaction.
+	metrics.Default.ObserveMetadataTx("view", time.Since(start), err == nil || errors.Is(err, errIterationStopped))
 	return err
 }
 
@@ -295,9 +353,12 @@ func (h *MetadataHandler) ListAuthIdentities(limit int, after string) ([]models.
 		}
 
 		count := 0
+		lastReturnedKey := ""
 		for ; k != nil; k, v = cursor.Next() {
 			if count >= limit {
-				nextCursor = string(k)
+				// `after` is exclusive, so hand back the key of the last
+				// returned record to let callers resume without gaps.
+				nextCursor = lastReturnedKey
 				break
 			}
 			record := models.AuthIdentity{}
@@ -305,6 +366,7 @@ func (h *MetadataHandler) ListAuthIdentities(limit int, after string) ([]models.
 				return err
 			}
 			identities = append(identities, record)
+			lastReturnedKey = string(k)
 			count++
 		}
 		return nil
@@ -445,6 +507,9 @@ func (h *MetadataHandler) GetBucketManifest(bucketName string) (*models.BucketMa
 }
 
 func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
+	if manifest == nil {
+		return errors.New("object manifest is required")
+	}
 	bucket := manifest.Bucket
 	key := manifest.Key
 
@@ -534,7 +599,19 @@ func (h *MetadataHandler) ListObjects(bucket, prefix string) ([]*models.ObjectMa
 	return objects, nil
 }
 
-func (h *MetadataHandler) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
+// ForEachObjectKeyFrom iterates object keys in ascending order starting at
+// startKey (inclusive), inside a single read transaction. The callback receives
+// the raw key and a decode function; decode unmarshals the manifest lazily from
+// the value read in this transaction. Callers that only make decisions from the
+// key (prefix, delimiter, continuation) never pay for JSON decoding. The decode
+// function is only valid during the callback: callers must not retain it or call
+// it concurrently. It may be called more than once, each time returning a newly
+// decoded manifest. The key string is owned by the caller.
+//
+// Returning StopIteration from fn stops the scan and is reported as a
+// successful transaction. Any other error, including a decode error, aborts the
+// scan and is returned unchanged.
+func (h *MetadataHandler) ForEachObjectKeyFrom(bucket, startKey string, fn func(key string, decode func() (*models.ObjectManifest, error)) error) error {
 	if fn == nil {
 		return errors.New("object callback is required")
 	}
@@ -561,16 +638,40 @@ func (h *MetadataHandler) ForEachObjectFrom(bucket, startKey string, fn func(*mo
 			k, v = cursor.Seek([]byte(startKey))
 		}
 
-		for ; k != nil; k, v = cursor.Next() {
+		// One decoder closure is reused across the scan; value is updated per
+		// iteration. Decoding stays inside the View so v remains valid.
+		var value []byte
+		decode := func() (*models.ObjectManifest, error) {
 			object := models.ObjectManifest{}
-			if err := json.Unmarshal(v, &object); err != nil {
-				return err
+			if err := json.Unmarshal(value, &object); err != nil {
+				return nil, err
 			}
-			if err := fn(&object); err != nil {
+			return &object, nil
+		}
+
+		for ; k != nil; k, v = cursor.Next() {
+			value = v
+			if err := fn(string(k), decode); err != nil {
 				return err
 			}
 		}
 		return nil
+	})
+}
+
+// ForEachObjectFrom is the eager compatibility wrapper around
+// ForEachObjectKeyFrom: it decodes every visited manifest before invoking fn.
+// New hot paths should use ForEachObjectKeyFrom and decode only when needed.
+func (h *MetadataHandler) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
+	if fn == nil {
+		return errors.New("object callback is required")
+	}
+	return h.ForEachObjectKeyFrom(bucket, startKey, func(_ string, decode func() (*models.ObjectManifest, error)) error {
+		object, err := decode()
+		if err != nil {
+			return err
+		}
+		return fn(object)
 	})
 }
 
@@ -652,6 +753,10 @@ func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.Mul
 		if multipartUploadBucket == nil {
 			return errors.New("multipart upload index not found")
 		}
+		keyIndexBucket := tx.Bucket(multipartUploadKeyIndex)
+		if keyIndexBucket == nil {
+			return errors.New("multipart upload key index not found")
+		}
 		payload, err := json.Marshal(upload)
 		if err != nil {
 			return err
@@ -661,7 +766,7 @@ func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.Mul
 			return err
 		}
 
-		return nil
+		return keyIndexBucket.Put(multipartUploadKeyIndexKey(upload), []byte{})
 	})
 	if err != nil {
 		return nil, err
@@ -716,6 +821,39 @@ func putMultipartUpload(multipartUploadBucket *bbolt.Bucket, uploadID string, up
 		return err
 	}
 	return multipartUploadBucket.Put([]byte(uploadID), payload)
+}
+
+// multipartUploadKeyIndexKey builds the forward-scannable index key. Ordering
+// is bucket, key, initiation time, then upload ID, which matches S3's listing
+// order and gives every record a unique, stable position.
+func multipartUploadKeyIndexKey(upload *models.MultipartUpload) []byte {
+	return []byte(upload.Bucket + multipartKeyIndexSeparator +
+		upload.Key + multipartKeyIndexSeparator +
+		upload.CreatedAt + multipartKeyIndexSeparator +
+		upload.UploadID)
+}
+
+func multipartUploadKeyIndexPrefix(bucket, prefix string) []byte {
+	return []byte(bucket + multipartKeyIndexSeparator + prefix)
+}
+
+func parseMultipartUploadKeyIndexKey(raw []byte) (bucket, key, createdAt, uploadID string, ok bool) {
+	parts := strings.SplitN(string(raw), multipartKeyIndexSeparator, 4)
+	if len(parts) != 4 {
+		return "", "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], parts[3], true
+}
+
+func deleteMultipartUploadKeyIndexEntry(tx *bbolt.Tx, upload *models.MultipartUpload) error {
+	if upload == nil {
+		return nil
+	}
+	keyIndexBucket := tx.Bucket(multipartUploadKeyIndex)
+	if keyIndexBucket == nil {
+		return nil
+	}
+	return keyIndexBucket.Delete(multipartUploadKeyIndexKey(upload))
 }
 
 func deleteMultipartPartsByUploadID(tx *bbolt.Tx, uploadID string) error {
@@ -786,6 +924,170 @@ func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.Uploaded
 	}
 	return nil
 }
+
+// MultipartUploadsPage is one page of ListMultipartUploads output. Uploads and
+// CommonPrefixes share the page budget, so callers must render both and must
+// not re-page either list independently.
+type MultipartUploadsPage struct {
+	Uploads            []models.MultipartUpload
+	CommonPrefixes     []string
+	IsTruncated        bool
+	NextKeyMarker      string
+	NextUploadIDMarker string
+}
+
+// ListMultipartUploads returns pending uploads in bucket ordered by key, then
+// initiation time, then upload ID. It scans the key-ordered index forward from
+// the requested marker and stops after one page, so the work is bounded by the
+// page size rather than the number of uploads in the bucket.
+func (h *MetadataHandler) ListMultipartUploads(bucket, prefix, delimiter, keyMarker, uploadIDMarker string, maxUploads int) (*MultipartUploadsPage, error) {
+	capacity := maxUploads
+	if capacity < 0 {
+		capacity = 0
+	}
+	page := &MultipartUploadsPage{
+		Uploads:        make([]models.MultipartUpload, 0, capacity),
+		CommonPrefixes: make([]string, 0),
+	}
+
+	err := h.view(func(tx *bbolt.Tx) error {
+		systemIndexBucket := tx.Bucket(systemIndex)
+		if systemIndexBucket == nil {
+			return errors.New("system index not found")
+		}
+		if systemIndexBucket.Get([]byte(bucket)) == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
+		}
+		if maxUploads <= 0 {
+			return nil
+		}
+		uploadsBucket := tx.Bucket(multipartUploadIndex)
+		keyIndexBucket := tx.Bucket(multipartUploadKeyIndex)
+		if uploadsBucket == nil || keyIndexBucket == nil {
+			return errors.New("multipart upload index not found")
+		}
+
+		// Markers before the prefix are already excluded by the prefix seek.
+		// upload-id-marker is only meaningful together with key-marker.
+		startKey := multipartUploadKeyIndexPrefix(bucket, prefix)
+		skipKeyMarker := ""
+		exactMarkerResume := false
+		applyMarker := keyMarker != "" && keyMarker >= prefix
+		if applyMarker {
+			if uploadIDMarker != "" {
+				marker, err := getMultipartUploadFromBucket(uploadsBucket, uploadIDMarker)
+				if err == nil && marker.Bucket == bucket && marker.Key == keyMarker {
+					// Resume immediately after the marker pair's exact position.
+					startKey = multipartUploadKeyIndexKey(marker)
+					exactMarkerResume = true
+				} else {
+					skipKeyMarker = keyMarker
+					startKey = multipartUploadKeyIndexPrefix(bucket, keyMarker)
+				}
+			} else {
+				skipKeyMarker = keyMarker
+				startKey = multipartUploadKeyIndexPrefix(bucket, keyMarker)
+			}
+		}
+
+		cursor := keyIndexBucket.Cursor()
+		entryCount := 0
+		currentCommonPrefix := ""
+		lastKeyMarker := ""
+		lastUploadIDMarker := ""
+		lastCommonPrefix := ""
+
+		for k, _ := cursor.Seek(startKey); k != nil; k, _ = cursor.Next() {
+			entryBucket, key, _, uploadID, ok := parseMultipartUploadKeyIndexKey(k)
+			if !ok {
+				continue
+			}
+			if entryBucket != bucket {
+				if entryBucket > bucket {
+					break
+				}
+				continue
+			}
+			if prefix != "" {
+				if key < prefix {
+					continue
+				}
+				if !strings.HasPrefix(key, prefix) {
+					break
+				}
+			}
+			if skipKeyMarker != "" && key <= skipKeyMarker {
+				continue
+			}
+			if exactMarkerResume && string(k) == string(startKey) {
+				continue
+			}
+
+			if delimiter != "" {
+				relative := strings.TrimPrefix(key, prefix)
+				if idx := strings.Index(relative, delimiter); idx >= 0 {
+					commonPrefix := prefix + relative[:idx+len(delimiter)]
+					if keyMarker != "" && commonPrefix <= keyMarker {
+						continue
+					}
+					if commonPrefix == currentCommonPrefix {
+						continue
+					}
+					if entryCount >= maxUploads {
+						page.IsTruncated = true
+						page.NextKeyMarker = lastKeyMarker
+						page.NextUploadIDMarker = lastUploadIDMarker
+						if lastCommonPrefix != "" {
+							page.NextKeyMarker = lastCommonPrefix
+							page.NextUploadIDMarker = ""
+						}
+						return nil
+					}
+					currentCommonPrefix = commonPrefix
+					page.CommonPrefixes = append(page.CommonPrefixes, commonPrefix)
+					lastCommonPrefix = commonPrefix
+					lastKeyMarker = ""
+					lastUploadIDMarker = ""
+					entryCount++
+					continue
+				}
+			}
+
+			upload, err := getMultipartUploadFromBucket(uploadsBucket, uploadID)
+			if err != nil {
+				if errors.Is(err, ErrMultipartNotFound) {
+					continue
+				}
+				return err
+			}
+			if upload.State != "pending" || upload.Bucket != bucket || upload.Key != key {
+				continue
+			}
+			if entryCount >= maxUploads {
+				page.IsTruncated = true
+				if lastCommonPrefix != "" {
+					page.NextKeyMarker = lastCommonPrefix
+					page.NextUploadIDMarker = ""
+				} else {
+					page.NextKeyMarker = lastKeyMarker
+					page.NextUploadIDMarker = lastUploadIDMarker
+				}
+				return nil
+			}
+			page.Uploads = append(page.Uploads, *upload)
+			lastKeyMarker = upload.Key
+			lastUploadIDMarker = upload.UploadID
+			lastCommonPrefix = ""
+			entryCount++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return page, nil
+}
+
 func (h *MetadataHandler) ListMultipartParts(uploadID string) ([]models.UploadedPart, error) {
 	parts := make([]models.UploadedPart, 0)
 
@@ -850,6 +1152,9 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 		if err := putMultipartUpload(multipartUploadBucket, uploadID, upload); err != nil {
 			return err
 		}
+		if err := deleteMultipartUploadKeyIndexEntry(tx, upload); err != nil {
+			return err
+		}
 
 		if err := deleteMultipartPartsByUploadID(tx, uploadID); err != nil {
 			return err
@@ -867,11 +1172,14 @@ func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
 		if err != nil {
 			return err
 		}
-		if upload.State == "completed" {
+		if upload.State != "pending" {
 			return fmt.Errorf("%w: %s", ErrMultipartNotPending, uploadID)
 		}
 		upload.State = "aborted"
 		if err := putMultipartUpload(multipartUploadBucket, uploadID, upload); err != nil {
+			return err
+		}
+		if err := deleteMultipartUploadKeyIndexEntry(tx, upload); err != nil {
 			return err
 		}
 
@@ -899,27 +1207,41 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 		}
 
 		now := time.Now().UTC()
-		keysToDelete := make([]string, 0)
+		uploadsToDelete := make([]models.MultipartUpload, 0)
+		orphanIDs := make([]string, 0)
 		if err := uploadsBucket.ForEach(func(k, v []byte) error {
 			upload := models.MultipartUpload{}
 			if err := json.Unmarshal(v, &upload); err != nil {
-				keysToDelete = append(keysToDelete, string(k))
+				orphanIDs = append(orphanIDs, string(k))
 				return nil
 			}
 			createdAt, err := time.Parse(time.RFC3339, upload.CreatedAt)
 			if err != nil {
-				keysToDelete = append(keysToDelete, string(k))
+				orphanIDs = append(orphanIDs, string(k))
 				return nil
 			}
 			if now.Sub(createdAt) >= retention {
-				keysToDelete = append(keysToDelete, string(k))
+				upload.UploadID = string(k)
+				uploadsToDelete = append(uploadsToDelete, upload)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
 
-		for _, uploadID := range keysToDelete {
+		for _, upload := range uploadsToDelete {
+			if err := uploadsBucket.Delete([]byte(upload.UploadID)); err != nil {
+				return err
+			}
+			if err := deleteMultipartUploadKeyIndexEntry(tx, &upload); err != nil {
+				return err
+			}
+			if err := deleteMultipartPartsByUploadID(tx, upload.UploadID); err != nil {
+				return err
+			}
+			cleaned++
+		}
+		for _, uploadID := range orphanIDs {
 			if err := uploadsBucket.Delete([]byte(uploadID)); err != nil {
 				return err
 			}

@@ -12,7 +12,12 @@ type ObjectManifest struct {
 	ContentType string   `json:"content_type"`
 	ETag        string   `json:"etag"`
 	Chunks      []string `json:"chunks"`
-	CreatedAt   int64    `json:"created_at"`
+	// ChunkSizes is parallel to Chunks and records the byte length of each
+	// chunk. It may be absent on manifests written before per-chunk sizes were
+	// persisted (legacy objects); readers must fall back to a prefix-reading
+	// path in that case rather than assuming a fixed chunk size.
+	ChunkSizes []int64 `json:"chunk_sizes,omitempty"`
+	CreatedAt  int64   `json:"created_at"`
 }
 type BucketManifest struct {
 	Name              string    `json:"name"`
@@ -136,7 +141,11 @@ type UploadedPart struct {
 	ETag       string   `json:"etag" xml:"ETag"`
 	Size       int64    `json:"size" xml:"Size"`
 	Chunks     []string `json:"chunks"`
-	CreatedAt  int64    `json:"created_at"`
+	// ChunkSizes is parallel to Chunks. It is absent for parts uploaded before
+	// per-chunk sizes were persisted; completing such an upload still works but
+	// leaves the object manifest without layout information.
+	ChunkSizes []int64 `json:"chunk_sizes,omitempty"`
+	CreatedAt  int64   `json:"created_at"`
 }
 
 type CompletedPart struct {
