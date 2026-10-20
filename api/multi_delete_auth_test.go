@@ -175,6 +175,44 @@ func TestMultiDeleteAllowsScopedKeys(t *testing.T) {
 	}
 }
 
+func TestMultiDeleteBatchKeepsPerObjectErrorOrder(t *testing.T) {
+	handler, svc, authSvc := newAuthorizedDeleteHandler(t)
+	if err := svc.CreateBucket("test-bucket"); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	createDeleteUser(t, authSvc, "allowed/")
+	putTestObject(t, svc, "allowed/file.txt")
+
+	// The empty key is a validation error, the private key is an authorization
+	// error, and the allowed key is deleted. Batch authorization must not
+	// reorder the per-object response.
+	body := `<Delete>` +
+		`<Object><Key></Key></Object>` +
+		`<Object><Key>private/file.txt</Key></Object>` +
+		`<Object><Key>allowed/file.txt</Key></Object>` +
+		`</Delete>`
+	req := withAuthContext(newBucketPostRequest("test-bucket", body), "delete-user")
+	rec := httptest.NewRecorder()
+
+	handler.handlePostBucket(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	responseBody := rec.Body.String()
+	invalidAt := strings.Index(responseBody, "InvalidArgument")
+	deniedAt := strings.Index(responseBody, "AccessDenied")
+	if invalidAt < 0 || deniedAt < 0 || !strings.Contains(responseBody, "<Deleted>") {
+		t.Fatalf("expected validation, authorization, and deleted entries, body=%s", responseBody)
+	}
+	if invalidAt > deniedAt {
+		t.Fatalf("per-object error order changed: body=%s", responseBody)
+	}
+	if _, err := svc.HeadObject("test-bucket", "allowed/file.txt"); !errors.Is(err, metadata.ErrObjectNotFound) {
+		t.Fatalf("allowed object should be deleted, got err=%v", err)
+	}
+}
+
 func TestMultiDeleteRouteAuthorizesKeysAfterMiddleware(t *testing.T) {
 	handler, svc, authSvc := newAuthorizedDeleteHandler(t)
 	handler.setupRoutes()

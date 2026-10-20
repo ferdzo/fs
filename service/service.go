@@ -13,6 +13,7 @@ import (
 	"fs/utils"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,12 +37,20 @@ type ObjectService struct {
 
 var (
 	ErrChunkMissing           = errors.New("chunk file missing from blob store")
+	ErrNoSuchUpload           = errors.New("multipart upload not found")
 	ErrInvalidPart            = errors.New("invalid multipart part")
 	ErrInvalidPartOrder       = errors.New("invalid multipart part order")
 	ErrInvalidCompleteRequest = errors.New("invalid complete multipart request")
 	ErrEntityTooSmall         = errors.New("multipart entity too small")
 	ErrEntityTooLarge         = errors.New("entity too large")
+	ErrInvalidRange           = errors.New("invalid byte range")
 )
+
+// errRangeChunkMismatch signals that a layout that passed validation still
+// produced chunk indices outside the manifest's chunk list. It is an internal
+// inconsistency, never a client error; range reads fall back to the
+// prefix-discarding path so the response stays correct.
+var errRangeChunkMismatch = errors.New("range chunk mapping mismatch")
 
 const DefaultMaxUploadSize int64 = 5 * 1024 * 1024 * 1024
 
@@ -215,7 +224,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 	writeLease := s.chunkPins.newLease(true)
 	defer writeLease.Release()
 
-	chunks, size, etag, err := s.blob.IngestStreamWithPin(s.limitUpload(input), func(chunkID string) error {
+	chunks, chunkSizes, size, etag, err := s.blob.IngestStreamWithSizes(s.limitUpload(input), func(chunkID string) error {
 		writeLease.Pin(chunkID)
 		return nil
 	})
@@ -231,6 +240,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		ContentType: contentType,
 		ETag:        etag,
 		Chunks:      chunks,
+		ChunkSizes:  chunkSizes,
 		CreatedAt:   timestamp,
 	}
 	slog.Debug("object_written_manifest",
@@ -278,6 +288,7 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 		ContentType: source.ContentType,
 		ETag:        source.ETag,
 		Chunks:      append([]string(nil), source.Chunks...),
+		ChunkSizes:  append([]int64(nil), source.ChunkSizes...),
 		CreatedAt:   time.Now().Unix(),
 	}
 	if err := s.metadata.PutManifest(manifest); err != nil {
@@ -296,6 +307,7 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 	// mutex is released before any pipe I/O.
 	waitStart := time.Now()
 	s.chunkPins.mu.Lock()
+	lockAcquired := time.Now()
 	manifest, mErr := s.metadata.GetManifest(bucket, key)
 	var readLease *chunkLease
 	if mErr == nil {
@@ -303,8 +315,9 @@ func (s *ObjectService) GetObject(bucket, key string) (io.ReadCloser, *models.Ob
 		readLease.pinAllLocked(manifest.Chunks)
 	}
 	s.chunkPins.mu.Unlock()
-	metrics.Default.ObserveLockWait("gc_mu_read", waitStart.Sub(start))
-	metrics.Default.ObserveLockHold("gc_mu_read", time.Since(waitStart))
+	lockReleased := time.Now()
+	metrics.Default.ObserveLockWait("gc_mu_read", lockAcquired.Sub(waitStart))
+	metrics.Default.ObserveLockHold("gc_mu_read", lockReleased.Sub(lockAcquired))
 
 	if mErr != nil {
 		metrics.Default.ObserveService("get_object", time.Since(start), false)
@@ -364,6 +377,275 @@ func (r *leasedReadCloser) Close() error {
 	return r.PipeReader.Close()
 }
 
+// GetObjectRange returns a reader for [start, start+length) of an object without
+// reading or hashing any chunk before the one that covers start.
+//
+// The mapping is driven by the manifest's persisted per-chunk sizes, never by
+// the blob store's current chunk size: multipart completion concatenates parts
+// whose final chunk is short, and CHUNK_SIZE can change between deployments, so
+// a fixed stride would compute wrong offsets. When a manifest predates
+// per-chunk sizes (or its layout is internally inconsistent), the call falls
+// back to GetObject and discards the prefix, which is correct but slower.
+//
+// On the mapped path it preflights and pins only the covering chunks and streams
+// from the first covering chunk at its real in-chunk offset. It always emits
+// exactly length bytes on success.
+func (s *ObjectService) GetObjectRange(bucket, key string, start, length int64) (io.ReadCloser, *models.ObjectManifest, error) {
+	started := time.Now()
+	if start < 0 || length < 0 {
+		return nil, nil, ErrInvalidRange
+	}
+
+	waitStart := time.Now()
+	s.chunkPins.mu.Lock()
+	lockAcquired := time.Now()
+	manifest, mErr := s.metadata.GetManifest(bucket, key)
+	var readLease *chunkLease
+	firstIdx, lastIdx := 0, -1
+	var rangeErr error
+	useFallback := false
+	if mErr == nil {
+		if !manifestHasChunkLayout(manifest) {
+			useFallback = true
+		} else {
+			firstIdx, lastIdx, rangeErr = coveringChunks(manifest, start, length)
+			if rangeErr == nil && lastIdx >= firstIdx {
+				readLease = s.chunkPins.newLeaseLocked(false)
+				readLease.pinAllLocked(manifest.Chunks[firstIdx : lastIdx+1])
+			}
+		}
+	}
+	s.chunkPins.mu.Unlock()
+	lockReleased := time.Now()
+	metrics.Default.ObserveLockWait("gc_mu_read", lockAcquired.Sub(waitStart))
+	metrics.Default.ObserveLockHold("gc_mu_read", lockReleased.Sub(lockAcquired))
+
+	if mErr != nil {
+		metrics.Default.ObserveService("get_object_range", time.Since(started), false)
+		return nil, nil, mErr
+	}
+	if length == 0 {
+		metrics.Default.ObserveService("get_object_range", time.Since(started), true)
+		return io.NopCloser(strings.NewReader("")), manifest, nil
+	}
+	if useFallback {
+		return s.getObjectRangeByPrefix(bucket, key, start, length)
+	}
+	if rangeErr != nil {
+		metrics.Default.ObserveService("get_object_range", time.Since(started), false)
+		if errors.Is(rangeErr, errRangeChunkMismatch) {
+			return s.getObjectRangeByPrefix(bucket, key, start, length)
+		}
+		return nil, nil, rangeErr
+	}
+
+	release := func() {}
+	if readLease != nil {
+		release = readLease.Release
+	}
+
+	// Preflight only the covering chunks: a missing chunk anywhere in the
+	// requested interval must fail before a 206 header is committed. Chunks
+	// outside the interval are never stat'd or opened.
+	for idx := firstIdx; idx <= lastIdx; idx++ {
+		if _, ok := s.blob.StatChunk(manifest.Chunks[idx]); !ok {
+			release()
+			err := fmt.Errorf("%w: chunk %s", ErrChunkMissing, manifest.Chunks[idx])
+			metrics.Default.ObserveService("get_object_range", time.Since(started), false)
+			return nil, nil, err
+		}
+	}
+
+	pr, pw := io.Pipe()
+	utils.Go("get-object-range-stream", func() {
+		streamOK := false
+		defer func() {
+			if r := recover(); r != nil {
+				_ = pw.CloseWithError(fmt.Errorf("get-object-range-stream panic: %v", r))
+				release()
+				metrics.Default.ObserveService("get_object_range", time.Since(started), false)
+				panic(r)
+			}
+			release()
+			metrics.Default.ObserveService("get_object_range", time.Since(started), streamOK)
+		}()
+		if err := s.writeObjectRange(manifest, firstIdx, lastIdx, start, length, pw); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := pw.Close(); err != nil {
+			return
+		}
+		streamOK = true
+	})
+	return &leasedReadCloser{PipeReader: pr, release: release}, manifest, nil
+}
+
+// manifestHasChunkLayout reports whether ChunkSizes is a complete, consistent
+// description of the manifest's chunks. Size alone is not enough: a short first
+// chunk can still make Size > (n-1)*chunkSize, so only an explicit per-chunk
+// layout may be used to compute offsets.
+func manifestHasChunkLayout(manifest *models.ObjectManifest) bool {
+	if manifest == nil || len(manifest.ChunkSizes) != len(manifest.Chunks) {
+		return false
+	}
+	_, ok := chunkLayoutSize(manifest.ChunkSizes, manifest.Size)
+	return ok
+}
+
+// chunkLayoutSize sums sizes and reports whether the total equals want. It also
+// rejects non-positive chunk sizes, which would make prefix sums ambiguous.
+func chunkLayoutSize(sizes []int64, want int64) (int64, bool) {
+	if want < 0 {
+		return 0, false
+	}
+	var total int64
+	for _, size := range sizes {
+		if size <= 0 || size > want-total {
+			return 0, false
+		}
+		total += size
+	}
+	return total, total == want
+}
+
+func chunkPrefixSums(sizes []int64) []int64 {
+	prefix := make([]int64, len(sizes)+1)
+	for i, size := range sizes {
+		prefix[i+1] = prefix[i] + size
+	}
+	return prefix
+}
+
+// coveringChunks maps a byte interval onto manifest chunk indices using the
+// manifest's per-chunk sizes. It returns (0, -1) for an empty interval so no
+// chunks are pinned.
+func coveringChunks(manifest *models.ObjectManifest, start, length int64) (int, int, error) {
+	if start < 0 || length < 0 {
+		return 0, -1, ErrInvalidRange
+	}
+	if length == 0 {
+		return 0, -1, nil
+	}
+	if start >= manifest.Size || length > manifest.Size-start {
+		return 0, -1, ErrInvalidRange
+	}
+
+	prefix := chunkPrefixSums(manifest.ChunkSizes)
+	first := sort.Search(len(manifest.ChunkSizes), func(i int) bool {
+		return prefix[i+1] > start
+	})
+	end := start + length
+	last := sort.Search(len(manifest.ChunkSizes), func(i int) bool {
+		return prefix[i+1] >= end
+	})
+	if first >= len(manifest.ChunkSizes) || last >= len(manifest.ChunkSizes) || last < first {
+		return 0, -1, errRangeChunkMismatch
+	}
+	return first, last, nil
+}
+
+// writeObjectRange emits exactly length bytes of the object starting at start,
+// reading only the chunks in [firstIdx, lastIdx] and slicing the first chunk at
+// the offset implied by the real per-chunk sizes. The blob layer always returns
+// a whole chunk, so chunk boundaries are respected by construction.
+func (s *ObjectService) writeObjectRange(manifest *models.ObjectManifest, firstIdx, lastIdx int, start, length int64, w *io.PipeWriter) error {
+	if length == 0 {
+		return nil
+	}
+	prefix := chunkPrefixSums(manifest.ChunkSizes)
+	remaining := length
+	for idx := firstIdx; idx <= lastIdx; idx++ {
+		data, err := s.blob.GetBlob(manifest.Chunks[idx])
+		if err != nil {
+			return err
+		}
+		declared := manifest.ChunkSizes[idx]
+		if int64(len(data)) != declared {
+			return fmt.Errorf("%w: chunk %s is %d bytes, manifest declares %d",
+				storage.ErrChunkIntegrity, manifest.Chunks[idx], len(data), declared)
+		}
+		from := int64(0)
+		if idx == firstIdx {
+			from = start - prefix[idx]
+		}
+		if from < 0 {
+			from = 0
+		}
+		if from > declared {
+			from = declared
+		}
+		available := declared - from
+		if available <= 0 {
+			continue
+		}
+		take := remaining
+		if take > available {
+			take = available
+		}
+		if _, err := w.Write(data[from : from+take]); err != nil {
+			return err
+		}
+		remaining -= take
+		if remaining == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("range ended %d bytes short: %w", remaining, io.ErrUnexpectedEOF)
+}
+
+// getObjectRangeByPrefix is the correctness fallback used when the manifest
+// lacks a usable per-chunk layout (objects written before sizes were persisted,
+// or a mixed legacy multipart upload). It reuses GetObject (with its lease and
+// preflight semantics) and discards the prefix in-process, so it is slower than
+// the mapped path but never guesses chunk offsets.
+func (s *ObjectService) getObjectRangeByPrefix(bucket, key string, start, length int64) (io.ReadCloser, *models.ObjectManifest, error) {
+	stream, manifest, err := s.GetObject(bucket, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if start < 0 || length < 0 || start > manifest.Size || length > manifest.Size-start {
+		_ = stream.Close()
+		return nil, nil, ErrInvalidRange
+	}
+	if length == 0 {
+		_ = stream.Close()
+		return io.NopCloser(strings.NewReader("")), manifest, nil
+	}
+	if start > 0 {
+		if _, err := io.CopyN(io.Discard, stream, start); err != nil {
+			_ = stream.Close()
+			return nil, nil, err
+		}
+	}
+	return &limitedReadCloser{inner: stream, remaining: length}, manifest, nil
+}
+
+// limitedReadCloser caps an underlying stream at a fixed number of bytes.
+type limitedReadCloser struct {
+	inner     io.ReadCloser
+	remaining int64
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) {
+	if l.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > l.remaining {
+		p = p[:l.remaining]
+	}
+	n, err := l.inner.Read(p)
+	l.remaining -= int64(n)
+	if errors.Is(err, io.EOF) && l.remaining > 0 {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+func (l *limitedReadCloser) Close() error {
+	return l.inner.Close()
+}
+
 func (s *ObjectService) HeadObject(bucket, key string) (models.ObjectManifest, error) {
 	start := time.Now()
 	success := false
@@ -396,16 +678,34 @@ func (s *ObjectService) ListObjects(bucket, prefix string) ([]*models.ObjectMani
 	return s.metadata.ListObjects(bucket, prefix)
 }
 
-func (s *ObjectService) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
+// ForEachObjectKeyFrom is the lazy listing iterator: the callback receives the
+// raw key and decodes a manifest only when it needs one. A normal
+// StopIteration from the callback is recorded as a successful iteration.
+func (s *ObjectService) ForEachObjectKeyFrom(bucket, startKey string, fn func(key string, decode func() (*models.ObjectManifest, error)) error) error {
 	start := time.Now()
 	success := false
 	defer func() {
 		metrics.Default.ObserveService("for_each_object_from", time.Since(start), success)
 	}()
 
-	err := s.metadata.ForEachObjectFrom(bucket, startKey, fn)
-	success = err == nil
+	err := s.metadata.ForEachObjectKeyFrom(bucket, startKey, fn)
+	success = err == nil || metadata.IsIterationStopped(err)
 	return err
+}
+
+// ForEachObjectFrom is the eager compatibility wrapper: it decodes every
+// visited manifest before invoking fn.
+func (s *ObjectService) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
+	if fn == nil {
+		return errors.New("object callback is required")
+	}
+	return s.ForEachObjectKeyFrom(bucket, startKey, func(_ string, decode func() (*models.ObjectManifest, error)) error {
+		object, err := decode()
+		if err != nil {
+			return err
+		}
+		return fn(object)
+	})
 }
 
 func (s *ObjectService) CreateBucket(bucket string) error {
@@ -455,6 +755,31 @@ func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.Multi
 	return s.metadata.CreateMultipartUpload(bucket, key)
 }
 
+// pendingMultipartUpload resolves an upload that can still be mutated. Aborted
+// and completed uploads are intentionally retained in metadata for cleanup and
+// diagnostics, but from the S3 API they are indistinguishable from uploads that
+// never existed: every lifecycle operation reports NoSuchUpload.
+func (s *ObjectService) pendingMultipartUpload(bucket, key, uploadID string) (*models.MultipartUpload, error) {
+	upload, err := s.metadata.GetMultipartUpload(uploadID)
+	if err != nil {
+		if errors.Is(err, metadata.ErrMultipartNotFound) {
+			return nil, ErrNoSuchUpload
+		}
+		return nil, err
+	}
+	if upload.Bucket != bucket || upload.Key != key || upload.State != "pending" {
+		return nil, ErrNoSuchUpload
+	}
+	return upload, nil
+}
+
+func multipartLifecycleError(err error) error {
+	if errors.Is(err, metadata.ErrMultipartNotFound) || errors.Is(err, metadata.ErrMultipartNotPending) {
+		return ErrNoSuchUpload
+	}
+	return err
+}
+
 func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int, input io.Reader) (string, error) {
 	start := time.Now()
 	success := false
@@ -466,19 +791,15 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 		return "", ErrInvalidPart
 	}
 
-	upload, err := s.metadata.GetMultipartUpload(uploadId)
-	if err != nil {
+	if _, err := s.pendingMultipartUpload(bucket, key, uploadId); err != nil {
 		return "", err
-	}
-	if upload.Bucket != bucket || upload.Key != key {
-		return "", metadata.ErrMultipartNotFound
 	}
 
 	writeLease := s.chunkPins.newLease(true)
 	defer writeLease.Release()
 
 	var uploadedPart models.UploadedPart
-	chunkIds, totalSize, etag, err := s.blob.IngestStreamWithPin(s.limitUpload(input), func(chunkID string) error {
+	chunkIds, chunkSizes, totalSize, etag, err := s.blob.IngestStreamWithSizes(s.limitUpload(input), func(chunkID string) error {
 		writeLease.Pin(chunkID)
 		return nil
 	})
@@ -490,26 +811,38 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 		ETag:       etag,
 		Size:       totalSize,
 		Chunks:     chunkIds,
+		ChunkSizes: chunkSizes,
 		CreatedAt:  time.Now().Unix(),
 	}
 	err = s.metadata.PutMultipartPart(uploadId, uploadedPart)
 	if err != nil {
-		return "", err
+		return "", multipartLifecycleError(err)
 	}
 	success = true
 	return etag, nil
 }
 
 func (s *ObjectService) ListMultipartParts(bucket, key, uploadID string) ([]models.UploadedPart, error) {
-
-	upload, err := s.metadata.GetMultipartUpload(uploadID)
-	if err != nil {
+	if _, err := s.pendingMultipartUpload(bucket, key, uploadID); err != nil {
 		return nil, err
 	}
-	if upload.Bucket != bucket || upload.Key != key {
-		return nil, metadata.ErrMultipartNotFound
+	parts, err := s.metadata.ListMultipartParts(uploadID)
+	if err != nil {
+		return nil, multipartLifecycleError(err)
 	}
-	return s.metadata.ListMultipartParts(uploadID)
+	return parts, nil
+}
+
+func (s *ObjectService) ListMultipartUploads(bucket, prefix, delimiter, keyMarker, uploadIDMarker string, maxUploads int) (*metadata.MultipartUploadsPage, error) {
+	start := time.Now()
+	success := false
+	defer func() {
+		metrics.Default.ObserveService("list_multipart_uploads", time.Since(start), success)
+	}()
+
+	page, err := s.metadata.ListMultipartUploads(bucket, prefix, delimiter, keyMarker, uploadIDMarker, maxUploads)
+	success = err == nil
+	return page, err
 }
 
 func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, completed []models.CompletedPart) (*models.ObjectManifest, error) {
@@ -519,16 +852,11 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		metrics.Default.ObserveService("complete_multipart_upload", time.Since(start), success)
 	}()
 
-	if len(completed) == 0 {
-		return nil, ErrInvalidCompleteRequest
-	}
-
-	upload, err := s.metadata.GetMultipartUpload(uploadID)
-	if err != nil {
+	if _, err := s.pendingMultipartUpload(bucket, key, uploadID); err != nil {
 		return nil, err
 	}
-	if upload.Bucket != bucket || upload.Key != key {
-		return nil, metadata.ErrMultipartNotFound
+	if len(completed) == 0 {
+		return nil, ErrInvalidCompleteRequest
 	}
 
 	s.chunkPins.mu.Lock()
@@ -542,7 +870,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 	s.chunkPins.mu.Unlock()
 	if err != nil {
 		writeLease.Release()
-		return nil, err
+		return nil, multipartLifecycleError(err)
 	}
 	defer writeLease.Release()
 	if s.testHookCompleteAfterPin != nil {
@@ -557,6 +885,12 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 	lastPartNumber := 0
 	orderedParts := make([]models.UploadedPart, 0, len(completed))
 	chunks := make([]string, 0)
+	chunkSizes := make([]int64, 0)
+	// A legacy pending upload has parts without ChunkSizes. Completing it is
+	// still valid, but the resulting object cannot support the offset-mapped
+	// range path, so leave the manifest layout unknown and let range reads use
+	// the prefix-reading fallback.
+	layoutComplete := true
 	var totalSize int64
 
 	for i, part := range completed {
@@ -578,6 +912,12 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 
 		orderedParts = append(orderedParts, storedPart)
 		chunks = append(chunks, storedPart.Chunks...)
+		_, partLayoutOK := chunkLayoutSize(storedPart.ChunkSizes, storedPart.Size)
+		if len(storedPart.ChunkSizes) != len(storedPart.Chunks) || !partLayoutOK {
+			layoutComplete = false
+		} else {
+			chunkSizes = append(chunkSizes, storedPart.ChunkSizes...)
+		}
 		totalSize += storedPart.Size
 		if s.maxUploadSize > 0 && totalSize > s.maxUploadSize {
 			return nil, ErrEntityTooLarge
@@ -594,9 +934,14 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		Chunks:      chunks,
 		CreatedAt:   time.Now().Unix(),
 	}
+	if layoutComplete && len(chunkSizes) == len(chunks) {
+		if layoutSize, ok := chunkLayoutSize(chunkSizes, totalSize); ok && layoutSize == totalSize {
+			manifest.ChunkSizes = chunkSizes
+		}
+	}
 
 	if err := s.metadata.CompleteMultipartUpload(uploadID, manifest); err != nil {
-		return nil, err
+		return nil, multipartLifecycleError(err)
 	}
 
 	success = true
@@ -604,15 +949,13 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 }
 
 func (s *ObjectService) AbortMultipartUpload(bucket, key, uploadID string) error {
-
-	upload, err := s.metadata.GetMultipartUpload(uploadID)
-	if err != nil {
+	if _, err := s.pendingMultipartUpload(bucket, key, uploadID); err != nil {
 		return err
 	}
-	if upload.Bucket != bucket || upload.Key != key {
-		return metadata.ErrMultipartNotFound
+	if err := s.metadata.AbortMultipartUpload(uploadID); err != nil {
+		return multipartLifecycleError(err)
 	}
-	return s.metadata.AbortMultipartUpload(uploadID)
+	return nil
 }
 
 func (s *ObjectService) limitUpload(input io.Reader) io.Reader {
@@ -740,6 +1083,21 @@ func (s *ObjectService) GarbageCollect() error {
 		return err
 	}
 
+	// Ingest temp files are excluded from ForEachChunk (their names are not
+	// valid chunk IDs), so a crash between CreateTemp and Rename would leak
+	// them forever. Use a conservative cutoff: an in-flight write keeps a fresh
+	// mtime and per-chunk temp lifetime is milliseconds, so only a pathologically
+	// stalled writer could exceed max(gcGrace, 1h).
+	tempGrace := s.gcGrace
+	if tempGrace < time.Hour {
+		tempGrace = time.Hour
+	}
+	removedTempFiles, err := s.blob.RemoveStaleTempFiles(time.Now().Add(-tempGrace))
+	if err != nil {
+		// Temp cleanup is best-effort and must not fail the whole GC pass.
+		slog.Warn("garbage_collect_temp_cleanup_failed", "error", err)
+	}
+
 	slog.Info("garbage_collect_completed",
 		"referenced_chunks", len(referencedChunkSet),
 		"total_chunks", totalChunks,
@@ -748,6 +1106,7 @@ func (s *ObjectService) GarbageCollect() error {
 		"cleaned_uploads", cleanedUploads,
 		"skipped_pinned", skippedPinned,
 		"skipped_fresh", skippedFresh,
+		"removed_temp_files", removedTempFiles,
 	)
 	success = true
 	return nil

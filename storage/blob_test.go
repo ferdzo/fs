@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -151,6 +152,84 @@ func TestIngestStreamWithPinErrorAbortsSave(t *testing.T) {
 	}
 	if _, ok := bs.StatChunk(attempted); ok {
 		t.Fatalf("chunk %s was saved after callback failure", attempted)
+	}
+}
+
+func TestIngestStreamWithSizesReportsChunkLengths(t *testing.T) {
+	bs, err := NewBlobStore(t.TempDir(), 4)
+	if err != nil {
+		t.Fatalf("new blob store: %v", err)
+	}
+
+	chunks, sizes, total, _, err := bs.IngestStreamWithSizes(strings.NewReader("abcdefghij"), nil)
+	if err != nil {
+		t.Fatalf("IngestStreamWithSizes: %v", err)
+	}
+	if total != 10 {
+		t.Fatalf("total = %d, want 10", total)
+	}
+	if len(chunks) != len(sizes) {
+		t.Fatalf("chunk IDs = %d, sizes = %d; want parallel", len(chunks), len(sizes))
+	}
+	want := []int64{4, 4, 2}
+	for i := range want {
+		if sizes[i] != want[i] {
+			t.Fatalf("sizes = %v, want %v", sizes, want)
+		}
+	}
+}
+
+func TestAssembleStreamReadsChunksLargerThanConfiguredChunkSize(t *testing.T) {
+	root := t.TempDir()
+	large, err := NewBlobStore(root, 64<<10)
+	if err != nil {
+		t.Fatalf("new large blob store: %v", err)
+	}
+
+	payload := make([]byte, 200<<10)
+	for i := range payload {
+		payload[i] = byte(i*17 + i/251)
+	}
+	chunks, sizes, total, _, err := large.IngestStreamWithSizes(bytes.NewReader(payload), nil)
+	if err != nil {
+		t.Fatalf("ingest with large chunk size: %v", err)
+	}
+	if total != int64(len(payload)) {
+		t.Fatalf("total = %d, want %d", total, len(payload))
+	}
+	if len(sizes) != 4 || sizes[0] != 64<<10 || sizes[3] != 8<<10 {
+		t.Fatalf("chunk sizes = %v, want four 64 KiB chunks with an 8 KiB tail", sizes)
+	}
+
+	// Re-open the same data root with a much smaller configured chunk size,
+	// simulating a deployment where CHUNK_SIZE was reduced.
+	small, err := NewBlobStore(root, 4<<10)
+	if err != nil {
+		t.Fatalf("new small blob store: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		err := small.AssembleStream(chunks, pw)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+		} else {
+			_ = pw.Close()
+		}
+		errCh <- err
+	}()
+
+	got, readErr := io.ReadAll(pr)
+	assembleErr := <-errCh
+	if readErr != nil {
+		t.Fatalf("read assembled stream: %v", readErr)
+	}
+	if assembleErr != nil {
+		t.Fatalf("AssembleStream: %v", assembleErr)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("assembled %d bytes, want %d; content mismatch", len(got), len(payload))
 	}
 }
 

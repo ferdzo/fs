@@ -354,6 +354,47 @@ func (s *Service) Authorize(accessKeyID string, target RequestTarget) error {
 	return nil
 }
 
+// AuthorizeBatch authorizes action on bucket for every key in keys using a
+// single policy read and an in-memory evaluation per key. The returned slice
+// has one entry per key: nil means allowed, ErrAccessDenied means denied.
+//
+// Semantics match calling Authorize once per key (deny-overrides and per-key
+// prefix/action matching), but the caller's policy is loaded only once. This is
+// intended for multi-object delete, where a request would otherwise perform one
+// policy read per key.
+func (s *Service) AuthorizeBatch(accessKeyID string, action Action, bucket string, keys []string) []error {
+	errs := make([]error, len(keys))
+	if len(keys) == 0 {
+		return errs
+	}
+	if !s.cfg.Enabled {
+		return errs
+	}
+
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" || action == "" {
+		for i := range errs {
+			errs[i] = ErrAccessDenied
+		}
+		return errs
+	}
+
+	policy, err := s.store.GetAuthPolicy(accessKeyID)
+	if err != nil {
+		for i := range errs {
+			errs[i] = ErrAccessDenied
+		}
+		return errs
+	}
+
+	for i, key := range keys {
+		if !isAllowed(policy, RequestTarget{Action: action, Bucket: bucket, Key: key}) {
+			errs[i] = ErrAccessDenied
+		}
+	}
+	return errs
+}
+
 func (s *Service) CreateUser(input CreateUserInput) (*CreateUserResult, error) {
 	if !s.cfg.Enabled {
 		return nil, ErrAuthNotEnabled

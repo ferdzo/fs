@@ -53,6 +53,16 @@ var (
 		Code:    "InvalidPart",
 		Message: "One or more of the specified parts could not be found.",
 	}
+	s3ErrNoSuchUpload = s3APIError{
+		Status:  http.StatusNotFound,
+		Code:    "NoSuchUpload",
+		Message: "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.",
+	}
+	s3ErrInvalidRequest = s3APIError{
+		Status:  http.StatusBadRequest,
+		Code:    "InvalidRequest",
+		Message: "The request is not valid for this operation.",
+	}
 	s3ErrInvalidPartOrder = s3APIError{
 		Status:  http.StatusBadRequest,
 		Code:    "InvalidPartOrder",
@@ -167,24 +177,16 @@ func mapToS3Error(err error) s3APIError {
 			Code:    "NoSuchKey",
 			Message: "The specified key does not exist.",
 		}
-	case errors.Is(err, metadata.ErrMultipartNotFound):
-		return s3APIError{
-			Status:  http.StatusNotFound,
-			Code:    "NoSuchUpload",
-			Message: "The specified multipart upload does not exist.",
-		}
+	case errors.Is(err, service.ErrNoSuchUpload), errors.Is(err, metadata.ErrMultipartNotFound):
+		return s3ErrNoSuchUpload
 	case errors.Is(err, metadata.ErrMultipartNotPending):
-		return s3APIError{
-			Status:  http.StatusBadRequest,
-			Code:    "InvalidRequest",
-			Message: "The multipart upload is not in a valid state for this operation.",
-		}
+		return s3ErrNoSuchUpload
 	case errors.Is(err, service.ErrInvalidPart):
 		return s3ErrInvalidPart
 	case errors.Is(err, service.ErrInvalidPartOrder):
 		return s3ErrInvalidPartOrder
 	case errors.Is(err, service.ErrInvalidCompleteRequest):
-		return s3ErrMalformedXML
+		return s3ErrInvalidRequest
 	case errors.Is(err, service.ErrEntityTooSmall):
 		return s3ErrEntityTooSmall
 	case errors.Is(err, service.ErrEntityTooLarge):

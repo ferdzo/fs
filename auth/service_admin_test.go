@@ -6,6 +6,7 @@ import (
 	"fs/metadata"
 	"fs/models"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -189,6 +190,55 @@ func TestSetUserStatus(t *testing.T) {
 	}
 	if updated.Status != "disabled" {
 		t.Fatalf("SetUserStatus status = %q, want disabled", updated.Status)
+	}
+}
+
+func TestListUsersCursorPaginatesWithoutGaps(t *testing.T) {
+	_, svc := newTestAuthService(t)
+
+	want := []string{"page-user-1", "page-user-2", "page-user-3", "page-user-4", "page-user-5"}
+	for _, accessKey := range want {
+		if _, err := svc.CreateUser(CreateUserInput{
+			AccessKeyID: accessKey,
+			Policy: models.AuthPolicy{
+				Statements: []models.AuthPolicyStatement{
+					{Effect: "allow", Actions: []string{"s3:GetObject"}, Bucket: "*", Prefix: "*"},
+				},
+			},
+		}); err != nil {
+			t.Fatalf("CreateUser(%s) returned error: %v", accessKey, err)
+		}
+	}
+
+	seen := []string{}
+	cursor := ""
+	pages := 0
+	for {
+		users, nextCursor, err := svc.ListUsers(2, cursor)
+		if err != nil {
+			t.Fatalf("ListUsers returned error: %v", err)
+		}
+		pages++
+		for _, user := range users {
+			seen = append(seen, user.AccessKeyID)
+		}
+		if nextCursor == "" {
+			break
+		}
+		if nextCursor == cursor {
+			t.Fatalf("cursor did not advance from %q", cursor)
+		}
+		cursor = nextCursor
+		if pages > 10 {
+			t.Fatal("pagination did not terminate")
+		}
+	}
+
+	if !slices.Equal(seen, want) {
+		t.Fatalf("paged users = %v, want %v", seen, want)
+	}
+	if pages != 3 {
+		t.Fatalf("pages = %d, want 3", pages)
 	}
 }
 

@@ -169,6 +169,12 @@ func validateObjectKey(key string) *s3APIError {
 		err := s3ErrInvalidObjectKey
 		return &err
 	}
+	// NUL is the separator used by the key-ordered multipart upload index, so
+	// accepting it would make index entries ambiguous to parse.
+	if strings.IndexByte(key, 0) >= 0 {
+		err := s3ErrInvalidArgument
+		return &err
+	}
 	if len(key) > maxObjectKeyBytes {
 		err := s3ErrKeyTooLong
 		return &err
@@ -253,6 +259,26 @@ func (h *Handler) authorizeObjectAction(r *http.Request, action auth.Action, buc
 	})
 }
 
+// authorizeObjectActions authorizes the same action against a bucket for many
+// keys. It resolves the caller once and lets the auth service evaluate every
+// key against a single policy read, instead of repeating the per-key lookup.
+func (h *Handler) authorizeObjectActions(r *http.Request, action auth.Action, bucket string, keys []string) []error {
+	errs := make([]error, len(keys))
+	if h.authSvc == nil || !h.authSvc.Config().Enabled {
+		return errs
+	}
+
+	authCtx, ok := auth.GetRequestContext(r.Context())
+	if !ok || !authCtx.Authenticated {
+		for i := range errs {
+			errs[i] = auth.ErrAccessDenied
+		}
+		return errs
+	}
+
+	return h.authSvc.AuthorizeBatch(authCtx.AccessKeyID, action, bucket, keys)
+}
+
 func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key, apiErr := objectKeyFromRequest(r)
@@ -266,40 +292,21 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+	if rangeHeader != "" {
+		// Resolve and validate the range before opening the object stream so a
+		// suffix or mid-object range never reads the prefix, and an invalid
+		// range is rejected with 416 without touching the blob store.
+		h.handleGetObjectRange(w, r, bucket, key, rangeHeader)
+		return
+	}
+
 	stream, manifest, err := h.svc.GetObject(bucket, key)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
 		return
 	}
 	defer stream.Close()
-
-	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
-	if rangeHeader != "" {
-		start, end, err := parseSingleByteRange(rangeHeader, manifest.Size)
-		if err != nil {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.Size))
-			writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
-			return
-		}
-
-		if start > 0 {
-			if _, err := io.CopyN(io.Discard, stream, start); err != nil {
-				writeMappedS3Error(w, r, err)
-				return
-			}
-		}
-
-		length := end - start + 1
-		w.Header().Set("Content-Type", manifest.ContentType)
-		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, manifest.Size))
-		w.Header().Set("ETag", `"`+manifest.ETag+`"`)
-		w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = io.CopyN(w, stream, length)
-		return
-	}
 
 	w.Header().Set("Content-Type", manifest.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
@@ -312,6 +319,52 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 			"bucket", bucket,
 			"key", key,
 			"etag", manifest.ETag,
+			"error", err,
+		)
+	}
+}
+
+// handleGetObjectRange serves a single-range GET. It validates the Range header
+// against the object size first, then reads only the chunks that cover the
+// requested interval.
+func (h *Handler) handleGetObjectRange(w http.ResponseWriter, r *http.Request, bucket, key, rangeHeader string) {
+	head, err := h.svc.HeadObject(bucket, key)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	start, end, err := parseSingleByteRange(rangeHeader, head.Size)
+	if err != nil {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", head.Size))
+		writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
+		return
+	}
+	length := end - start + 1
+
+	stream, manifest, err := h.svc.GetObjectRange(bucket, key, start, length)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRange) {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", head.Size))
+			writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
+			return
+		}
+		writeMappedS3Error(w, r, err)
+		return
+	}
+	defer stream.Close()
+
+	w.Header().Set("Content-Type", manifest.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, manifest.Size))
+	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.WriteHeader(http.StatusPartialContent)
+	if _, err := io.CopyN(w, stream, length); err != nil && !errors.Is(err, context.Canceled) {
+		h.logger.Warn("get_object_range_stream_failed",
+			"bucket", bucket,
+			"key", key,
 			"error", err,
 		)
 	}
@@ -538,21 +591,97 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// listPartsResponse mirrors the S3 ListPartsResult shape. It lives in the API
+// package because models.ListPartsResult predates pagination support.
+type listPartsResponse struct {
+	XMLName xml.Name `xml:"ListPartsResult"`
+	Xmlns   string   `xml:"xmlns,attr"`
+
+	Bucket   string `xml:"Bucket"`
+	Key      string `xml:"Key"`
+	UploadID string `xml:"UploadId"`
+
+	PartNumberMarker     int  `xml:"PartNumberMarker"`
+	NextPartNumberMarker int  `xml:"NextPartNumberMarker,omitempty"`
+	MaxParts             int  `xml:"MaxParts"`
+	IsTruncated          bool `xml:"IsTruncated"`
+
+	Parts []models.PartItem `xml:"Part"`
+}
+
+func parseListPartsPage(r *http.Request) (int, int, *s3APIError) {
+	partNumberMarker := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("part-number-marker")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			apiErr := s3ErrInvalidArgument
+			return 0, 0, &apiErr
+		}
+		partNumberMarker = parsed
+	}
+
+	maxParts := 1000
+	if raw := strings.TrimSpace(r.URL.Query().Get("max-parts")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			apiErr := s3ErrInvalidArgument
+			return 0, 0, &apiErr
+		}
+		if parsed > 1000 {
+			parsed = 1000
+		}
+		maxParts = parsed
+	}
+	return partNumberMarker, maxParts, nil
+}
+
 func (h *Handler) handleListMultipartParts(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+	partNumberMarker, maxParts, apiErr := parseListPartsPage(r)
+	if apiErr != nil {
+		writeS3Error(w, r, *apiErr, r.URL.Path)
+		return
+	}
+
 	parts, err := h.svc.ListMultipartParts(bucket, key, uploadID)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
 		return
 	}
 
-	response := models.ListPartsResult{
-		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
-		Bucket:   bucket,
-		Key:      key,
-		UploadID: uploadID,
-		Parts:    make([]models.PartItem, 0, len(parts)),
-	}
+	// Parts arrive in ascending part-number order. Only parts strictly greater
+	// than the marker are returned, then the page is capped at max-parts.
+	filtered := make([]models.UploadedPart, 0, len(parts))
 	for _, part := range parts {
+		if part.PartNumber > partNumberMarker {
+			filtered = append(filtered, part)
+		}
+	}
+
+	truncated := false
+	nextPartNumberMarker := 0
+	if maxParts == 0 {
+		// Consistent with max-keys=0 on ListObjects: an explicit zero page is
+		// empty and not marked truncated because there is no marker to resume
+		// from.
+		filtered = nil
+	} else if len(filtered) > maxParts {
+		filtered = filtered[:maxParts]
+		truncated = true
+		nextPartNumberMarker = filtered[len(filtered)-1].PartNumber
+	}
+
+	response := listPartsResponse{
+		Xmlns:                "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:               bucket,
+		Key:                  key,
+		UploadID:             uploadID,
+		PartNumberMarker:     partNumberMarker,
+		NextPartNumberMarker: nextPartNumberMarker,
+		MaxParts:             maxParts,
+		IsTruncated:          truncated,
+		Parts:                make([]models.PartItem, 0, len(filtered)),
+	}
+	for _, part := range filtered {
 		response.Parts = append(response.Parts, models.PartItem{
 			PartNumber:   part.PartNumber,
 			LastModified: time.Unix(part.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
@@ -834,7 +963,27 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 	response := models.DeleteObjectsResult{
 		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
 	}
-	for _, obj := range req.Objects {
+
+	// Validate keys first, then authorize all valid keys in one batch so the
+	// caller's policy is read once per request rather than once per key.
+	// Validation errors keep their original per-object position when the
+	// response is assembled below.
+	validKeys := make([]string, 0, len(req.Objects))
+	validIndexes := make([]int, 0, len(req.Objects))
+	for i, obj := range req.Objects {
+		if obj.Key == "" || len(obj.Key) > maxObjectKeyBytes {
+			continue
+		}
+		validKeys = append(validKeys, obj.Key)
+		validIndexes = append(validIndexes, i)
+	}
+	batchErrs := h.authorizeObjectActions(r, auth.ActionDeleteObject, bucket, validKeys)
+	authErrs := make([]error, len(req.Objects))
+	for i, index := range validIndexes {
+		authErrs[index] = batchErrs[i]
+	}
+
+	for i, obj := range req.Objects {
 		if obj.Key == "" {
 			response.Errors = append(response.Errors, models.DeleteError{
 				Key:     obj.Key,
@@ -851,7 +1000,7 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
-		if err := h.authorizeObjectAction(r, auth.ActionDeleteObject, bucket, obj.Key); err != nil {
+		if err := authErrs[i]; err != nil {
 			apiErr := mapToS3Error(err)
 			response.Errors = append(response.Errors, models.DeleteError{
 				Key:     obj.Key,
@@ -1058,6 +1207,11 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	query := r.URL.Query()
 
+	if query.Has("uploads") {
+		h.handleListMultipartUploads(w, r, bucket)
+		return
+	}
+
 	if query.Has("location") {
 		region := "us-east-1"
 		if h.authSvc != nil {
@@ -1092,6 +1246,120 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
+}
+
+// listMultipartUploadsResult mirrors the S3 ListMultipartUploadsResult shape.
+type listMultipartUploadsResult struct {
+	XMLName xml.Name `xml:"ListMultipartUploadsResult"`
+	Xmlns   string   `xml:"xmlns,attr"`
+
+	Bucket             string `xml:"Bucket"`
+	KeyMarker          string `xml:"KeyMarker"`
+	UploadIDMarker     string `xml:"UploadIdMarker"`
+	NextKeyMarker      string `xml:"NextKeyMarker,omitempty"`
+	NextUploadIDMarker string `xml:"NextUploadIdMarker,omitempty"`
+	Delimiter          string `xml:"Delimiter,omitempty"`
+	Prefix             string `xml:"Prefix"`
+	MaxUploads         int    `xml:"MaxUploads"`
+	IsTruncated        bool   `xml:"IsTruncated"`
+	EncodingType       string `xml:"EncodingType,omitempty"`
+
+	Uploads        []listMultipartUploadItem `xml:"Upload,omitempty"`
+	CommonPrefixes []models.CommonPrefixes   `xml:"CommonPrefixes,omitempty"`
+}
+
+type listMultipartUploadItem struct {
+	Key          string `xml:"Key"`
+	UploadID     string `xml:"UploadId"`
+	Initiated    string `xml:"Initiated"`
+	StorageClass string `xml:"StorageClass"`
+}
+
+func (h *Handler) handleListMultipartUploads(w http.ResponseWriter, r *http.Request, bucket string) {
+	query := r.URL.Query()
+	prefix := query.Get("prefix")
+	delimiter := query.Get("delimiter")
+	keyMarker := query.Get("key-marker")
+	uploadIDMarker := query.Get("upload-id-marker")
+	encodingType := strings.ToLower(strings.TrimSpace(query.Get("encoding-type")))
+	if encodingType != "" && encodingType != "url" {
+		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+		return
+	}
+	// upload-id-marker is only meaningful together with key-marker.
+	if keyMarker == "" {
+		uploadIDMarker = ""
+	}
+
+	maxUploads := 1000
+	if raw := strings.TrimSpace(query.Get("max-uploads")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+		if parsed > 1000 {
+			parsed = 1000
+		}
+		maxUploads = parsed
+	}
+
+	page, err := h.svc.ListMultipartUploads(bucket, prefix, delimiter, keyMarker, uploadIDMarker, maxUploads)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	result := listMultipartUploadsResult{
+		Xmlns:          "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:         bucket,
+		KeyMarker:      s3EncodeIfNeeded(keyMarker, encodingType),
+		UploadIDMarker: uploadIDMarker,
+		Delimiter:      s3EncodeIfNeeded(delimiter, encodingType),
+		Prefix:         s3EncodeIfNeeded(prefix, encodingType),
+		MaxUploads:     maxUploads,
+		IsTruncated:    page.IsTruncated,
+		EncodingType:   encodingType,
+	}
+	if page.IsTruncated {
+		result.NextKeyMarker = s3EncodeIfNeeded(page.NextKeyMarker, encodingType)
+		result.NextUploadIDMarker = page.NextUploadIDMarker
+	}
+	for _, upload := range page.Uploads {
+		result.Uploads = append(result.Uploads, listMultipartUploadItem{
+			Key:          s3EncodeIfNeeded(upload.Key, encodingType),
+			UploadID:     upload.UploadID,
+			Initiated:    formatMultipartInitiated(upload.CreatedAt),
+			StorageClass: "STANDARD",
+		})
+	}
+	for _, commonPrefix := range page.CommonPrefixes {
+		result.CommonPrefixes = append(result.CommonPrefixes, models.CommonPrefixes{
+			Prefix: s3EncodeIfNeeded(commonPrefix, encodingType),
+		})
+	}
+
+	xmlResponse, err := xml.Marshal(result)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(xmlResponse)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(xmlResponse)
+}
+
+// formatMultipartInitiated renders the stored RFC3339 timestamp in the
+// millisecond ISO-8601 form S3 uses for Initiated.
+func formatMultipartInitiated(createdAt string) string {
+	parsed, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return createdAt
+	}
+	return parsed.UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 func shouldUseListObjectsV1(query url.Values) bool {
@@ -1148,6 +1416,7 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	type pageEntry struct {
+		Key          string
 		Object       *models.ObjectManifest
 		CommonPrefix string
 	}
@@ -1155,7 +1424,6 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	entries := make([]pageEntry, 0, maxKeys)
 	seenCommonPrefixes := make(map[string]struct{})
 	truncated := false
-	stopErr := errors.New("list_v1_page_complete")
 
 	startKey := prefix
 	if marker != "" && marker > startKey {
@@ -1163,18 +1431,13 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	if maxKeys > 0 {
-		err := h.svc.ForEachObjectFrom(bucket, startKey, func(object *models.ObjectManifest) error {
-			if object == nil {
-				return nil
-			}
-			key := object.Key
-
+		err := h.svc.ForEachObjectKeyFrom(bucket, startKey, func(key string, decode func() (*models.ObjectManifest, error)) error {
 			if prefix != "" {
 				if key < prefix {
 					return nil
 				}
 				if !strings.HasPrefix(key, prefix) {
-					return stopErr
+					return metadata.StopIteration()
 				}
 			}
 			if marker != "" && key <= marker {
@@ -1194,7 +1457,7 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 					seenCommonPrefixes[commonPrefix] = struct{}{}
 					if len(entries) >= maxKeys {
 						truncated = true
-						return stopErr
+						return metadata.StopIteration()
 					}
 					entries = append(entries, pageEntry{
 						CommonPrefix: commonPrefix,
@@ -1205,12 +1468,16 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 
 			if len(entries) >= maxKeys {
 				truncated = true
-				return stopErr
+				return metadata.StopIteration()
 			}
-			entries = append(entries, pageEntry{Object: object})
+			object, err := decode()
+			if err != nil {
+				return err
+			}
+			entries = append(entries, pageEntry{Key: key, Object: object})
 			return nil
 		})
-		if err != nil && !errors.Is(err, stopErr) {
+		if err != nil && !metadata.IsIterationStopped(err) {
 			writeMappedS3Error(w, r, err)
 			return
 		}
@@ -1219,7 +1486,7 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	for _, entry := range entries {
 		if entry.Object != nil {
 			result.Contents = append(result.Contents, models.Contents{
-				Key:          s3EncodeIfNeeded(entry.Object.Key, encodingType),
+				Key:          s3EncodeIfNeeded(entry.Key, encodingType),
 				LastModified: time.Unix(entry.Object.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
 				ETag:         `"` + entry.Object.ETag + `"`,
 				Size:         entry.Object.Size,
@@ -1236,13 +1503,13 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	if result.IsTruncated && result.NextMarker == "" && len(entries) > 0 {
 		last := entries[len(entries)-1]
 		if last.Object != nil {
-			result.NextMarker = s3EncodeIfNeeded(last.Object.Key, encodingType)
+			result.NextMarker = s3EncodeIfNeeded(last.Key, encodingType)
 		} else {
 			result.NextMarker = s3EncodeIfNeeded(last.CommonPrefix, encodingType)
 		}
 	}
 
-	xmlResponse, err := xml.MarshalIndent(result, "", "    ")
+	xmlResponse, err := xml.Marshal(result)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
 		return
@@ -1308,6 +1575,7 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	type pageEntry struct {
+		Key          string
 		Marker       string
 		Object       *models.ObjectManifest
 		CommonPrefix string
@@ -1316,7 +1584,6 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	entries := make([]pageEntry, 0, maxKeys)
 	seenCommonPrefixes := make(map[string]struct{})
 	truncated := false
-	stopErr := errors.New("list_v2_page_complete")
 
 	startKey := prefix
 	if continuationToken != "" {
@@ -1326,18 +1593,13 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	if maxKeys > 0 {
-		err := h.svc.ForEachObjectFrom(bucket, startKey, func(object *models.ObjectManifest) error {
-			if object == nil {
-				return nil
-			}
-			key := object.Key
-
+		err := h.svc.ForEachObjectKeyFrom(bucket, startKey, func(key string, decode func() (*models.ObjectManifest, error)) error {
 			if prefix != "" {
 				if key < prefix {
 					return nil
 				}
 				if !strings.HasPrefix(key, prefix) {
-					return stopErr
+					return metadata.StopIteration()
 				}
 			}
 
@@ -1365,7 +1627,7 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 					seenCommonPrefixes[commonPrefix] = struct{}{}
 					if len(entries) >= maxKeys {
 						truncated = true
-						return stopErr
+						return metadata.StopIteration()
 					}
 					entries = append(entries, pageEntry{
 						Marker:       "C:" + commonPrefix,
@@ -1377,15 +1639,20 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 
 			if len(entries) >= maxKeys {
 				truncated = true
-				return stopErr
+				return metadata.StopIteration()
+			}
+			object, err := decode()
+			if err != nil {
+				return err
 			}
 			entries = append(entries, pageEntry{
+				Key:    key,
 				Marker: "K:" + key,
 				Object: object,
 			})
 			return nil
 		})
-		if err != nil && !errors.Is(err, stopErr) {
+		if err != nil && !metadata.IsIterationStopped(err) {
 			writeMappedS3Error(w, r, err)
 			return
 		}
@@ -1394,7 +1661,7 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	for _, entry := range entries {
 		if entry.Object != nil {
 			result.Contents = append(result.Contents, models.Contents{
-				Key:          s3EncodeIfNeeded(entry.Object.Key, encodingType),
+				Key:          s3EncodeIfNeeded(entry.Key, encodingType),
 				LastModified: time.Unix(entry.Object.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z"),
 				ETag:         `"` + entry.Object.ETag + `"`,
 				Size:         entry.Object.Size,
@@ -1413,7 +1680,7 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 		result.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(entries[result.KeyCount-1].Marker))
 	}
 
-	xmlResponse, err := xml.MarshalIndent(result, "", "    ")
+	xmlResponse, err := xml.Marshal(result)
 	if err != nil {
 		writeMappedS3Error(w, r, err)
 		return
