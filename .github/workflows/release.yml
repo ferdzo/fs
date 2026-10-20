@@ -6,6 +6,9 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Also started explicitly by the Auto Tag workflow, because tags pushed with
+  # GITHUB_TOKEN do not trigger `push` events.
+  workflow_dispatch:
 
 permissions:
   contents: write
