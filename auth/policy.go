@@ -35,7 +35,8 @@ func statementMatches(stmt models.AuthPolicyStatement, target RequestTarget) boo
 	}
 	prefix := normalizePrefixPattern(stmt.Prefix)
 	if target.Key == "" {
-		if target.Action == ActionListBucket {
+		switch target.Action {
+		case ActionListBucket, ActionListBucketVersions, ActionListBucketMultipart:
 			return strings.HasPrefix(target.Prefix, prefix)
 		}
 		return true

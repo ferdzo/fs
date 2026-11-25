@@ -96,3 +96,44 @@ func TestObjectPrefixWithoutSlashKeepsLiteralStartsWithSemantics(t *testing.T) {
 		t.Fatalf("expected prefix 'a' to deny key not starting with it")
 	}
 }
+
+func TestBucketSubresourceAndPrefixScopedListActions(t *testing.T) {
+	policy := &models.AuthPolicy{
+		Statements: []models.AuthPolicyStatement{
+			{
+				Effect: "allow",
+				Actions: []string{
+					"s3:GetBucketLocation",
+					"s3:GetBucketVersioning",
+					"s3:ListBucket",
+					"s3:ListBucketVersions",
+					"s3:ListBucketMultipartUploads",
+				},
+				Bucket: "backup",
+				Prefix: "restic/",
+			},
+		},
+	}
+
+	if !isAllowed(policy, RequestTarget{Action: ActionGetBucketLocation, Bucket: "backup"}) {
+		t.Fatal("expected GetBucketLocation to succeed under prefix-scoped bucket policy")
+	}
+	if !isAllowed(policy, RequestTarget{Action: ActionGetBucketVersioning, Bucket: "backup"}) {
+		t.Fatal("expected GetBucketVersioning to succeed under prefix-scoped bucket policy")
+	}
+	if isAllowed(policy, RequestTarget{Action: ActionPutBucketVersioning, Bucket: "backup"}) {
+		t.Fatal("expected PutBucketVersioning to be denied when not in policy")
+	}
+	if !isAllowed(policy, RequestTarget{Action: ActionListBucketVersions, Bucket: "backup", Prefix: "restic/daily/"}) {
+		t.Fatal("expected ListBucketVersions under allowed prefix to succeed")
+	}
+	if isAllowed(policy, RequestTarget{Action: ActionListBucketVersions, Bucket: "backup", Prefix: "other/"}) {
+		t.Fatal("expected ListBucketVersions outside allowed prefix to be denied")
+	}
+	if !isAllowed(policy, RequestTarget{Action: ActionListBucketMultipart, Bucket: "backup", Prefix: "restic/"}) {
+		t.Fatal("expected ListBucketMultipartUploads under allowed prefix to succeed")
+	}
+	if isAllowed(policy, RequestTarget{Action: ActionListBucketMultipart, Bucket: "backup"}) {
+		t.Fatal("expected ListBucketMultipartUploads with empty prefix to be denied under restic/ policy")
+	}
+}

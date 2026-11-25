@@ -14,6 +14,8 @@ type Config struct {
 	DataPath                  string
 	Address                   string
 	Port                      int
+	MetricsAddress            string
+	MetricsPort               int
 	ChunkSize                 int
 	MaxObjectUploadBytes      int64
 	LogLevel                  string
@@ -42,6 +44,8 @@ func NewConfig() *Config {
 		DataPath:             sanitizeDataPath(os.Getenv("DATA_PATH")),
 		Address:              firstNonEmpty(strings.TrimSpace(os.Getenv("ADDRESS")), "0.0.0.0"),
 		Port:                 envIntRange("PORT", 2600, 1, 65535),
+		MetricsAddress:       firstNonEmpty(strings.TrimSpace(os.Getenv("METRICS_ADDRESS")), "127.0.0.1"),
+		MetricsPort:          envIntRange("METRICS_PORT", 9091, 0, 65535),
 		ChunkSize:            envIntRange("CHUNK_SIZE", 8192000, 1, 64*1024*1024),
 		MaxObjectUploadBytes: envInt64Range("FS_MAX_OBJECT_UPLOAD_BYTES", 5*1024*1024*1024, 1, 5*1024*1024*1024),
 		LogLevel:             strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),

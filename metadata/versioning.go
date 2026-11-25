@@ -30,6 +30,30 @@ const (
 // ErrVersionNotFound reports that a requested object version does not exist.
 var ErrVersionNotFound = errors.New("object version not found")
 
+// ErrPreconditionFailed reports that a conditional write precondition did not hold.
+var ErrPreconditionFailed = errors.New("precondition failed")
+
+// IfNoneMatchPreconditionFailed reports whether an If-None-Match header value
+// matches an existing live object's ETag (or "*").
+func IfNoneMatchPreconditionFailed(headerValue, etag string) bool {
+	for _, rawToken := range strings.Split(headerValue, ",") {
+		token := strings.TrimSpace(rawToken)
+		if token == "" {
+			continue
+		}
+		if token == "*" {
+			return true
+		}
+
+		token = strings.TrimPrefix(token, "W/")
+		token = strings.Trim(token, `"`)
+		if strings.EqualFold(token, etag) {
+			return true
+		}
+	}
+	return false
+}
+
 // DeleteResult describes a version-aware object delete.
 type DeleteResult struct {
 	VersionID    string
@@ -198,8 +222,10 @@ func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key 
 }
 
 // putObjectVersionTx writes a manifest according to the bucket's versioning
-// state. All index updates happen in the caller's transaction.
-func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest) (string, error) {
+// state. When ifNoneMatch is non-empty, it rejects the write with
+// ErrPreconditionFailed if a live (non-delete-marker) object matches. All
+// index updates happen in the caller's transaction.
+func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMatch string) (string, error) {
 	if manifest == nil {
 		return "", errors.New("object manifest is required")
 	}
@@ -210,6 +236,17 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest) (string, 
 	metaBucket := tx.Bucket([]byte(manifest.Bucket))
 	if metaBucket == nil {
 		return "", fmt.Errorf("%w: %s", ErrBucketNotFound, manifest.Bucket)
+	}
+	if ifNoneMatch = strings.TrimSpace(ifNoneMatch); ifNoneMatch != "" {
+		if existing := metaBucket.Get([]byte(manifest.Key)); existing != nil {
+			current := models.ObjectManifest{}
+			if err := json.Unmarshal(existing, &current); err != nil {
+				return "", err
+			}
+			if !current.DeleteMarker && IfNoneMatchPreconditionFailed(ifNoneMatch, current.ETag) {
+				return "", ErrPreconditionFailed
+			}
+		}
 	}
 	if status == "" {
 		manifest.VersionID = ""
@@ -283,10 +320,16 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest) (string, 
 // PutObjectVersion stores a manifest as a new version (or overwrites when the
 // bucket is unversioned) and returns the version ID.
 func (h *MetadataHandler) PutObjectVersion(manifest *models.ObjectManifest) (string, error) {
+	return h.PutObjectVersionConditional(manifest, "")
+}
+
+// PutObjectVersionConditional stores a manifest while atomically enforcing an
+// optional If-None-Match precondition inside the metadata write transaction.
+func (h *MetadataHandler) PutObjectVersionConditional(manifest *models.ObjectManifest, ifNoneMatch string) (string, error) {
 	var versionID string
 	err := h.update(func(tx *bbolt.Tx) error {
 		var err error
-		versionID, err = putObjectVersionTx(tx, manifest)
+		versionID, err = putObjectVersionTx(tx, manifest, ifNoneMatch)
 		return err
 	})
 	return versionID, err
@@ -424,6 +467,53 @@ func (h *MetadataHandler) DeleteObject(bucket, key, versionID string) (DeleteRes
 	return result, err
 }
 
+// DeleteObjectSpec identifies one key (and optional version) in a batch delete.
+type DeleteObjectSpec struct {
+	Key       string
+	VersionID string
+}
+
+// BatchDeleteResult describes the outcome of one item in a batch delete.
+type BatchDeleteResult struct {
+	Key                string
+	RequestedVersionID string
+	VersionID          string
+	DeleteMarker       bool
+}
+
+// DeleteObjects applies a batch of version-aware deletes in a single metadata
+// transaction, honoring the bucket's versioning state whether or not items
+// specify a VersionID.
+func (h *MetadataHandler) DeleteObjects(bucket string, specs []DeleteObjectSpec) ([]BatchDeleteResult, error) {
+	results := make([]BatchDeleteResult, 0, len(specs))
+	err := h.update(func(tx *bbolt.Tx) error {
+		if _, err := bucketVersioningTx(tx, bucket); err != nil {
+			return err
+		}
+		for _, spec := range specs {
+			if spec.Key == "" {
+				continue
+			}
+			reqVersion := strings.TrimSpace(spec.VersionID)
+			res, err := deleteObjectTx(tx, bucket, spec.Key, reqVersion)
+			if err != nil {
+				return err
+			}
+			results = append(results, BatchDeleteResult{
+				Key:                spec.Key,
+				RequestedVersionID: reqVersion,
+				VersionID:          res.VersionID,
+				DeleteMarker:       res.DeleteMarker,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // GetManifestVersion returns one version, resolving "null" to the legacy
 // record when the bucket has never been versioned. Delete markers are returned
 // with DeleteMarker set; callers decide how to surface them.
@@ -498,9 +588,9 @@ func (h *MetadataHandler) ListObjectVersions(bucket, prefix, delimiter, keyMarke
 		versions := tx.Bucket(versionIndex)
 		order := tx.Bucket(versionOrderIndex)
 		cursor := metaBucket.Cursor()
-		start := keyMarker
-		if start == "" {
-			start = prefix
+		start := prefix
+		if keyMarker != "" && keyMarker > start {
+			start = keyMarker
 		}
 		var k, v []byte
 		if start == "" {
@@ -574,7 +664,7 @@ func (h *MetadataHandler) ListObjectVersions(bucket, prefix, delimiter, keyMarke
 			foundMarker := false
 			for _, entry := range entries {
 				if skipUntilMarker {
-					if entry.VersionID == versionIDMarker {
+					if versionIDOrNull(entry) == versionIDMarker {
 						skipUntilMarker = false
 						foundMarker = true
 					}

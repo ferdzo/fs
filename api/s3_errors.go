@@ -187,6 +187,8 @@ func mapToS3Error(err error) s3APIError {
 			Code:    "NoSuchKey",
 			Message: "The specified key does not exist.",
 		}
+	case errors.Is(err, metadata.ErrPreconditionFailed):
+		return s3ErrPreconditionFailed
 	case errors.Is(err, metadata.ErrVersionNotFound):
 		return s3ErrNoSuchVersion
 	case errors.Is(err, service.ErrNoSuchUpload), errors.Is(err, metadata.ErrMultipartNotFound):

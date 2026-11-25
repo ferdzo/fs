@@ -405,7 +405,7 @@ func TestListMultipartUploadsRequiresListBucket(t *testing.T) {
 			Statements: []models.AuthPolicyStatement{
 				{
 					Effect:  "allow",
-					Actions: []string{"s3:ListBucket"},
+					Actions: []string{"s3:ListBucketMultipartUploads"},
 					Bucket:  bucket,
 					Prefix:  "allowed/",
 				},
@@ -413,6 +413,30 @@ func TestListMultipartUploadsRequiresListBucket(t *testing.T) {
 		},
 	}); err != nil {
 		t.Fatalf("create list user: %v", err)
+	}
+	if _, err := authSvc.CreateUser(auth.CreateUserInput{
+		AccessKeyID: "list-bucket-only",
+		SecretKey:   "list-bucket-secret-1",
+		Policy: models.AuthPolicy{
+			Statements: []models.AuthPolicyStatement{
+				{
+					Effect:  "allow",
+					Actions: []string{"s3:ListBucket"},
+					Bucket:  bucket,
+					Prefix:  "*",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("create list-only user: %v", err)
+	}
+
+	listOnlyReq := httptest.NewRequest(http.MethodGet, "/"+bucket+"?uploads&prefix=allowed%2F", nil)
+	signTestSigV4Request(t, listOnlyReq, "list-bucket-only", "list-bucket-secret-1")
+	listOnlyRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(listOnlyRec, listOnlyReq)
+	if listOnlyRec.Code != http.StatusForbidden || !strings.Contains(listOnlyRec.Body.String(), "AccessDenied") {
+		t.Fatalf("list-only user status/body = %d/%s, want 403 AccessDenied", listOnlyRec.Code, listOnlyRec.Body.String())
 	}
 
 	unsigned := httptest.NewRequest(http.MethodGet, "/"+bucket+"?uploads", nil)

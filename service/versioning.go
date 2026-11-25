@@ -3,7 +3,9 @@ package service
 import (
 	"errors"
 	"fs/metadata"
+	"fs/metrics"
 	"fs/models"
+	"time"
 )
 
 // ErrDeleteMarker reports that a version resolves to a delete marker.
@@ -50,4 +52,18 @@ func (s *ObjectService) SetBucketVersioning(bucket, status string) error {
 // ListObjectVersions returns one page of versions, including delete markers.
 func (s *ObjectService) ListObjectVersions(bucket, prefix, delimiter, keyMarker, versionIDMarker string, maxKeys int) (*metadata.ObjectVersionsPage, error) {
 	return s.metadata.ListObjectVersions(bucket, prefix, delimiter, keyMarker, versionIDMarker, maxKeys)
+}
+
+// DeleteObjectsVersioned deletes a batch of keys (with optional version IDs) in
+// a single metadata transaction, honoring the bucket's versioning state.
+func (s *ObjectService) DeleteObjectsVersioned(bucket string, specs []metadata.DeleteObjectSpec) ([]metadata.BatchDeleteResult, error) {
+	start := time.Now()
+	success := false
+	defer func() {
+		metrics.Default.ObserveService("delete_objects", time.Since(start), success)
+	}()
+
+	results, err := s.metadata.DeleteObjects(bucket, specs)
+	success = err == nil
+	return results, err
 }

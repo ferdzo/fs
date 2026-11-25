@@ -215,6 +215,12 @@ func (r *chunkPinRegistry) pinCount() int {
 }
 
 func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Reader) (*models.ObjectManifest, error) {
+	return s.PutObjectConditional(bucket, key, contentType, "", input)
+}
+
+// PutObjectConditional ingests input and stores a manifest while atomically
+// enforcing an optional If-None-Match precondition in metadata.
+func (s *ObjectService) PutObjectConditional(bucket, key, contentType, ifNoneMatch string, input io.Reader) (*models.ObjectManifest, error) {
 	start := time.Now()
 	success := false
 	defer func() {
@@ -250,7 +256,7 @@ func (s *ObjectService) PutObject(bucket, key, contentType string, input io.Read
 		"chunk_count", len(manifest.Chunks),
 		"etag", manifest.ETag,
 	)
-	if _, err = s.metadata.PutObjectVersion(manifest); err != nil {
+	if _, err = s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch); err != nil {
 		return nil, err
 	}
 
@@ -264,6 +270,12 @@ func (s *ObjectService) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) 
 
 // CopyObjectVersion copies an explicit source version ("" means latest).
 func (s *ObjectService) CopyObjectVersion(srcBucket, srcKey, srcVersionID, dstBucket, dstKey string) (*models.ObjectManifest, error) {
+	return s.CopyObjectVersionConditional(srcBucket, srcKey, srcVersionID, dstBucket, dstKey, "")
+}
+
+// CopyObjectVersionConditional copies an explicit source version while
+// atomically enforcing an optional If-None-Match precondition on the target.
+func (s *ObjectService) CopyObjectVersionConditional(srcBucket, srcKey, srcVersionID, dstBucket, dstKey, ifNoneMatch string) (*models.ObjectManifest, error) {
 	start := time.Now()
 	success := false
 	defer func() {
@@ -296,7 +308,7 @@ func (s *ObjectService) CopyObjectVersion(srcBucket, srcKey, srcVersionID, dstBu
 		ChunkSizes:  append([]int64(nil), source.ChunkSizes...),
 		CreatedAt:   time.Now().Unix(),
 	}
-	if _, err := s.metadata.PutObjectVersion(manifest); err != nil {
+	if _, err := s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch); err != nil {
 		return nil, err
 	}
 

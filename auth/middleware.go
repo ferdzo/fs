@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"fs/metrics"
 	"hash"
 	"io"
@@ -25,6 +26,15 @@ func Middleware(
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authCtx := RequestContext{Authenticated: false, AuthType: "none"}
 			if svc == nil || !svc.Config().Enabled {
+				if err := wrapDisabledAuthStreamingBody(r); err != nil {
+					metrics.Default.ObserveAuth("error", "disabled", authErrorClass(err))
+					if onError != nil {
+						onError(w, r, err)
+						return
+					}
+					http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+					return
+				}
 				metrics.Default.ObserveAuth("bypass", "disabled", "auth_disabled")
 				next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), authCtx)))
 				return
@@ -98,6 +108,22 @@ func Middleware(
 			next.ServeHTTP(w, r.WithContext(WithRequestContext(r.Context(), resolvedCtx)))
 		})
 	}
+}
+
+func wrapDisabledAuthStreamingBody(r *http.Request) error {
+	if r == nil || r.Body == nil || r.Body == http.NoBody {
+		return nil
+	}
+	payloadMode := resolvePayloadHash(r, false)
+	if !isSignedStreamingPayloadHash(payloadMode) {
+		return nil
+	}
+	if _, ok := resolveSignedStreamingMode(payloadMode); !ok {
+		return fmt.Errorf("%w: unsupported signed streaming payload mode %q",
+			ErrAuthorizationHeaderMalformed, payloadMode)
+	}
+	r.Body = NewSignedChunkedReader(r.Body, nil)
+	return nil
 }
 
 func wrapRequestBody(r *http.Request, ctx RequestContext) error {

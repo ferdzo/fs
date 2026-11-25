@@ -9,6 +9,7 @@ import (
 	"fs/service"
 	"fs/storage"
 	"fs/utils"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -44,6 +45,8 @@ func RunServer(ctx context.Context) error {
 		"auth_enabled", authConfig.Enabled,
 		"auth_region", authConfig.Region,
 		"admin_api_enabled", config.AdminAPIEnabled,
+		"metrics_address", config.MetricsAddress,
+		"metrics_port", config.MetricsPort,
 	)
 
 	if err := os.MkdirAll(config.DataPath, 0o755); err != nil {
@@ -80,6 +83,21 @@ func RunServer(ctx context.Context) error {
 
 	handler := api.NewHandler(objectService, logger, logConfig, authService, config.AdminAPIEnabled,
 		time.Duration(config.BodyReadTimeoutSeconds)*time.Second)
+	var metricsSrv *api.MetricsServer
+	if config.MetricsPort > 0 {
+		metricsAddr := net.JoinHostPort(config.MetricsAddress, strconv.Itoa(config.MetricsPort))
+		metricsSrv, err = api.StartMetricsServer(ctx, metricsAddr, logger)
+		if err != nil {
+			_ = metadataHandler.Close()
+			logger.Error("failed_to_start_metrics_server", "address", metricsAddr, "error", err)
+			return err
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+	}
 	addr := config.Address + ":" + strconv.Itoa(config.Port)
 	if config.GcEnabled {
 		go objectService.RunGC(ctx, config.GcInterval)

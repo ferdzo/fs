@@ -11,15 +11,21 @@ This project is S3-compatible for a focused subset of operations.
 - `PUT /{bucket}` create bucket
 - `HEAD /{bucket}` head bucket
 - `DELETE /{bucket}` delete bucket (must be empty)
+- `GET /{bucket}` list objects v1
 - `GET /{bucket}?list-type=2...` list objects v2
 - `GET /{bucket}?location` get bucket location
+- `GET /{bucket}?uploads` list multipart uploads
+- `GET /{bucket}?versioning` get bucket versioning status
+- `PUT /{bucket}?versioning` enable or suspend bucket versioning
+- `GET /{bucket}?versions` list object versions and delete markers
 - `POST /{bucket}?delete` delete multiple objects
 
 ### Object
-- `PUT /{bucket}/{key}` put object
-- `GET /{bucket}/{key}` get object
-- `HEAD /{bucket}/{key}` head object
-- `DELETE /{bucket}/{key}` delete object
+- `PUT /{bucket}/{key}` put object (supports `If-None-Match` precondition)
+- `PUT /{bucket}/{key}` with `x-amz-copy-source` copy object (supports `?versionId=...`)
+- `GET /{bucket}/{key}` get object (supports `?versionId=...`)
+- `HEAD /{bucket}/{key}` head object (supports `?versionId=...`)
+- `DELETE /{bucket}/{key}` delete object (supports `?versionId=...` and delete markers)
 - `GET /{bucket}/{key}` supports single-range requests
 
 ### Multipart upload
@@ -32,7 +38,7 @@ This project is S3-compatible for a focused subset of operations.
 ### Authentication
 - AWS SigV4 header auth
 - AWS SigV4 presigned query auth
-- `aws-chunked` payload decode for unsigned streaming upload modes
+- `aws-chunked` payload decode for unsigned (`STREAMING-UNSIGNED-PAYLOAD*`) and signed (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) streaming upload modes
 - SigV4 payload hash verification for fixed-size signed payloads
 
 ## Partially Implemented / Differences
@@ -46,7 +52,6 @@ This project is S3-compatible for a focused subset of operations.
 - Signed `aws-chunked` payload modes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and `-TRAILER`) are fully decoded with per-chunk signature chain verification; tampered chunks are rejected mid-upload with `SignatureDoesNotMatch`. When auth is disabled these modes are decoded without signature checks (no secret is available).
 
 ## Not Implemented (Current)
-- Bucket versioning
 - Lifecycle rules
 - Replication
 - Object lock / legal hold / retention

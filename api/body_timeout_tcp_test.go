@@ -3,11 +3,15 @@ package api
 import (
 	"bufio"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"fs/logging"
 )
 
 // TestUnreadBodyDrainRespectsBodyTimeout is a real-TCP regression for the
@@ -116,5 +120,49 @@ func TestKeepaliveSurvivesUnreadBodyDrain(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("second status = %d, want 200", resp2.StatusCode)
+	}
+}
+
+func TestNewHandlerBodyReadTimeoutZeroDisablesMiddleware(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	zeroHandler := NewHandler(nil, logger, logging.Config{}, nil, false, 0)
+	if zeroHandler.bodyReadTimeout != 0 {
+		t.Fatalf("NewHandler(..., 0).bodyReadTimeout = %v, want 0", zeroHandler.bodyReadTimeout)
+	}
+	zeroHandler.setupRoutes()
+	zeroWrapped := false
+	zeroHandler.router.Put("/probe", func(w http.ResponseWriter, r *http.Request) {
+		_, zeroWrapped = r.Body.(*deadlineRefreshReader)
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	zeroHandler.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/probe", strings.NewReader("ok")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200", rec.Code)
+	}
+	if zeroWrapped {
+		t.Fatal("bodyReadTimeout=0 must not wrap request body with deadlineRefreshReader")
+	}
+
+	omittedHandler := NewHandler(nil, logger, logging.Config{}, nil, false)
+	if omittedHandler.bodyReadTimeout != time.Minute {
+		t.Fatalf("NewHandler() default bodyReadTimeout = %v, want 1m", omittedHandler.bodyReadTimeout)
+	}
+
+	negativeHandler := NewHandler(nil, logger, logging.Config{}, nil, false, -time.Second)
+	if negativeHandler.bodyReadTimeout != time.Minute {
+		t.Fatalf("NewHandler(..., -1s).bodyReadTimeout = %v, want 1m", negativeHandler.bodyReadTimeout)
+	}
+	negativeHandler.setupRoutes()
+	negWrapped := false
+	negativeHandler.router.Put("/probe", func(w http.ResponseWriter, r *http.Request) {
+		_, negWrapped = r.Body.(*deadlineRefreshReader)
+		w.WriteHeader(http.StatusOK)
+	})
+	rec2 := httptest.NewRecorder()
+	negativeHandler.router.ServeHTTP(rec2, httptest.NewRequest(http.MethodPut, "/probe", strings.NewReader("ok")))
+	if !negWrapped {
+		t.Fatal("positive default bodyReadTimeout should wrap request body with deadlineRefreshReader")
 	}
 }
