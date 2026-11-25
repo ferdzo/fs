@@ -1174,7 +1174,7 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 
 		final.Bucket = upload.Bucket
 		final.Key = upload.Key
-		if _, err := putObjectVersionTx(tx, final); err != nil {
+		if _, err := putObjectVersionTx(tx, final, ""); err != nil {
 			return err
 		}
 

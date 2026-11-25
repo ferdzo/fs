@@ -311,3 +311,111 @@ func TestCompleteMultipartUploadCreatesVersion(t *testing.T) {
 		t.Fatalf("multipart version id = %q, want a unique id", latest.VersionID)
 	}
 }
+
+func TestDeleteObjectsBatchRespectsVersioning(t *testing.T) {
+	h, _ := newTestStore(t)
+	mustCreateBucket(t, h, "unver")
+	mustCreateBucket(t, h, "ver")
+	if err := h.SetBucketVersioning("ver", versioningEnabled); err != nil {
+		t.Fatalf("SetBucketVersioning: %v", err)
+	}
+
+	mustPutManifest(t, h, versionedObject("unver", "k1", "e1", "c1"))
+	unverRes, err := h.DeleteObjects("unver", []DeleteObjectSpec{{Key: "k1"}, {Key: "missing"}})
+	if err != nil {
+		t.Fatalf("DeleteObjects unversioned: %v", err)
+	}
+	if len(unverRes) != 2 || unverRes[0].DeleteMarker || unverRes[0].VersionID != "" {
+		t.Fatalf("unexpected unversioned results: %+v", unverRes)
+	}
+	if _, err := h.GetManifest("unver", "k1"); !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("k1 should be permanently deleted, got %v", err)
+	}
+
+	v1 := mustPutVersion(t, h, versionedObject("ver", "a", "ea", "ca"))
+	v2 := mustPutVersion(t, h, versionedObject("ver", "b", "eb", "cb"))
+	verRes, err := h.DeleteObjects("ver", []DeleteObjectSpec{
+		{Key: "a"},
+		{Key: "b", VersionID: v2},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects versioned: %v", err)
+	}
+	if len(verRes) != 2 {
+		t.Fatalf("len(verRes) = %d, want 2", len(verRes))
+	}
+	if !verRes[0].DeleteMarker || verRes[0].VersionID == "" || verRes[0].RequestedVersionID != "" {
+		t.Fatalf("expected delete marker for unversioned key delete in versioned bucket, got %+v", verRes[0])
+	}
+	if verRes[1].DeleteMarker || verRes[1].VersionID != v2 || verRes[1].RequestedVersionID != v2 {
+		t.Fatalf("expected explicit version delete for b, got %+v", verRes[1])
+	}
+
+	// Historical version v1 must still be visible and addressable.
+	if _, err := h.GetManifestVersion("ver", "a", v1); err != nil {
+		t.Fatalf("GetManifestVersion(a, %s): %v", v1, err)
+	}
+	if err := h.DeleteBucket("ver"); !errors.Is(err, ErrBucketNotEmpty) {
+		t.Fatalf("DeleteBucket with remaining versions = %v, want ErrBucketNotEmpty", err)
+	}
+}
+
+func TestPutObjectVersionConditionalIfNoneMatch(t *testing.T) {
+	h, _ := newTestStore(t)
+	mustCreateBucket(t, h, "bucket")
+	if err := h.SetBucketVersioning("bucket", versioningEnabled); err != nil {
+		t.Fatalf("SetBucketVersioning: %v", err)
+	}
+
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e1", "c1"), "*"); err != nil {
+		t.Fatalf("initial conditional put: %v", err)
+	}
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e2", "c2"), "*"); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("overwrite with If-None-Match:* = %v, want ErrPreconditionFailed", err)
+	}
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e2", "c2"), `"e1"`); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("overwrite with matching ETag = %v, want ErrPreconditionFailed", err)
+	}
+
+	if _, err := h.DeleteObject("bucket", "k", ""); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e3", "c3"), "*"); err != nil {
+		t.Fatalf("conditional put over delete marker failed: %v", err)
+	}
+}
+
+func TestListObjectVersionsNullMarkerAndKeyMarkerBeforePrefix(t *testing.T) {
+	h, _ := newTestStore(t)
+	mustCreateBucket(t, h, "bucket")
+	mustPutManifest(t, h, versionedObject("bucket", "a", "ea", "ca"))
+	if err := h.SetBucketVersioning("bucket", versioningEnabled); err != nil {
+		t.Fatalf("SetBucketVersioning: %v", err)
+	}
+	mustPutVersion(t, h, versionedObject("bucket", "logs/1", "eb", "cb"))
+
+	// Paginating from legacy "null" record must resume on the next key.
+	p1, err := h.ListObjectVersions("bucket", "", "", "", "", 1)
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if !p1.IsTruncated || p1.NextKeyMarker != "a" || p1.NextVersionIDMarker != "null" {
+		t.Fatalf("unexpected page 1: %+v", p1)
+	}
+	p2, err := h.ListObjectVersions("bucket", "", "", p1.NextKeyMarker, p1.NextVersionIDMarker, 10)
+	if err != nil {
+		t.Fatalf("page 2 with null marker: %v", err)
+	}
+	if len(p2.Versions) != 1 || p2.Versions[0].Manifest.Key != "logs/1" {
+		t.Fatalf("unexpected page 2: %+v", p2)
+	}
+
+	// keyMarker before prefix must still return matching prefixed entries.
+	prefixed, err := h.ListObjectVersions("bucket", "logs/", "", "a", "", 10)
+	if err != nil {
+		t.Fatalf("keyMarker before prefix: %v", err)
+	}
+	if len(prefixed.Versions) != 1 || prefixed.Versions[0].Manifest.Key != "logs/1" {
+		t.Fatalf("unexpected prefixed page: %+v", prefixed)
+	}
+}

@@ -59,3 +59,36 @@ func TestRequiresHandlerAuthorizationOnlyForMultiDelete(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveTargetGranularBucketAndVersionActions(t *testing.T) {
+	cases := []struct {
+		name       string
+		method     string
+		url        string
+		wantAction Action
+		wantBucket string
+		wantKey    string
+		wantPrefix string
+	}{
+		{"get versioning", http.MethodGet, "/b?versioning", ActionGetBucketVersioning, "b", "", ""},
+		{"put versioning", http.MethodPut, "/b?versioning", ActionPutBucketVersioning, "b", "", ""},
+		{"get location", http.MethodGet, "/b?location", ActionGetBucketLocation, "b", "", ""},
+		{"list versions", http.MethodGet, "/b?versions&prefix=logs/", ActionListBucketVersions, "b", "", "logs/"},
+		{"list uploads", http.MethodGet, "/b?uploads&prefix=part/", ActionListBucketMultipart, "b", "", "part/"},
+		{"get object version", http.MethodGet, "/b/k?versionId=v1", ActionGetObjectVersion, "b", "k", ""},
+		{"head object version", http.MethodHead, "/b/k?versionId=v1", ActionGetObjectVersion, "b", "k", ""},
+		{"get object latest", http.MethodGet, "/b/k", ActionGetObject, "b", "k", ""},
+		{"delete object version", http.MethodDelete, "/b/k?versionId=v1", ActionDeleteObjectVersion, "b", "k", ""},
+		{"delete object unversioned", http.MethodDelete, "/b/k", ActionDeleteObject, "b", "k", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "http://example.com"+tc.url, nil)
+			target := resolveTarget(req)
+			if target.Action != tc.wantAction || target.Bucket != tc.wantBucket || target.Key != tc.wantKey || target.Prefix != tc.wantPrefix {
+				t.Fatalf("resolveTarget(%s %s) = %+v, want action=%q bucket=%q key=%q prefix=%q",
+					tc.method, tc.url, target, tc.wantAction, tc.wantBucket, tc.wantKey, tc.wantPrefix)
+			}
+		})
+	}
+}

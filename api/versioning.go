@@ -163,11 +163,15 @@ func (h *Handler) handleListObjectVersions(w http.ResponseWriter, r *http.Reques
 	}
 	for _, entry := range page.Versions {
 		manifest := entry.Manifest
+		versionID := manifest.VersionID
+		if versionID == "" {
+			versionID = "null"
+		}
 		lastModified := time.Unix(manifest.CreatedAt, 0).UTC().Format("2006-01-02T15:04:05.000Z")
 		if manifest.DeleteMarker {
 			result.DeleteMarkers = append(result.DeleteMarkers, listDeleteMarkerEntry{
 				Key:          s3EncodeIfNeeded(manifest.Key, encodingType),
-				VersionID:    manifest.VersionID,
+				VersionID:    versionID,
 				IsLatest:     entry.IsLatest,
 				LastModified: lastModified,
 			})
@@ -175,7 +179,7 @@ func (h *Handler) handleListObjectVersions(w http.ResponseWriter, r *http.Reques
 		}
 		result.Versions = append(result.Versions, listVersionEntry{
 			Key:          s3EncodeIfNeeded(manifest.Key, encodingType),
-			VersionID:    manifest.VersionID,
+			VersionID:    versionID,
 			IsLatest:     entry.IsLatest,
 			LastModified: lastModified,
 			ETag:         `"` + manifest.ETag + `"`,

@@ -16,13 +16,19 @@ Bucket operations:
 - `HEAD /{bucket}`
 - `DELETE /{bucket}`
 - `GET /` (list buckets)
+- `GET /{bucket}` (ListObjectsV1)
+- `GET /{bucket}?list-type=2&prefix=...` (ListObjectsV2)
+- `GET /{bucket}?location` (bucket location)
+- `GET /{bucket}?uploads` (list multipart uploads)
+- `GET /{bucket}?versioning` (get versioning status)
+- `PUT /{bucket}?versioning` (enable or suspend versioning)
+- `GET /{bucket}?versions` (list object versions and delete markers)
 
 Object operations:
-- `PUT /{bucket}/{key}`
-- `GET /{bucket}/{key}`
-- `HEAD /{bucket}/{key}`
-- `DELETE /{bucket}/{key}`
-- `GET /{bucket}?list-type=2&prefix=...` (ListObjectsV2-style)
+- `PUT /{bucket}/{key}` (supports `If-None-Match` precondition and `x-amz-copy-source` with optional `?versionId=...`)
+- `GET /{bucket}/{key}` (supports single-range `Range` and `?versionId=...`)
+- `HEAD /{bucket}/{key}` (supports `?versionId=...`)
+- `DELETE /{bucket}/{key}` (supports `?versionId=...`)
 
 Multipart upload:
 - `POST /{bucket}/{key}?uploads` (initiate)
@@ -127,8 +133,9 @@ Required when `FS_AUTH_ENABLED=true`:
 - `FS_ROOT_USER` and `FS_ROOT_PASSWORD` define initial credentials
 - `ADMIN_API_ENABLED=true` enables `/_admin/v1/*` routes (bootstrap key only)
 
-Upload limits:
+Upload limits & timeouts:
 - `FS_MAX_OBJECT_UPLOAD_BYTES` limits object PUT payloads, multipart upload parts, and completed multipart object size (default 5 GiB).
+- `FS_BODY_READ_TIMEOUT_SECONDS` sets the idle deadline between request-body reads (default 60s; `0` disables).
 
 Reference: `auth/README.md`
 
@@ -148,16 +155,14 @@ CLI credential/env resolution for `fs admin`:
 Note:
 - `fs admin snapshot ...` commands operate locally on filesystem paths and do not require endpoint or auth credentials.
 
-Health:
-- `GET /healthz`
-- `HEAD /healthz`
-- `GET /metrics` (Prometheus exposition format)
-- `HEAD /metrics`
+Health & Metrics:
+- `GET /healthz`, `HEAD /healthz` (on the S3 listener, unauthenticated)
+- `GET /metrics`, `HEAD /metrics` (Prometheus exposition format on dedicated listener `METRICS_ADDRESS`:`METRICS_PORT`, default `127.0.0.1:9091`; set `METRICS_PORT=0` to disable)
 
 ## Limitations
 
 - Not full S3 API coverage.
-- No versioning or lifecycle policies.
+- No lifecycle policies, replication, object lock, SSE, ACLs, or tagging.
 - Error and edge-case behavior is still being refined for client compatibility.
 
 ## License

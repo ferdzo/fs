@@ -61,7 +61,7 @@ const (
 
 func NewHandler(svc *service.ObjectService, logger *slog.Logger, logConfig logging.Config, authSvc *auth.Service, adminAPI bool, bodyReadTimeout ...time.Duration) *Handler {
 	timeout := time.Minute
-	if len(bodyReadTimeout) > 0 && bodyReadTimeout[0] > 0 {
+	if len(bodyReadTimeout) > 0 && bodyReadTimeout[0] >= 0 {
 		timeout = bodyReadTimeout[0]
 	}
 	r := chi.NewRouter()
@@ -111,8 +111,6 @@ func (h *Handler) setupRoutes() {
 
 	h.router.Get("/healthz", h.handleHealth)
 	h.router.Head("/healthz", h.handleHealth)
-	h.router.Get("/metrics", h.handleMetrics)
-	h.router.Head("/metrics", h.handleMetrics)
 	h.router.Get("/", h.handleGetBuckets)
 	if h.adminAPI {
 		h.registerAdminRoutes()
@@ -150,18 +148,6 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodHead {
 		_, _ = w.Write([]byte("ok"))
 	}
-}
-
-func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	payload := metrics.Default.RenderPrometheus()
-	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(payload))
 }
 
 func validateObjectKey(key string) *s3APIError {
@@ -244,8 +230,12 @@ func parseCopySource(raw string) (string, string, string, error) {
 	return bucket, key, versionID, nil
 }
 
-func (h *Handler) authorizeCopySource(r *http.Request, bucket, key string) error {
-	return h.authorizeObjectAction(r, auth.ActionGetObject, bucket, key)
+func (h *Handler) authorizeCopySource(r *http.Request, bucket, key, versionID string) error {
+	action := auth.ActionGetObject
+	if strings.TrimSpace(versionID) != "" {
+		action = auth.ActionGetObjectVersion
+	}
+	return h.authorizeObjectAction(r, action, bucket, key)
 }
 
 func (h *Handler) authorizeObjectAction(r *http.Request, action auth.Action, bucket, key string) error {
@@ -474,13 +464,12 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 	writeS3Error(w, r, s3ErrNotImplemented, r.URL.Path)
 }
 
-// hasSignedStreamingPayload reports whether the request declares a
-// chunk-signature streaming mode that fs cannot verify yet.
+// hasSignedStreamingPayload reports whether the request declares one of the
+// supported SigV4 chunk-signature streaming modes.
 func hasSignedStreamingPayload(r *http.Request) bool {
-	return strings.HasPrefix(
-		strings.ToUpper(strings.TrimSpace(r.Header.Get("x-amz-content-sha256"))),
-		"STREAMING-AWS4-HMAC-SHA256",
-	)
+	mode := strings.ToUpper(strings.TrimSpace(r.Header.Get("x-amz-content-sha256")))
+	return mode == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" ||
+		mode == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
 }
 
 func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
@@ -536,14 +525,15 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.Default.ObserveBatchSize(1)
 
-	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch != "" {
+	ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match"))
+	if ifNoneMatch != "" {
 		manifest, err := h.svc.HeadObject(bucket, key)
 		if err != nil {
-			if !errors.Is(err, metadata.ErrObjectNotFound) {
+			if !errors.Is(err, metadata.ErrObjectNotFound) && !errors.Is(err, service.ErrDeleteMarker) {
 				writeMappedS3Error(w, r, err)
 				return
 			}
-		} else if ifNoneMatchPreconditionFailed(ifNoneMatch, manifest.ETag) {
+		} else if metadata.IfNoneMatchPreconditionFailed(ifNoneMatch, manifest.ETag) {
 			writeS3Error(w, r, s3ErrPreconditionFailed, r.URL.Path)
 			return
 		}
@@ -555,12 +545,12 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
 			return
 		}
-		if err := h.authorizeCopySource(r, srcBucket, srcKey); err != nil {
+		if err := h.authorizeCopySource(r, srcBucket, srcKey, srcVersionID); err != nil {
 			writeMappedS3Error(w, r, err)
 			return
 		}
 
-		manifest, err := h.svc.CopyObjectVersion(srcBucket, srcKey, srcVersionID, bucket, key)
+		manifest, err := h.svc.CopyObjectVersionConditional(srcBucket, srcKey, srcVersionID, bucket, key, ifNoneMatch)
 		if err != nil {
 			if errors.Is(err, service.ErrDeleteMarker) {
 				writeS3Error(w, r, s3ErrInvalidRequest, r.URL.Path)
@@ -614,7 +604,7 @@ func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request) {
 		defer decodeStream.Close()
 	}
 
-	manifest, err := h.svc.PutObject(bucket, key, contentType, bodyReader)
+	manifest, err := h.svc.PutObjectConditional(bucket, key, contentType, ifNoneMatch, bodyReader)
 
 	if err != nil {
 		writeMappedS3Error(w, r, err)
@@ -930,25 +920,6 @@ func readAWSChunkedLine(reader *bufio.Reader) (string, error) {
 	return string(line), err
 }
 
-func ifNoneMatchPreconditionFailed(headerValue, etag string) bool {
-	for _, rawToken := range strings.Split(headerValue, ",") {
-		token := strings.TrimSpace(rawToken)
-		if token == "" {
-			continue
-		}
-		if token == "*" {
-			return true
-		}
-
-		token = strings.TrimPrefix(token, "W/")
-		token = strings.Trim(token, `"`)
-		if strings.EqualFold(token, etag) {
-			return true
-		}
-	}
-	return false
-}
-
 func (h *Handler) handlePutBucket(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	if r.URL.Query().Has("versioning") {
@@ -1000,28 +971,43 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.Default.ObserveBatchSize(len(req.Objects))
 
-	keys := make([]string, 0, len(req.Objects))
+	specs := make([]metadata.DeleteObjectSpec, 0, len(req.Objects))
 	response := models.DeleteObjectsResult{
 		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
 	}
 
-	// Validate keys first, then authorize all valid keys in one batch so the
-	// caller's policy is read once per request rather than once per key.
-	// Validation errors keep their original per-object position when the
-	// response is assembled below.
-	validKeys := make([]string, 0, len(req.Objects))
-	validIndexes := make([]int, 0, len(req.Objects))
+	// Validate keys first, then authorize all valid keys in batches (splitting
+	// unversioned DeleteObject from explicit-version DeleteObjectVersion) so
+	// the caller's policy is read at most once per action class. Validation
+	// errors keep their original per-object position in the response.
+	unversionedKeys := make([]string, 0, len(req.Objects))
+	unversionedIndexes := make([]int, 0, len(req.Objects))
+	versionedKeys := make([]string, 0)
+	versionedIndexes := make([]int, 0)
 	for i, obj := range req.Objects {
-		if obj.Key == "" || len(obj.Key) > maxObjectKeyBytes {
+		if obj.Key == "" || strings.IndexByte(obj.Key, 0) >= 0 || len(obj.Key) > maxObjectKeyBytes {
 			continue
 		}
-		validKeys = append(validKeys, obj.Key)
-		validIndexes = append(validIndexes, i)
+		if strings.TrimSpace(obj.VersionID) != "" {
+			versionedKeys = append(versionedKeys, obj.Key)
+			versionedIndexes = append(versionedIndexes, i)
+		} else {
+			unversionedKeys = append(unversionedKeys, obj.Key)
+			unversionedIndexes = append(unversionedIndexes, i)
+		}
 	}
-	batchErrs := h.authorizeObjectActions(r, auth.ActionDeleteObject, bucket, validKeys)
 	authErrs := make([]error, len(req.Objects))
-	for i, index := range validIndexes {
-		authErrs[index] = batchErrs[i]
+	if len(unversionedKeys) > 0 {
+		batchErrs := h.authorizeObjectActions(r, auth.ActionDeleteObject, bucket, unversionedKeys)
+		for i, index := range unversionedIndexes {
+			authErrs[index] = batchErrs[i]
+		}
+	}
+	if len(versionedKeys) > 0 {
+		batchErrs := h.authorizeObjectActions(r, auth.ActionDeleteObjectVersion, bucket, versionedKeys)
+		for i, index := range versionedIndexes {
+			authErrs[index] = batchErrs[i]
+		}
 	}
 
 	for i, obj := range req.Objects {
@@ -1030,6 +1016,14 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 				Key:     obj.Key,
 				Code:    s3ErrInvalidObjectKey.Code,
 				Message: s3ErrInvalidObjectKey.Message,
+			})
+			continue
+		}
+		if strings.IndexByte(obj.Key, 0) >= 0 {
+			response.Errors = append(response.Errors, models.DeleteError{
+				Key:     obj.Key,
+				Code:    s3ErrInvalidArgument.Code,
+				Message: s3ErrInvalidArgument.Message,
 			})
 			continue
 		}
@@ -1050,59 +1044,32 @@ func (h *Handler) handlePostBucket(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
-		keys = append(keys, obj.Key)
+		specs = append(specs, metadata.DeleteObjectSpec{
+			Key:       obj.Key,
+			VersionID: strings.TrimSpace(obj.VersionID),
+		})
 	}
 
-	hasVersions := false
-	for _, obj := range req.Objects {
-		if strings.TrimSpace(obj.VersionID) != "" {
-			hasVersions = true
-			break
-		}
+	results, err := h.svc.DeleteObjectsVersioned(bucket, specs)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
 	}
 
-	if hasVersions {
-		if !req.Quiet {
-			response.Deleted = make([]models.DeletedEntry, 0, len(keys))
-		}
-		for i, obj := range req.Objects {
-			if obj.Key == "" || len(obj.Key) > maxObjectKeyBytes || authErrs[i] != nil {
-				continue
+	if !req.Quiet {
+		response.Deleted = make([]models.DeletedEntry, 0, len(results))
+		for _, res := range results {
+			entry := models.DeletedEntry{
+				Key: res.Key,
 			}
-			result, err := h.svc.DeleteObjectVersion(bucket, obj.Key, strings.TrimSpace(obj.VersionID))
-			if err != nil {
-				apiErr := mapToS3Error(err)
-				response.Errors = append(response.Errors, models.DeleteError{
-					Key:     obj.Key,
-					Code:    apiErr.Code,
-					Message: apiErr.Message,
-				})
-				continue
+			if res.RequestedVersionID != "" && res.VersionID != "" {
+				entry.VersionID = res.VersionID
 			}
-			if !req.Quiet {
-				entry := models.DeletedEntry{
-					Key:          obj.Key,
-					VersionID:    result.VersionID,
-					DeleteMarker: result.DeleteMarker,
-				}
-				if result.DeleteMarker {
-					entry.DeleteMarkerVersionID = result.VersionID
-				}
-				response.Deleted = append(response.Deleted, entry)
+			if res.DeleteMarker {
+				entry.DeleteMarker = true
+				entry.DeleteMarkerVersionID = res.VersionID
 			}
-		}
-	} else {
-		deleted, err := h.svc.DeleteObjects(bucket, keys)
-		if err != nil {
-			writeMappedS3Error(w, r, err)
-			return
-		}
-
-		if !req.Quiet {
-			response.Deleted = make([]models.DeletedEntry, 0, len(deleted))
-			for _, key := range deleted {
-				response.Deleted = append(response.Deleted, models.DeletedEntry{Key: key})
-			}
+			response.Deleted = append(response.Deleted, entry)
 		}
 	}
 
@@ -1527,6 +1494,13 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 	seenCommonPrefixes := make(map[string]struct{})
 	truncated := false
 
+	versioningStatus, err := h.svc.GetBucketVersioning(bucket)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+	filterDeleteMarkers := versioningStatus != ""
+
 	startKey := prefix
 	if marker != "" && marker > startKey {
 		startKey = marker
@@ -1544,6 +1518,18 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 			}
 			if marker != "" && key <= marker {
 				return nil
+			}
+
+			var decoded *models.ObjectManifest
+			if filterDeleteMarkers {
+				var err error
+				decoded, err = decode()
+				if err != nil {
+					return err
+				}
+				if decoded.DeleteMarker {
+					return nil
+				}
 			}
 
 			if delimiter != "" {
@@ -1572,9 +1558,13 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 				truncated = true
 				return metadata.StopIteration()
 			}
-			object, err := decode()
-			if err != nil {
-				return err
+			object := decoded
+			if object == nil {
+				var err error
+				object, err = decode()
+				if err != nil {
+					return err
+				}
 			}
 			entries = append(entries, pageEntry{Key: key, Object: object})
 			return nil
@@ -1687,6 +1677,13 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	seenCommonPrefixes := make(map[string]struct{})
 	truncated := false
 
+	versioningStatus, err := h.svc.GetBucketVersioning(bucket)
+	if err != nil {
+		writeMappedS3Error(w, r, err)
+		return
+	}
+	filterDeleteMarkers := versioningStatus != ""
+
 	startKey := prefix
 	if continuationToken != "" {
 		startKey = continuationValue
@@ -1716,6 +1713,18 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 				return nil
 			}
 
+			var decoded *models.ObjectManifest
+			if filterDeleteMarkers {
+				var err error
+				decoded, err = decode()
+				if err != nil {
+					return err
+				}
+				if decoded.DeleteMarker {
+					return nil
+				}
+			}
+
 			if delimiter != "" {
 				relative := strings.TrimPrefix(key, prefix)
 				if idx := strings.Index(relative, delimiter); idx >= 0 {
@@ -1743,9 +1752,13 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 				truncated = true
 				return metadata.StopIteration()
 			}
-			object, err := decode()
-			if err != nil {
-				return err
+			object := decoded
+			if object == nil {
+				var err error
+				object, err = decode()
+				if err != nil {
+					return err
+				}
 			}
 			entries = append(entries, pageEntry{
 				Key:    key,
