@@ -197,10 +197,23 @@ func setLatestFromOrder(versions, order, metaBucket *bbolt.Bucket, bucket, key s
 func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key string) error {
 	data := versions.Get(objectVersionKey(bucket, key, nullVersionID))
 	if data == nil {
+		// An unmaterialized pre-versioning record lives only in metaBucket.
+		if latest := metaBucket.Get([]byte(key)); latest != nil {
+			current := models.ObjectManifest{}
+			if err := json.Unmarshal(latest, &current); err != nil {
+				return err
+			}
+			if current.VersionID == "" {
+				return removeChunkRefsTx(metaBucket.Tx(), current.Chunks, time.Now().UnixNano())
+			}
+		}
 		return nil
 	}
 	manifest := models.ObjectManifest{}
 	if err := json.Unmarshal(data, &manifest); err != nil {
+		return err
+	}
+	if err := removeChunkRefsTx(metaBucket.Tx(), manifest.Chunks, time.Now().UnixNano()); err != nil {
 		return err
 	}
 	if err := versions.Delete(objectVersionKey(bucket, key, nullVersionID)); err != nil {
@@ -252,6 +265,18 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 		manifest.VersionID = ""
 		manifest.VersionSeq = 0
 		manifest.DeleteMarker = false
+		if existing := metaBucket.Get([]byte(manifest.Key)); existing != nil {
+			old := models.ObjectManifest{}
+			if err := json.Unmarshal(existing, &old); err != nil {
+				return "", err
+			}
+			if err := removeChunkRefsTx(tx, old.Chunks, time.Now().UnixNano()); err != nil {
+				return "", err
+			}
+		}
+		if err := addChunkRefsTx(tx, manifest.Chunks); err != nil {
+			return "", err
+		}
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			return "", err
@@ -304,6 +329,9 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 	manifest.VersionID = versionID
 	manifest.VersionSeq = seq
 	manifest.DeleteMarker = false
+	if err := addChunkRefsTx(tx, manifest.Chunks); err != nil {
+		return "", err
+	}
 	if err := putVersionRecord(versions, order, manifest); err != nil {
 		return "", err
 	}
@@ -350,6 +378,13 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 		if status == "" {
 			if latestData == nil {
 				return DeleteResult{}, nil
+			}
+			latest := models.ObjectManifest{}
+			if err := json.Unmarshal(latestData, &latest); err != nil {
+				return DeleteResult{}, err
+			}
+			if err := removeChunkRefsTx(tx, latest.Chunks, time.Now().UnixNano()); err != nil {
+				return DeleteResult{}, err
 			}
 			return DeleteResult{}, metaBucket.Delete([]byte(key))
 		}
@@ -414,6 +449,9 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 			return DeleteResult{}, err
 		}
 		if latest.VersionID == "" {
+			if err := removeChunkRefsTx(tx, latest.Chunks, time.Now().UnixNano()); err != nil {
+				return DeleteResult{}, err
+			}
 			if err := metaBucket.Delete([]byte(key)); err != nil {
 				return DeleteResult{}, err
 			}
@@ -431,6 +469,9 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 	}
 	manifest := models.ObjectManifest{}
 	if err := json.Unmarshal(data, &manifest); err != nil {
+		return DeleteResult{}, err
+	}
+	if err := removeChunkRefsTx(tx, manifest.Chunks, time.Now().UnixNano()); err != nil {
 		return DeleteResult{}, err
 	}
 	if err := versions.Delete(objectVersionKey(bucket, key, versionID)); err != nil {
@@ -599,27 +640,37 @@ func (h *MetadataHandler) ListObjectVersions(bucket, prefix, delimiter, keyMarke
 			k, v = cursor.Seek([]byte(start))
 		}
 		seenPrefix := ""
-		for ; k != nil; k, v = cursor.Next() {
+		for k != nil {
 			key := string(k)
 			if prefix != "" && !strings.HasPrefix(key, prefix) {
 				break
 			}
 			if keyMarker != "" && key < keyMarker {
+				k, v = cursor.Next()
 				continue
 			}
 			if keyMarker != "" && versionIDMarker == "" && key == keyMarker {
+				k, v = cursor.Next()
 				continue
 			}
 			if keyMarker != "" && versionIDMarker == "" && delimiter != "" &&
 				strings.HasSuffix(keyMarker, delimiter) && strings.HasPrefix(key, keyMarker) {
-				continue
+				if next, ok := prefixSuccessor(keyMarker); ok {
+					k, v = cursor.Seek(next)
+					continue
+				}
+				break
 			}
 			if delimiter != "" {
 				rest := strings.TrimPrefix(key, prefix)
 				if idx := strings.Index(rest, delimiter); idx >= 0 {
 					commonPrefix := prefix + rest[:idx+len(delimiter)]
 					if commonPrefix == seenPrefix {
-						continue
+						if next, ok := prefixSuccessor(commonPrefix); ok {
+							k, v = cursor.Seek(next)
+							continue
+						}
+						break
 					}
 					if budget == 0 {
 						page.IsTruncated = true
@@ -630,7 +681,11 @@ func (h *MetadataHandler) ListObjectVersions(bucket, prefix, delimiter, keyMarke
 					seenPrefix = commonPrefix
 					lastKey, lastVersion = commonPrefix, ""
 					budget--
-					continue
+					if next, ok := prefixSuccessor(commonPrefix); ok {
+						k, v = cursor.Seek(next)
+						continue
+					}
+					break
 				}
 			}
 
@@ -685,6 +740,7 @@ func (h *MetadataHandler) ListObjectVersions(bucket, prefix, delimiter, keyMarke
 			if key == keyMarker && versionIDMarker != "" && !foundMarker {
 				return fmt.Errorf("%w: %s", ErrVersionNotFound, versionIDMarker)
 			}
+			k, v = cursor.Next()
 		}
 		return nil
 	})

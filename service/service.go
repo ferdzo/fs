@@ -27,6 +27,10 @@ type ObjectService struct {
 	chunkPins          *chunkPinRegistry
 	gcRunMu            sync.Mutex
 	gcGrace            time.Duration
+	gcStateMu          sync.Mutex
+	gcClosed           bool
+	stopGC             chan struct{}
+	gcWg               sync.WaitGroup
 
 	// Narrow, unexported test hooks used only to make ordering races
 	// deterministic in tests. They are nil in production.
@@ -69,6 +73,7 @@ func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *st
 		maxUploadSize:      limit,
 		chunkPins:          newChunkPinRegistry(),
 		gcGrace:            15 * time.Minute,
+		stopGC:             make(chan struct{}),
 	}
 }
 
@@ -230,11 +235,16 @@ func (s *ObjectService) PutObjectConditional(bucket, key, contentType, ifNoneMat
 	writeLease := s.chunkPins.newLease(true)
 	defer writeLease.Release()
 
+	var ingested []string
 	chunks, chunkSizes, size, etag, err := s.blob.IngestStreamWithSizes(s.limitUpload(input), func(chunkID string) error {
 		writeLease.Pin(chunkID)
+		ingested = append(ingested, chunkID)
 		return nil
 	})
 	if err != nil {
+		if len(ingested) > 0 {
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+		}
 		return nil, err
 	}
 	timestamp := time.Now().Unix()
@@ -257,6 +267,9 @@ func (s *ObjectService) PutObjectConditional(bucket, key, contentType, ifNoneMat
 		"etag", manifest.ETag,
 	)
 	if _, err = s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch); err != nil {
+		if len(ingested) > 0 {
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+		}
 		return nil, err
 	}
 
@@ -792,8 +805,8 @@ func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, e
 	return s.metadata.DeleteManifests(bucket, keys)
 }
 
-func (s *ObjectService) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
-	return s.metadata.CreateMultipartUpload(bucket, key)
+func (s *ObjectService) CreateMultipartUpload(bucket, key string, contentType ...string) (*models.MultipartUpload, error) {
+	return s.metadata.CreateMultipartUpload(bucket, key, contentType...)
 }
 
 // pendingMultipartUpload resolves an upload that can still be mutated. Aborted
@@ -839,12 +852,17 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 	writeLease := s.chunkPins.newLease(true)
 	defer writeLease.Release()
 
+	var ingested []string
 	var uploadedPart models.UploadedPart
 	chunkIds, chunkSizes, totalSize, etag, err := s.blob.IngestStreamWithSizes(s.limitUpload(input), func(chunkID string) error {
 		writeLease.Pin(chunkID)
+		ingested = append(ingested, chunkID)
 		return nil
 	})
 	if err != nil {
+		if len(ingested) > 0 {
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+		}
 		return "", err
 	}
 	uploadedPart = models.UploadedPart{
@@ -857,6 +875,9 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 	}
 	err = s.metadata.PutMultipartPart(uploadId, uploadedPart)
 	if err != nil {
+		if len(ingested) > 0 {
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+		}
 		return "", multipartLifecycleError(err)
 	}
 	success = true
@@ -893,7 +914,8 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		metrics.Default.ObserveService("complete_multipart_upload", time.Since(start), success)
 	}()
 
-	if _, err := s.pendingMultipartUpload(bucket, key, uploadID); err != nil {
+	upload, err := s.pendingMultipartUpload(bucket, key, uploadID)
+	if err != nil {
 		return nil, err
 	}
 	if len(completed) == 0 {
@@ -966,11 +988,15 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 	}
 
 	finalETag := buildMultipartETag(orderedParts)
+	contentType := strings.TrimSpace(upload.ContentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 	manifest := &models.ObjectManifest{
 		Bucket:      bucket,
 		Key:         key,
 		Size:        totalSize,
-		ContentType: "application/octet-stream",
+		ContentType: contentType,
 		ETag:        finalETag,
 		Chunks:      chunks,
 		CreatedAt:   time.Now().Unix(),
@@ -1051,6 +1077,13 @@ func buildMultipartETag(parts []models.UploadedPart) string {
 }
 
 func (s *ObjectService) Close() error {
+	s.gcStateMu.Lock()
+	if !s.gcClosed {
+		s.gcClosed = true
+		close(s.stopGC)
+	}
+	s.gcStateMu.Unlock()
+	s.gcWg.Wait()
 	return s.metadata.Close()
 }
 
@@ -1074,15 +1107,16 @@ func (s *ObjectService) GarbageCollect() error {
 		return err
 	}
 
-	// Start the epoch before the metadata scan. Live write leases are seeded so
-	// chunks they already pinned survive this pass even though their manifests
-	// are not visible yet; later write pins add themselves to the same epoch.
+	// Start the epoch before reading the GC queue. Live write leases are seeded
+	// so chunks they already pinned survive this pass even though their
+	// manifests are not visible yet; later write pins add themselves to the
+	// same epoch.
 	s.chunkPins.mu.Lock()
 	epoch := s.chunkPins.beginEpochLocked()
 	s.chunkPins.mu.Unlock()
 	defer s.chunkPins.endEpoch(epoch)
 
-	referencedChunkSet, err := s.metadata.GetReferencedChunkSet()
+	candidates, err := s.metadata.ListGCQueue(0)
 	if err != nil {
 		return err
 	}
@@ -1091,44 +1125,54 @@ func (s *ObjectService) GarbageCollect() error {
 		s.testHookAfterGCSnapshot()
 	}
 
-	totalChunks := 0
-
-	if err := s.blob.ForEachChunk(func(chunkID string) error {
-		totalChunks++
-		if _, found := referencedChunkSet[chunkID]; found {
-			return nil
+	clearFromQueue := make([]string, 0, len(candidates))
+	for _, chunkID := range candidates {
+		mt, ok := s.blob.StatChunk(chunkID)
+		if !ok {
+			clearFromQueue = append(clearFromQueue, chunkID)
+			continue
 		}
-
-		// Final born/pin check, Stat, and unlink are atomic with respect to new
-		// leases. Once released, a writer/reader must take the same mutex, so it
-		// either sees the chunk before deletion or pins it for a later pass.
-		s.chunkPins.mu.Lock()
-		defer s.chunkPins.mu.Unlock()
-
-		if s.chunkPins.protectedLocked(epoch, chunkID) {
-			skippedPinned++
-			return nil
-		}
-		if mt, ok := s.blob.StatChunk(chunkID); !ok || time.Since(mt) < s.gcGrace {
+		if s.gcGrace > 0 && time.Since(mt) < s.gcGrace {
 			skippedFresh++
-			return nil
+			continue
 		}
-		if err := s.blob.DeleteBlob(chunkID); err != nil {
+
+		// Final born/pin check, refcount re-check, and unlink are atomic with
+		// respect to new leases. Once released, a writer/reader must take the
+		// same mutex, so it either sees the chunk before deletion or pins it
+		// for a later pass.
+		s.chunkPins.mu.Lock()
+		if s.chunkPins.protectedLocked(epoch, chunkID) {
+			s.chunkPins.mu.Unlock()
+			skippedPinned++
+			continue
+		}
+		refCount, err := s.metadata.ChunkRefCount(chunkID)
+		if err != nil || refCount > 0 {
+			s.chunkPins.mu.Unlock()
+			continue
+		}
+		deleteErr := s.blob.DeleteBlob(chunkID)
+		s.chunkPins.mu.Unlock()
+		if deleteErr != nil {
 			deleteErrors++
-			slog.Warn("garbage_collect_delete_failed", "chunk_id", chunkID, "error", err)
-			return nil
+			slog.Warn("garbage_collect_delete_failed", "chunk_id", chunkID, "error", deleteErr)
+			continue
 		}
 		deletedChunks++
-		return nil
-	}); err != nil {
-		return err
+		clearFromQueue = append(clearFromQueue, chunkID)
+	}
+	if len(clearFromQueue) > 0 {
+		if err := s.metadata.RemoveGCQueueEntries(clearFromQueue); err != nil {
+			return err
+		}
 	}
 
-	// Ingest temp files are excluded from ForEachChunk (their names are not
-	// valid chunk IDs), so a crash between CreateTemp and Rename would leak
-	// them forever. Use a conservative cutoff: an in-flight write keeps a fresh
-	// mtime and per-chunk temp lifetime is milliseconds, so only a pathologically
-	// stalled writer could exceed max(gcGrace, 1h).
+	// Ingest temp files are excluded from the chunk refcount table, so a crash
+	// between CreateTemp and Rename would leak them forever. Use a
+	// conservative cutoff: an in-flight write keeps a fresh mtime and per-chunk
+	// temp lifetime is milliseconds, so only a pathologically stalled writer
+	// could exceed max(gcGrace, 1h).
 	tempGrace := s.gcGrace
 	if tempGrace < time.Hour {
 		tempGrace = time.Hour
@@ -1140,8 +1184,7 @@ func (s *ObjectService) GarbageCollect() error {
 	}
 
 	slog.Info("garbage_collect_completed",
-		"referenced_chunks", len(referencedChunkSet),
-		"total_chunks", totalChunks,
+		"queued_chunks", len(candidates),
 		"deleted_chunks", deletedChunks,
 		"delete_errors", deleteErrors,
 		"cleaned_uploads", cleanedUploads,
@@ -1159,12 +1202,23 @@ func (s *ObjectService) RunGC(ctx context.Context, interval time.Duration) {
 		return
 	}
 
+	s.gcStateMu.Lock()
+	if s.gcClosed {
+		s.gcStateMu.Unlock()
+		return
+	}
+	s.gcWg.Add(1)
+	s.gcStateMu.Unlock()
+	defer s.gcWg.Done()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-s.stopGC:
 			return
 		case <-ticker.C:
 			_ = s.GarbageCollect()

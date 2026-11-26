@@ -5,9 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -465,5 +467,69 @@ func TestAuthFailuresRateLimitedPerSource(t *testing.T) {
 	}
 	if !sawSlowDown {
 		t.Fatal("expected 503 SlowDown once failure limit exceeded")
+	}
+}
+
+func TestGetBucketLocationRequiresExistingBucket(t *testing.T) {
+	handler, svc := newTestObjectHandler(t)
+
+	missingRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(missingRec, httptest.NewRequest(http.MethodGet, "/missing-bucket?location", nil))
+	if missingRec.Code != http.StatusNotFound || !strings.Contains(missingRec.Body.String(), "NoSuchBucket") {
+		t.Fatalf("missing bucket ?location = %d/%s, want 404 NoSuchBucket", missingRec.Code, missingRec.Body.String())
+	}
+
+	if err := svc.CreateBucket("existing-bucket"); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	okRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(okRec, httptest.NewRequest(http.MethodGet, "/existing-bucket?location", nil))
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("existing bucket ?location = %d body=%s", okRec.Code, okRec.Body.String())
+	}
+	if !strings.Contains(okRec.Body.String(), "<LocationConstraint") || !strings.Contains(okRec.Body.String(), "us-east-1") {
+		t.Fatalf("unexpected ?location body: %s", okRec.Body.String())
+	}
+}
+
+func TestLimitedListenerCloseUnblocksAccept(t *testing.T) {
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	ln := newLimitedListener(rawLn, 1)
+	defer ln.Close()
+
+	// Occupy the single connection slot.
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("first Accept: %v", err)
+	}
+	defer serverConn.Close()
+
+	acceptErr := make(chan error, 1)
+	go func() {
+		_, err := ln.Accept()
+		acceptErr <- err
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("ln.Close: %v", err)
+	}
+
+	select {
+	case err := <-acceptErr:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("blocked Accept returned %v, want net.ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Accept did not unblock on Close")
 	}
 }
