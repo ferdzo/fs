@@ -2,9 +2,18 @@ package metadata
 
 import (
 	"errors"
+	"fmt"
 	"fs/models"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+var testVersionSeq atomic.Uint64
+
+func nextTestID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, testVersionSeq.Add(1))
+}
 
 func versionedObject(bucket, key, etag string, chunks ...string) *models.ObjectManifest {
 	return &models.ObjectManifest{
@@ -19,7 +28,7 @@ func versionedObject(bucket, key, etag string, chunks ...string) *models.ObjectM
 
 func mustPutVersion(t *testing.T, h *MetadataHandler, manifest *models.ObjectManifest) string {
 	t.Helper()
-	versionID, err := h.PutObjectVersion(manifest)
+	versionID, err := h.PutObjectVersion(manifest, nextTestID("v"), time.Now().UTC())
 	if err != nil {
 		t.Fatalf("PutObjectVersion(%q/%q): %v", manifest.Bucket, manifest.Key, err)
 	}
@@ -75,7 +84,8 @@ func TestVersioningEnabledLifecycle(t *testing.T) {
 		t.Fatalf("second entry = %+v", page.Versions[1])
 	}
 
-	deleted, err := h.DeleteObject("bucket", "k", "")
+	now := time.Now().UTC()
+	deleted, err := h.DeleteObject("bucket", "k", "", nextTestID("dm"), now)
 	if err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
@@ -94,7 +104,7 @@ func TestVersioningEnabledLifecycle(t *testing.T) {
 		t.Fatalf("GetManifestVersion under marker: %v", err)
 	}
 
-	if _, err := h.DeleteObject("bucket", "k", deleted.VersionID); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", deleted.VersionID, "", now); err != nil {
 		t.Fatalf("delete marker: %v", err)
 	}
 	restored, err := h.GetManifest("bucket", "k")
@@ -105,10 +115,10 @@ func TestVersioningEnabledLifecycle(t *testing.T) {
 		t.Fatalf("restored = %+v", restored)
 	}
 
-	if _, err := h.DeleteObject("bucket", "k", v1); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", v1, "", now); err != nil {
 		t.Fatalf("delete v1: %v", err)
 	}
-	if _, err := h.DeleteObject("bucket", "k", v2); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", v2, "", now); err != nil {
 		t.Fatalf("delete v2: %v", err)
 	}
 	if _, err := h.GetManifest("bucket", "k"); !errors.Is(err, ErrObjectNotFound) {
@@ -132,13 +142,14 @@ func TestVersioningSuspendedReplacesNull(t *testing.T) {
 		t.Fatalf("suspended versions = %d, want 1", len(page.Versions))
 	}
 
-	if _, err := h.DeleteObject("bucket", "k", ""); err != nil {
+	now := time.Now().UTC()
+	if _, err := h.DeleteObject("bucket", "k", "", "", now); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 	if page := mustListVersions(t, h, "bucket", 100); len(page.Versions) != 1 || !page.Versions[0].Manifest.DeleteMarker {
 		t.Fatalf("suspended marker page = %+v", page.Versions)
 	}
-	if _, err := h.DeleteObject("bucket", "k", ""); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", "", "", now); err != nil {
 		t.Fatalf("second DeleteObject: %v", err)
 	}
 	if page := mustListVersions(t, h, "bucket", 100); len(page.Versions) != 1 || !page.Versions[0].Manifest.DeleteMarker {
@@ -174,7 +185,7 @@ func TestVersioningMaterializesLegacyObject(t *testing.T) {
 		t.Fatalf("legacy etag = %q", legacy.ETag)
 	}
 
-	if err := h.PutManifest(versionedObject("bucket", "k", "bypass", "chunk")); err == nil {
+	if err := h.PutManifest(versionedObject("bucket", "k", "bypass", "chunk"), time.Now().UTC()); err == nil {
 		t.Fatal("PutManifest succeeded on a versioned bucket")
 	}
 }
@@ -255,7 +266,7 @@ func TestReferencedChunksIncludeAllVersions(t *testing.T) {
 	}
 	mustPutVersion(t, h, versionedObject("bucket", "k", "e1", "chunk-old"))
 	mustPutVersion(t, h, versionedObject("bucket", "k", "e2", "chunk-new"))
-	if _, err := h.DeleteObject("bucket", "k", ""); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", "", nextTestID("dm"), time.Now().UTC()); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
@@ -281,7 +292,7 @@ func TestDeleteBucketRequiresAllVersionsRemoved(t *testing.T) {
 	if err := h.DeleteBucket("bucket"); !errors.Is(err, ErrBucketNotEmpty) {
 		t.Fatalf("DeleteBucket with versions = %v, want ErrBucketNotEmpty", err)
 	}
-	if _, err := h.DeleteObject("bucket", "k", versionID); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", versionID, "", time.Now().UTC()); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 	if err := h.DeleteBucket("bucket"); err != nil {
@@ -295,12 +306,13 @@ func TestCompleteMultipartUploadCreatesVersion(t *testing.T) {
 	if err := h.SetBucketVersioning("bucket", versioningEnabled); err != nil {
 		t.Fatalf("SetBucketVersioning: %v", err)
 	}
-	upload, err := h.CreateMultipartUpload("bucket", "multipart-key")
+	now := time.Now().UTC()
+	upload, err := h.CreateMultipartUpload("bucket", "multipart-key", nextTestID("up"), "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
 	final := &models.ObjectManifest{Size: 3, ETag: "etag", Chunks: []string{"chunk"}}
-	if err := h.CompleteMultipartUpload(upload.UploadID, final); err != nil {
+	if err := h.CompleteMultipartUpload(upload.UploadID, final, nextTestID("v"), now); err != nil {
 		t.Fatalf("CompleteMultipartUpload: %v", err)
 	}
 	latest, err := h.GetManifest("bucket", "multipart-key")
@@ -319,9 +331,10 @@ func TestDeleteObjectsBatchRespectsVersioning(t *testing.T) {
 	if err := h.SetBucketVersioning("ver", versioningEnabled); err != nil {
 		t.Fatalf("SetBucketVersioning: %v", err)
 	}
+	now := time.Now().UTC()
 
 	mustPutManifest(t, h, versionedObject("unver", "k1", "e1", "c1"))
-	unverRes, err := h.DeleteObjects("unver", []DeleteObjectSpec{{Key: "k1"}, {Key: "missing"}})
+	unverRes, err := h.DeleteObjects("unver", []DeleteObjectSpec{{Key: "k1"}, {Key: "missing"}}, now)
 	if err != nil {
 		t.Fatalf("DeleteObjects unversioned: %v", err)
 	}
@@ -335,9 +348,9 @@ func TestDeleteObjectsBatchRespectsVersioning(t *testing.T) {
 	v1 := mustPutVersion(t, h, versionedObject("ver", "a", "ea", "ca"))
 	v2 := mustPutVersion(t, h, versionedObject("ver", "b", "eb", "cb"))
 	verRes, err := h.DeleteObjects("ver", []DeleteObjectSpec{
-		{Key: "a"},
+		{Key: "a", DeleteMarkerID: nextTestID("dm")},
 		{Key: "b", VersionID: v2},
-	})
+	}, now)
 	if err != nil {
 		t.Fatalf("DeleteObjects versioned: %v", err)
 	}
@@ -366,21 +379,22 @@ func TestPutObjectVersionConditionalIfNoneMatch(t *testing.T) {
 	if err := h.SetBucketVersioning("bucket", versioningEnabled); err != nil {
 		t.Fatalf("SetBucketVersioning: %v", err)
 	}
+	now := time.Now().UTC()
 
-	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e1", "c1"), "*"); err != nil {
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e1", "c1"), "*", nextTestID("v"), now); err != nil {
 		t.Fatalf("initial conditional put: %v", err)
 	}
-	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e2", "c2"), "*"); !errors.Is(err, ErrPreconditionFailed) {
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e2", "c2"), "*", nextTestID("v"), now); !errors.Is(err, ErrPreconditionFailed) {
 		t.Fatalf("overwrite with If-None-Match:* = %v, want ErrPreconditionFailed", err)
 	}
-	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e2", "c2"), `"e1"`); !errors.Is(err, ErrPreconditionFailed) {
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e2", "c2"), `"e1"`, nextTestID("v"), now); !errors.Is(err, ErrPreconditionFailed) {
 		t.Fatalf("overwrite with matching ETag = %v, want ErrPreconditionFailed", err)
 	}
 
-	if _, err := h.DeleteObject("bucket", "k", ""); err != nil {
+	if _, err := h.DeleteObject("bucket", "k", "", nextTestID("dm"), now); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
-	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e3", "c3"), "*"); err != nil {
+	if _, err := h.PutObjectVersionConditional(versionedObject("bucket", "k", "e3", "c3"), "*", nextTestID("v"), now); err != nil {
 		t.Fatalf("conditional put over delete marker failed: %v", err)
 	}
 }

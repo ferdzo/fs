@@ -27,14 +27,14 @@ func newTestStore(t *testing.T) (*MetadataHandler, string) {
 
 func mustCreateBucket(t *testing.T, h *MetadataHandler, bucket string) {
 	t.Helper()
-	if err := h.CreateBucket(bucket); err != nil {
+	if err := h.CreateBucket(bucket, time.Now().UTC()); err != nil {
 		t.Fatalf("CreateBucket(%q): %v", bucket, err)
 	}
 }
 
 func mustPutManifest(t *testing.T, h *MetadataHandler, manifest *models.ObjectManifest) {
 	t.Helper()
-	if err := h.PutManifest(manifest); err != nil {
+	if err := h.PutManifest(manifest, time.Now().UTC()); err != nil {
 		t.Fatalf("PutManifest(%q/%q): %v", manifest.Bucket, manifest.Key, err)
 	}
 }
@@ -105,8 +105,10 @@ func TestBucketLifecycle(t *testing.T) {
 	})
 
 	t.Run("create and get manifest", func(t *testing.T) {
-		before := time.Now().Add(-time.Second)
-		mustCreateBucket(t, h, "alpha-bucket")
+		wantCreated := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+		if err := h.CreateBucket("alpha-bucket", wantCreated); err != nil {
+			t.Fatalf("CreateBucket(%q): %v", "alpha-bucket", err)
+		}
 
 		manifest, err := h.GetBucketManifest("alpha-bucket")
 		if err != nil {
@@ -115,11 +117,8 @@ func TestBucketLifecycle(t *testing.T) {
 		if manifest.Name != "alpha-bucket" {
 			t.Fatalf("manifest.Name = %q, want alpha-bucket", manifest.Name)
 		}
-		if manifest.CreatedAt.IsZero() {
-			t.Fatal("manifest.CreatedAt is zero")
-		}
-		if manifest.CreatedAt.Before(before) || manifest.CreatedAt.After(time.Now().Add(time.Second)) {
-			t.Fatalf("manifest.CreatedAt = %v, want around now", manifest.CreatedAt)
+		if !manifest.CreatedAt.Equal(wantCreated) {
+			t.Fatalf("manifest.CreatedAt = %v, want %v", manifest.CreatedAt, wantCreated)
 		}
 		if manifest.VersioningStatus != "" {
 			t.Fatalf("manifest.VersioningStatus = %q, want empty", manifest.VersioningStatus)
@@ -130,7 +129,7 @@ func TestBucketLifecycle(t *testing.T) {
 	})
 
 	t.Run("duplicate create fails", func(t *testing.T) {
-		err := h.CreateBucket("alpha-bucket")
+		err := h.CreateBucket("alpha-bucket", time.Now().UTC())
 		if !errors.Is(err, ErrBucketAlreadyExists) {
 			t.Fatalf("CreateBucket duplicate error = %v, want ErrBucketAlreadyExists", err)
 		}
@@ -146,17 +145,17 @@ func TestBucketLifecycle(t *testing.T) {
 		if _, err := h.ListObjects("no-such-bucket", ""); !errors.Is(err, ErrBucketNotFound) {
 			t.Fatalf("ListObjects error = %v, want ErrBucketNotFound", err)
 		}
-		if _, err := h.CreateMultipartUpload("no-such-bucket", "key"); !errors.Is(err, ErrBucketNotFound) {
+		if _, err := h.CreateMultipartUpload("no-such-bucket", "key", "up-missing", "", time.Now().UTC()); !errors.Is(err, ErrBucketNotFound) {
 			t.Fatalf("CreateMultipartUpload error = %v, want ErrBucketNotFound", err)
 		}
-		if err := h.PutManifest(&models.ObjectManifest{Bucket: "no-such-bucket", Key: "key"}); !errors.Is(err, ErrBucketNotFound) {
+		if err := h.PutManifest(&models.ObjectManifest{Bucket: "no-such-bucket", Key: "key"}, time.Now().UTC()); !errors.Is(err, ErrBucketNotFound) {
 			t.Fatalf("PutManifest error = %v, want ErrBucketNotFound", err)
 		}
 	})
 
 	t.Run("invalid names rejected", func(t *testing.T) {
 		for _, bucket := range []string{"Bad_Bucket", "ab", ".dot"} {
-			if err := h.CreateBucket(bucket); !errors.Is(err, ErrInvalidBucketName) {
+			if err := h.CreateBucket(bucket, time.Now().UTC()); !errors.Is(err, ErrInvalidBucketName) {
 				t.Fatalf("CreateBucket(%q) error = %v, want ErrInvalidBucketName", bucket, err)
 			}
 			if err := h.DeleteBucket(bucket); !errors.Is(err, ErrInvalidBucketName) {
@@ -198,7 +197,7 @@ func TestBucketLifecycle(t *testing.T) {
 			t.Fatalf("second DeleteBucket error = %v, want ErrBucketNotFound", err)
 		}
 		// The name becomes reusable after deletion.
-		if err := h.CreateBucket("doomed-bucket"); err != nil {
+		if err := h.CreateBucket("doomed-bucket", time.Now().UTC()); err != nil {
 			t.Fatalf("re-create after delete: %v", err)
 		}
 	})
@@ -210,7 +209,7 @@ func TestBucketLifecycle(t *testing.T) {
 		if err := h.DeleteBucket("occupied-bucket"); !errors.Is(err, ErrBucketNotEmpty) {
 			t.Fatalf("DeleteBucket non-empty error = %v, want ErrBucketNotEmpty", err)
 		}
-		if err := h.DeleteManifest("occupied-bucket", "object.txt"); err != nil {
+		if err := h.DeleteManifest("occupied-bucket", "object.txt", time.Now().UTC()); err != nil {
 			t.Fatalf("DeleteManifest: %v", err)
 		}
 		if err := h.DeleteBucket("occupied-bucket"); err != nil {
@@ -282,13 +281,13 @@ func TestObjectManifestRoundTripAndOverwrite(t *testing.T) {
 	if _, err := h.GetManifest("objects-bucket", "missing.bin"); !errors.Is(err, ErrObjectNotFound) {
 		t.Fatalf("GetManifest missing error = %v, want ErrObjectNotFound", err)
 	}
-	if err := h.PutManifest(nil); err == nil {
+	if err := h.PutManifest(nil, time.Now().UTC()); err == nil {
 		t.Fatal("PutManifest(nil) = nil, want error")
 	}
-	if err := h.DeleteManifest("objects-bucket", "missing.bin"); !errors.Is(err, ErrObjectNotFound) {
+	if err := h.DeleteManifest("objects-bucket", "missing.bin", time.Now().UTC()); !errors.Is(err, ErrObjectNotFound) {
 		t.Fatalf("DeleteManifest missing error = %v, want ErrObjectNotFound", err)
 	}
-	if err := h.DeleteManifest("objects-bucket", "dir/object.bin"); err != nil {
+	if err := h.DeleteManifest("objects-bucket", "dir/object.bin", time.Now().UTC()); err != nil {
 		t.Fatalf("DeleteManifest: %v", err)
 	}
 	if _, err := h.GetManifest("objects-bucket", "dir/object.bin"); !errors.Is(err, ErrObjectNotFound) {
@@ -432,7 +431,8 @@ func TestDeleteManifests(t *testing.T) {
 		mustPutManifest(t, h, &models.ObjectManifest{Bucket: "batch-delete-bucket", Key: key, ETag: "etag-" + key})
 	}
 
-	deleted, err := h.DeleteManifests("batch-delete-bucket", []string{"a.txt", "missing.txt", "", "c.txt"})
+	now := time.Now().UTC()
+	deleted, err := h.DeleteManifests("batch-delete-bucket", []string{"a.txt", "missing.txt", "", "c.txt"}, now)
 	if err != nil {
 		t.Fatalf("DeleteManifests: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestDeleteManifests(t *testing.T) {
 		t.Fatalf("remaining keys = %v, want [b.txt]", got)
 	}
 
-	if _, err := h.DeleteManifests("no-such-bucket", []string{"a.txt"}); !errors.Is(err, ErrBucketNotFound) {
+	if _, err := h.DeleteManifests("no-such-bucket", []string{"a.txt"}, now); !errors.Is(err, ErrBucketNotFound) {
 		t.Fatalf("DeleteManifests missing bucket error = %v, want ErrBucketNotFound", err)
 	}
 }
@@ -456,8 +456,9 @@ func TestDeleteManifests(t *testing.T) {
 func TestMultipartUploadLifecycle(t *testing.T) {
 	h, _ := newTestStore(t)
 	mustCreateBucket(t, h, "multipart-bucket")
+	now := time.Now().UTC()
 
-	upload, err := h.CreateMultipartUpload("multipart-bucket", "dir/large.bin")
+	upload, err := h.CreateMultipartUpload("multipart-bucket", "dir/large.bin", "up-lifecycle-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
@@ -485,13 +486,13 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 	if _, err := h.GetMultipartUpload("missing-upload-id"); !errors.Is(err, ErrMultipartNotFound) {
 		t.Fatalf("GetMultipartUpload missing error = %v, want ErrMultipartNotFound", err)
 	}
-	if err := h.PutMultipartPart("missing-upload-id", models.UploadedPart{PartNumber: 1}); !errors.Is(err, ErrMultipartNotFound) {
+	if err := h.PutMultipartPart("missing-upload-id", models.UploadedPart{PartNumber: 1}, now); !errors.Is(err, ErrMultipartNotFound) {
 		t.Fatalf("PutMultipartPart missing upload error = %v, want ErrMultipartNotFound", err)
 	}
-	if err := h.AbortMultipartUpload("missing-upload-id"); !errors.Is(err, ErrMultipartNotFound) {
+	if err := h.AbortMultipartUpload("missing-upload-id", now); !errors.Is(err, ErrMultipartNotFound) {
 		t.Fatalf("AbortMultipartUpload missing upload error = %v, want ErrMultipartNotFound", err)
 	}
-	if err := h.CompleteMultipartUpload("missing-upload-id", &models.ObjectManifest{}); !errors.Is(err, ErrMultipartNotFound) {
+	if err := h.CompleteMultipartUpload("missing-upload-id", &models.ObjectManifest{}, "", now); !errors.Is(err, ErrMultipartNotFound) {
 		t.Fatalf("CompleteMultipartUpload missing upload error = %v, want ErrMultipartNotFound", err)
 	}
 
@@ -502,7 +503,7 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 		{PartNumber: 2, ETag: "etag-2", Size: 20, Chunks: []string{"chunk-2"}, CreatedAt: 1700000002},
 	}
 	for _, part := range parts {
-		if err := h.PutMultipartPart(upload.UploadID, part); err != nil {
+		if err := h.PutMultipartPart(upload.UploadID, part, now); err != nil {
 			t.Fatalf("PutMultipartPart(%d): %v", part.PartNumber, err)
 		}
 	}
@@ -525,7 +526,7 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 
 	// Re-uploading a part replaces the previous value.
 	replacement := models.UploadedPart{PartNumber: 2, ETag: "etag-2b", Size: 25, Chunks: []string{"chunk-2b"}, CreatedAt: 1700000010}
-	if err := h.PutMultipartPart(upload.UploadID, replacement); err != nil {
+	if err := h.PutMultipartPart(upload.UploadID, replacement, now); err != nil {
 		t.Fatalf("PutMultipartPart replacement: %v", err)
 	}
 	listed, err = h.ListMultipartParts(upload.UploadID)
@@ -541,7 +542,7 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 
 	// Invalid part numbers are rejected before touching the store.
 	for _, partNumber := range []int{-1, 0, 10001} {
-		err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: partNumber})
+		err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: partNumber}, now)
 		if err == nil {
 			t.Fatalf("PutMultipartPart(%d) = nil, want error", partNumber)
 		}
@@ -567,7 +568,7 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 		Chunks:      []string{"chunk-1a", "chunk-1b", "chunk-2b", "chunk-3"},
 		CreatedAt:   1700000020,
 	}
-	if err := h.CompleteMultipartUpload(upload.UploadID, final); err != nil {
+	if err := h.CompleteMultipartUpload(upload.UploadID, final, "", now); err != nil {
 		t.Fatalf("CompleteMultipartUpload: %v", err)
 	}
 
@@ -601,17 +602,17 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 		t.Fatalf("parts after complete = %v, want none", remainingParts)
 	}
 
-	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1}); !errors.Is(err, ErrMultipartNotPending) {
+	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1}, now); !errors.Is(err, ErrMultipartNotPending) {
 		t.Fatalf("PutMultipartPart on completed error = %v, want ErrMultipartNotPending", err)
 	}
-	if err := h.CompleteMultipartUpload(upload.UploadID, &models.ObjectManifest{}); !errors.Is(err, ErrMultipartNotPending) {
+	if err := h.CompleteMultipartUpload(upload.UploadID, &models.ObjectManifest{}, "", now); !errors.Is(err, ErrMultipartNotPending) {
 		t.Fatalf("CompleteMultipartUpload again error = %v, want ErrMultipartNotPending", err)
 	}
-	if err := h.AbortMultipartUpload(upload.UploadID); !errors.Is(err, ErrMultipartNotPending) {
+	if err := h.AbortMultipartUpload(upload.UploadID, now); !errors.Is(err, ErrMultipartNotPending) {
 		t.Fatalf("AbortMultipartUpload on completed error = %v, want ErrMultipartNotPending", err)
 	}
 
-	if err := h.CompleteMultipartUpload(upload.UploadID, nil); err == nil {
+	if err := h.CompleteMultipartUpload(upload.UploadID, nil, "", now); err == nil {
 		t.Fatal("CompleteMultipartUpload(nil) = nil, want error")
 	}
 
@@ -630,12 +631,13 @@ func TestMultipartUploadLifecycle(t *testing.T) {
 func TestAbortMultipartUploadCleansPartsAndBlocksBucketDelete(t *testing.T) {
 	h, _ := newTestStore(t)
 	mustCreateBucket(t, h, "abort-bucket")
+	now := time.Now().UTC()
 
-	upload, err := h.CreateMultipartUpload("abort-bucket", "pending.bin")
+	upload, err := h.CreateMultipartUpload("abort-bucket", "pending.bin", "up-abort-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
-	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, ETag: "etag-1", Size: 5, Chunks: []string{"abort-chunk"}}); err != nil {
+	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, ETag: "etag-1", Size: 5, Chunks: []string{"abort-chunk"}}, now); err != nil {
 		t.Fatalf("PutMultipartPart: %v", err)
 	}
 
@@ -644,7 +646,7 @@ func TestAbortMultipartUploadCleansPartsAndBlocksBucketDelete(t *testing.T) {
 		t.Fatalf("DeleteBucket with pending upload error = %v, want ErrBucketNotEmpty", err)
 	}
 
-	if err := h.AbortMultipartUpload(upload.UploadID); err != nil {
+	if err := h.AbortMultipartUpload(upload.UploadID, now); err != nil {
 		t.Fatalf("AbortMultipartUpload: %v", err)
 	}
 
@@ -672,10 +674,10 @@ func TestAbortMultipartUploadCleansPartsAndBlocksBucketDelete(t *testing.T) {
 		t.Fatalf("aborted part chunk still referenced: %v", referenced)
 	}
 
-	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 2}); !errors.Is(err, ErrMultipartNotPending) {
+	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 2}, now); !errors.Is(err, ErrMultipartNotPending) {
 		t.Fatalf("PutMultipartPart after abort error = %v, want ErrMultipartNotPending", err)
 	}
-	if err := h.CompleteMultipartUpload(upload.UploadID, &models.ObjectManifest{}); !errors.Is(err, ErrMultipartNotPending) {
+	if err := h.CompleteMultipartUpload(upload.UploadID, &models.ObjectManifest{}, "", now); !errors.Is(err, ErrMultipartNotPending) {
 		t.Fatalf("CompleteMultipartUpload after abort error = %v, want ErrMultipartNotPending", err)
 	}
 
@@ -688,17 +690,18 @@ func TestAbortMultipartUploadCleansPartsAndBlocksBucketDelete(t *testing.T) {
 func TestCleanupMultipartUploadsRemovesParts(t *testing.T) {
 	h, _ := newTestStore(t)
 	mustCreateBucket(t, h, "cleanup-bucket")
+	now := time.Now().UTC()
 
-	upload, err := h.CreateMultipartUpload("cleanup-bucket", "expired.bin")
+	upload, err := h.CreateMultipartUpload("cleanup-bucket", "expired.bin", "up-cleanup-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
-	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, Chunks: []string{"expired-chunk"}}); err != nil {
+	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, Chunks: []string{"expired-chunk"}}, now); err != nil {
 		t.Fatalf("PutMultipartPart: %v", err)
 	}
-	setMultipartUploadCreatedAt(t, h, upload.UploadID, time.Now().Add(-2*time.Hour))
+	setMultipartUploadCreatedAt(t, h, upload.UploadID, now.Add(-2*time.Hour))
 
-	cleaned, err := h.CleanupMultipartUploads(time.Hour)
+	cleaned, err := h.CleanupMultipartUploads(time.Hour, now)
 	if err != nil {
 		t.Fatalf("CleanupMultipartUploads: %v", err)
 	}
@@ -1012,7 +1015,8 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMetadataHandler: %v", err)
 	}
-	if err := h.CreateBucket("persist-bucket"); err != nil {
+	now := time.Now().UTC()
+	if err := h.CreateBucket("persist-bucket", now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 	manifest := &models.ObjectManifest{
@@ -1024,14 +1028,14 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 		Chunks:      []string{"persist-object-chunk"},
 		CreatedAt:   1700000000,
 	}
-	if err := h.PutManifest(manifest); err != nil {
+	if err := h.PutManifest(manifest, now); err != nil {
 		t.Fatalf("PutManifest: %v", err)
 	}
-	upload, err := h.CreateMultipartUpload("persist-bucket", "pending.bin")
+	upload, err := h.CreateMultipartUpload("persist-bucket", "pending.bin", "up-persist-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
-	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, ETag: "part-etag", Size: 7, Chunks: []string{"persist-part-chunk"}}); err != nil {
+	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, ETag: "part-etag", Size: 7, Chunks: []string{"persist-part-chunk"}}, now); err != nil {
 		t.Fatalf("PutMultipartPart: %v", err)
 	}
 	if err := h.PutAuthIdentity(&models.AuthIdentity{AccessKeyID: "AKIAPERSIST", SecretEnc: "sealed", Status: "active"}); err != nil {

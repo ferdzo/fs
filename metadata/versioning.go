@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"go.etcd.io/bbolt"
 )
 
@@ -194,7 +193,7 @@ func setLatestFromOrder(versions, order, metaBucket *bbolt.Bucket, bucket, key s
 	return metaBucket.Put([]byte(key), data)
 }
 
-func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key string) error {
+func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key string, nowNano int64) error {
 	data := versions.Get(objectVersionKey(bucket, key, nullVersionID))
 	if data == nil {
 		// An unmaterialized pre-versioning record lives only in metaBucket.
@@ -204,7 +203,7 @@ func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key 
 				return err
 			}
 			if current.VersionID == "" {
-				return removeChunkRefsTx(metaBucket.Tx(), current.Chunks, time.Now().UnixNano())
+				return removeChunkRefsTx(metaBucket.Tx(), current.Chunks, nowNano)
 			}
 		}
 		return nil
@@ -213,7 +212,7 @@ func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key 
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return err
 	}
-	if err := removeChunkRefsTx(metaBucket.Tx(), manifest.Chunks, time.Now().UnixNano()); err != nil {
+	if err := removeChunkRefsTx(metaBucket.Tx(), manifest.Chunks, nowNano); err != nil {
 		return err
 	}
 	if err := versions.Delete(objectVersionKey(bucket, key, nullVersionID)); err != nil {
@@ -238,7 +237,7 @@ func removeNullVersionTx(versions, order, metaBucket *bbolt.Bucket, bucket, key 
 // state. When ifNoneMatch is non-empty, it rejects the write with
 // ErrPreconditionFailed if a live (non-delete-marker) object matches. All
 // index updates happen in the caller's transaction.
-func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMatch string) (string, error) {
+func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMatch, versionID string, now time.Time) (string, error) {
 	if manifest == nil {
 		return "", errors.New("object manifest is required")
 	}
@@ -261,6 +260,7 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 			}
 		}
 	}
+	nowNano := now.UnixNano()
 	if status == "" {
 		manifest.VersionID = ""
 		manifest.VersionSeq = 0
@@ -270,7 +270,7 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 			if err := json.Unmarshal(existing, &old); err != nil {
 				return "", err
 			}
-			if err := removeChunkRefsTx(tx, old.Chunks, time.Now().UnixNano()); err != nil {
+			if err := removeChunkRefsTx(tx, old.Chunks, nowNano); err != nil {
 				return "", err
 			}
 		}
@@ -285,6 +285,14 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 			return "", err
 		}
 		return "", nil
+	}
+
+	resolvedID := nullVersionID
+	if status == versioningEnabled {
+		resolvedID = strings.TrimSpace(versionID)
+		if resolvedID == "" || resolvedID == nullVersionID {
+			return "", errors.New("version id is required for versioned bucket")
+		}
 	}
 
 	versions, err := tx.CreateBucketIfNotExists(versionIndex)
@@ -317,16 +325,12 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 			}
 		}
 	} else {
-		if err := removeNullVersionTx(versions, order, metaBucket, manifest.Bucket, manifest.Key); err != nil {
+		if err := removeNullVersionTx(versions, order, metaBucket, manifest.Bucket, manifest.Key, nowNano); err != nil {
 			return "", err
 		}
 	}
 
-	versionID := nullVersionID
-	if status == versioningEnabled {
-		versionID = uuid.NewString()
-	}
-	manifest.VersionID = versionID
+	manifest.VersionID = resolvedID
 	manifest.VersionSeq = seq
 	manifest.DeleteMarker = false
 	if err := addChunkRefsTx(tx, manifest.Chunks); err != nil {
@@ -342,28 +346,28 @@ func putObjectVersionTx(tx *bbolt.Tx, manifest *models.ObjectManifest, ifNoneMat
 	if err := metaBucket.Put([]byte(manifest.Key), data); err != nil {
 		return "", err
 	}
-	return versionID, nil
+	return resolvedID, nil
 }
 
 // PutObjectVersion stores a manifest as a new version (or overwrites when the
 // bucket is unversioned) and returns the version ID.
-func (h *MetadataHandler) PutObjectVersion(manifest *models.ObjectManifest) (string, error) {
-	return h.PutObjectVersionConditional(manifest, "")
+func (h *MetadataHandler) PutObjectVersion(manifest *models.ObjectManifest, versionID string, now time.Time) (string, error) {
+	return h.PutObjectVersionConditional(manifest, "", versionID, now)
 }
 
 // PutObjectVersionConditional stores a manifest while atomically enforcing an
 // optional If-None-Match precondition inside the metadata write transaction.
-func (h *MetadataHandler) PutObjectVersionConditional(manifest *models.ObjectManifest, ifNoneMatch string) (string, error) {
-	var versionID string
+func (h *MetadataHandler) PutObjectVersionConditional(manifest *models.ObjectManifest, ifNoneMatch, versionID string, now time.Time) (string, error) {
+	var resolvedID string
 	err := h.update(func(tx *bbolt.Tx) error {
 		var err error
-		versionID, err = putObjectVersionTx(tx, manifest, ifNoneMatch)
+		resolvedID, err = putObjectVersionTx(tx, manifest, ifNoneMatch, versionID, now)
 		return err
 	})
-	return versionID, err
+	return resolvedID, err
 }
 
-func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, error) {
+func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID, deleteMarkerID string, now time.Time) (DeleteResult, error) {
 	status, err := bucketVersioningTx(tx, bucket)
 	if err != nil {
 		return DeleteResult{}, err
@@ -373,6 +377,7 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 		return DeleteResult{}, fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 	}
 	latestData := metaBucket.Get([]byte(key))
+	nowNano := now.UnixNano()
 
 	if versionID == "" {
 		if status == "" {
@@ -383,10 +388,17 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 			if err := json.Unmarshal(latestData, &latest); err != nil {
 				return DeleteResult{}, err
 			}
-			if err := removeChunkRefsTx(tx, latest.Chunks, time.Now().UnixNano()); err != nil {
+			if err := removeChunkRefsTx(tx, latest.Chunks, nowNano); err != nil {
 				return DeleteResult{}, err
 			}
 			return DeleteResult{}, metaBucket.Delete([]byte(key))
+		}
+		markerID := nullVersionID
+		if status == versioningEnabled {
+			markerID = strings.TrimSpace(deleteMarkerID)
+			if markerID == "" || markerID == nullVersionID {
+				return DeleteResult{}, errors.New("delete marker id is required for versioned bucket")
+			}
 		}
 		versions, err := tx.CreateBucketIfNotExists(versionIndex)
 		if err != nil {
@@ -414,12 +426,8 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 					}
 				}
 			}
-		} else if err := removeNullVersionTx(versions, order, metaBucket, bucket, key); err != nil {
+		} else if err := removeNullVersionTx(versions, order, metaBucket, bucket, key, nowNano); err != nil {
 			return DeleteResult{}, err
-		}
-		markerID := nullVersionID
-		if status == versioningEnabled {
-			markerID = uuid.NewString()
 		}
 		marker := models.ObjectManifest{
 			Bucket:       bucket,
@@ -427,7 +435,7 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 			VersionID:    markerID,
 			VersionSeq:   seq,
 			DeleteMarker: true,
-			CreatedAt:    time.Now().Unix(),
+			CreatedAt:    now.UTC().Unix(),
 		}
 		if err := putVersionRecord(versions, order, &marker); err != nil {
 			return DeleteResult{}, err
@@ -449,7 +457,7 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 			return DeleteResult{}, err
 		}
 		if latest.VersionID == "" {
-			if err := removeChunkRefsTx(tx, latest.Chunks, time.Now().UnixNano()); err != nil {
+			if err := removeChunkRefsTx(tx, latest.Chunks, nowNano); err != nil {
 				return DeleteResult{}, err
 			}
 			if err := metaBucket.Delete([]byte(key)); err != nil {
@@ -471,7 +479,7 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return DeleteResult{}, err
 	}
-	if err := removeChunkRefsTx(tx, manifest.Chunks, time.Now().UnixNano()); err != nil {
+	if err := removeChunkRefsTx(tx, manifest.Chunks, nowNano); err != nil {
 		return DeleteResult{}, err
 	}
 	if err := versions.Delete(objectVersionKey(bucket, key, versionID)); err != nil {
@@ -498,11 +506,11 @@ func deleteObjectTx(tx *bbolt.Tx, bucket, key, versionID string) (DeleteResult, 
 
 // DeleteObject removes the named version, creates a delete marker, or deletes
 // the object permanently depending on the bucket state and versionID argument.
-func (h *MetadataHandler) DeleteObject(bucket, key, versionID string) (DeleteResult, error) {
+func (h *MetadataHandler) DeleteObject(bucket, key, versionID, deleteMarkerID string, now time.Time) (DeleteResult, error) {
 	var result DeleteResult
 	err := h.update(func(tx *bbolt.Tx) error {
 		var err error
-		result, err = deleteObjectTx(tx, bucket, key, versionID)
+		result, err = deleteObjectTx(tx, bucket, key, versionID, deleteMarkerID, now)
 		return err
 	})
 	return result, err
@@ -510,8 +518,9 @@ func (h *MetadataHandler) DeleteObject(bucket, key, versionID string) (DeleteRes
 
 // DeleteObjectSpec identifies one key (and optional version) in a batch delete.
 type DeleteObjectSpec struct {
-	Key       string
-	VersionID string
+	Key            string
+	VersionID      string
+	DeleteMarkerID string
 }
 
 // BatchDeleteResult describes the outcome of one item in a batch delete.
@@ -525,7 +534,7 @@ type BatchDeleteResult struct {
 // DeleteObjects applies a batch of version-aware deletes in a single metadata
 // transaction, honoring the bucket's versioning state whether or not items
 // specify a VersionID.
-func (h *MetadataHandler) DeleteObjects(bucket string, specs []DeleteObjectSpec) ([]BatchDeleteResult, error) {
+func (h *MetadataHandler) DeleteObjects(bucket string, specs []DeleteObjectSpec, now time.Time) ([]BatchDeleteResult, error) {
 	results := make([]BatchDeleteResult, 0, len(specs))
 	err := h.update(func(tx *bbolt.Tx) error {
 		if _, err := bucketVersioningTx(tx, bucket); err != nil {
@@ -536,7 +545,7 @@ func (h *MetadataHandler) DeleteObjects(bucket string, specs []DeleteObjectSpec)
 				continue
 			}
 			reqVersion := strings.TrimSpace(spec.VersionID)
-			res, err := deleteObjectTx(tx, bucket, spec.Key, reqVersion)
+			res, err := deleteObjectTx(tx, bucket, spec.Key, reqVersion, spec.DeleteMarkerID, now)
 			if err != nil {
 				return err
 			}

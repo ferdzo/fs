@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"go.etcd.io/bbolt"
 )
 
@@ -573,7 +571,7 @@ func (h *MetadataHandler) ListAuthIdentities(limit int, after string) ([]models.
 	return identities, nextCursor, nil
 }
 
-func (h *MetadataHandler) CreateBucket(bucketName string) error {
+func (h *MetadataHandler) CreateBucket(bucketName string, createdAt time.Time) error {
 	if !isValidBucketName(bucketName) {
 		return fmt.Errorf("%w: %s", ErrInvalidBucketName, bucketName)
 	}
@@ -593,7 +591,7 @@ func (h *MetadataHandler) CreateBucket(bucketName string) error {
 		}
 		manifest := models.BucketManifest{
 			Name:      bucketName,
-			CreatedAt: time.Now(),
+			CreatedAt: createdAt.UTC(),
 		}
 		data, err := json.Marshal(manifest)
 		if err != nil {
@@ -718,16 +716,12 @@ func (h *MetadataHandler) GetBucketManifest(bucketName string) (*models.BucketMa
 	return manifest, nil
 }
 
-func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
+func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest, now time.Time) error {
 	if manifest == nil {
 		return errors.New("object manifest is required")
 	}
 	bucket := manifest.Bucket
 	key := manifest.Key
-
-	if _, err := h.GetBucketManifest(bucket); err != nil {
-		return err
-	}
 
 	err := h.update(func(tx *bbolt.Tx) error {
 		status, err := bucketVersioningTx(tx, bucket)
@@ -750,7 +744,7 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 			if err := json.Unmarshal(existing, &old); err != nil {
 				return err
 			}
-			if err := removeChunkRefsTx(tx, old.Chunks, time.Now().UnixNano()); err != nil {
+			if err := removeChunkRefsTx(tx, old.Chunks, now.UnixNano()); err != nil {
 				return err
 			}
 		}
@@ -919,24 +913,22 @@ func (h *MetadataHandler) ForEachObjectFrom(bucket, startKey string, fn func(*mo
 	})
 }
 
-func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
-	if _, err := h.GetManifest(bucket, key); err != nil {
-		return err
-	}
-
+func (h *MetadataHandler) DeleteManifest(bucket, key string, now time.Time) error {
 	err := h.update(func(tx *bbolt.Tx) error {
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
-		if existing := metadataBucket.Get([]byte(key)); existing != nil {
-			old := models.ObjectManifest{}
-			if err := json.Unmarshal(existing, &old); err != nil {
-				return err
-			}
-			if err := removeChunkRefsTx(tx, old.Chunks, time.Now().UnixNano()); err != nil {
-				return err
-			}
+		existing := metadataBucket.Get([]byte(key))
+		if existing == nil {
+			return fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
+		}
+		old := models.ObjectManifest{}
+		if err := json.Unmarshal(existing, &old); err != nil {
+			return err
+		}
+		if err := removeChunkRefsTx(tx, old.Chunks, now.UnixNano()); err != nil {
+			return err
 		}
 		return metadataBucket.Delete([]byte(key))
 	})
@@ -947,7 +939,7 @@ func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
 
 }
 
-func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]string, error) {
+func (h *MetadataHandler) DeleteManifests(bucket string, keys []string, now time.Time) ([]string, error) {
 	deleted := make([]string, 0, len(keys))
 
 	err := h.update(func(tx *bbolt.Tx) error {
@@ -956,7 +948,7 @@ func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]strin
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
 
-		nowNano := time.Now().UnixNano()
+		nowNano := now.UnixNano()
 		for _, key := range keys {
 			if key == "" {
 				continue
@@ -983,39 +975,31 @@ func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]strin
 	return deleted, nil
 }
 
-func (h *MetadataHandler) CreateMultipartUpload(bucket, key string, contentType ...string) (*models.MultipartUpload, error) {
-	var upload *models.MultipartUpload
+func (h *MetadataHandler) CreateMultipartUpload(bucket, key, uploadID, contentType string, createdAt time.Time) (*models.MultipartUpload, error) {
+	uploadID = strings.TrimSpace(uploadID)
+	if uploadID == "" {
+		return nil, errors.New("upload id is required")
+	}
 
-	err := h.view(func(tx *bbolt.Tx) error {
-		systemIndexBucket := tx.Bucket([]byte(systemIndex))
-		if systemIndexBucket == nil {
-			return errors.New("system index not found")
-		}
-		if systemIndexBucket.Get([]byte(bucket)) != nil {
-			return nil
-		}
-		return ErrBucketNotFound
-	})
-	if err != nil {
-		return nil, err
-	}
-	ct := ""
-	if len(contentType) > 0 {
-		ct = strings.TrimSpace(contentType[0])
-	}
-	uploadId := uuid.New().String()
-	createdAt := time.Now().UTC().Format(time.RFC3339)
-	upload = &models.MultipartUpload{
+	upload := &models.MultipartUpload{
 		Bucket:      bucket,
 		Key:         key,
-		ContentType: ct,
-		UploadID:    uploadId,
-		CreatedAt:   createdAt,
+		ContentType: strings.TrimSpace(contentType),
+		UploadID:    uploadID,
+		CreatedAt:   createdAt.UTC().Format(time.RFC3339),
 		State:       "pending",
 	}
 
-	err = h.update(func(tx *bbolt.Tx) error {
-		multipartUploadBucket := tx.Bucket([]byte(multipartUploadIndex))
+	err := h.update(func(tx *bbolt.Tx) error {
+		systemIndexBucket := tx.Bucket(systemIndex)
+		if systemIndexBucket == nil {
+			return errors.New("system index not found")
+		}
+		if systemIndexBucket.Get([]byte(bucket)) == nil {
+			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
+		}
+
+		multipartUploadBucket := tx.Bucket(multipartUploadIndex)
 		if multipartUploadBucket == nil {
 			return errors.New("multipart upload index not found")
 		}
@@ -1023,12 +1007,14 @@ func (h *MetadataHandler) CreateMultipartUpload(bucket, key string, contentType 
 		if keyIndexBucket == nil {
 			return errors.New("multipart upload key index not found")
 		}
+		if multipartUploadBucket.Get([]byte(uploadID)) != nil {
+			return errors.New("multipart upload already exists")
+		}
 		payload, err := json.Marshal(upload)
 		if err != nil {
 			return err
 		}
-		err = multipartUploadBucket.Put([]byte(uploadId), payload)
-		if err != nil {
+		if err := multipartUploadBucket.Put([]byte(uploadID), payload); err != nil {
 			return err
 		}
 
@@ -1122,14 +1108,13 @@ func deleteMultipartUploadKeyIndexEntry(tx *bbolt.Tx, upload *models.MultipartUp
 	return keyIndexBucket.Delete(multipartUploadKeyIndexKey(upload))
 }
 
-func deleteMultipartPartsByUploadID(tx *bbolt.Tx, uploadID string) error {
+func deleteMultipartPartsByUploadID(tx *bbolt.Tx, uploadID string, nowNano int64) error {
 	multipartPartsBucket, err := getMultipartPartsBucket(tx)
 	if err != nil {
 		return err
 	}
 
 	prefix := uploadID + ":"
-	nowNano := time.Now().UnixNano()
 	cursor := multipartPartsBucket.Cursor()
 	keysToDelete := make([][]byte, 0)
 	for k, v := cursor.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix); k, v = cursor.Next() {
@@ -1166,7 +1151,7 @@ func (h *MetadataHandler) GetMultipartUpload(uploadID string) (*models.Multipart
 	}
 	return upload, nil
 }
-func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.UploadedPart) error {
+func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.UploadedPart, now time.Time) error {
 	if part.PartNumber < 1 || part.PartNumber > 10000 {
 		return fmt.Errorf("invalid part number: %d", part.PartNumber)
 	}
@@ -1191,7 +1176,7 @@ func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.Uploaded
 			if err := json.Unmarshal(existing, &oldPart); err != nil {
 				return err
 			}
-			if err := removeChunkRefsTx(tx, oldPart.Chunks, time.Now().UnixNano()); err != nil {
+			if err := removeChunkRefsTx(tx, oldPart.Chunks, now.UnixNano()); err != nil {
 				return err
 			}
 		}
@@ -1405,7 +1390,7 @@ func (h *MetadataHandler) ListMultipartParts(uploadID string) ([]models.Uploaded
 	})
 	return parts, nil
 }
-func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models.ObjectManifest) error {
+func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models.ObjectManifest, versionID string, now time.Time) error {
 	if final == nil {
 		return errors.New("final object manifest is required")
 	}
@@ -1421,7 +1406,7 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 
 		final.Bucket = upload.Bucket
 		final.Key = upload.Key
-		if _, err := putObjectVersionTx(tx, final, ""); err != nil {
+		if _, err := putObjectVersionTx(tx, final, "", versionID, now); err != nil {
 			return err
 		}
 
@@ -1433,7 +1418,7 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 			return err
 		}
 
-		if err := deleteMultipartPartsByUploadID(tx, uploadID); err != nil {
+		if err := deleteMultipartPartsByUploadID(tx, uploadID, now.UnixNano()); err != nil {
 			return err
 		}
 		return nil
@@ -1443,7 +1428,7 @@ func (h *MetadataHandler) CompleteMultipartUpload(uploadID string, final *models
 	}
 	return nil
 }
-func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
+func (h *MetadataHandler) AbortMultipartUpload(uploadID string, now time.Time) error {
 	err := h.update(func(tx *bbolt.Tx) error {
 		upload, multipartUploadBucket, err := getMultipartUploadFromTx(tx, uploadID)
 		if err != nil {
@@ -1460,7 +1445,7 @@ func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
 			return err
 		}
 
-		if err := deleteMultipartPartsByUploadID(tx, uploadID); err != nil {
+		if err := deleteMultipartPartsByUploadID(tx, uploadID, now.UnixNano()); err != nil {
 			return err
 		}
 		return nil
@@ -1471,7 +1456,7 @@ func (h *MetadataHandler) AbortMultipartUpload(uploadID string) error {
 	return nil
 }
 
-func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int, error) {
+func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration, now time.Time) (int, error) {
 	if retention <= 0 {
 		return 0, nil
 	}
@@ -1483,7 +1468,8 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 			return err
 		}
 
-		now := time.Now().UTC()
+		cutoffNow := now.UTC()
+		nowNano := cutoffNow.UnixNano()
 		uploadsToDelete := make([]models.MultipartUpload, 0)
 		orphanIDs := make([]string, 0)
 		if err := uploadsBucket.ForEach(func(k, v []byte) error {
@@ -1497,7 +1483,7 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 				orphanIDs = append(orphanIDs, string(k))
 				return nil
 			}
-			if now.Sub(createdAt) >= retention {
+			if cutoffNow.Sub(createdAt) >= retention {
 				upload.UploadID = string(k)
 				uploadsToDelete = append(uploadsToDelete, upload)
 			}
@@ -1513,7 +1499,7 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 			if err := deleteMultipartUploadKeyIndexEntry(tx, &upload); err != nil {
 				return err
 			}
-			if err := deleteMultipartPartsByUploadID(tx, upload.UploadID); err != nil {
+			if err := deleteMultipartPartsByUploadID(tx, upload.UploadID, nowNano); err != nil {
 				return err
 			}
 			cleaned++
@@ -1522,7 +1508,7 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration) (int,
 			if err := uploadsBucket.Delete([]byte(uploadID)); err != nil {
 				return err
 			}
-			if err := deleteMultipartPartsByUploadID(tx, uploadID); err != nil {
+			if err := deleteMultipartPartsByUploadID(tx, uploadID, nowNano); err != nil {
 				return err
 			}
 			cleaned++

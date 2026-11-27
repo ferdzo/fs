@@ -206,11 +206,11 @@ func (h *MetadataHandler) ChunkRefCount(chunkID string) (uint64, error) {
 // EnqueueUnreferencedChunks queues chunkIDs for garbage collection when they
 // currently have zero metadata references (for example after an aborted or
 // failed upload).
-func (h *MetadataHandler) EnqueueUnreferencedChunks(chunkIDs []string) error {
+func (h *MetadataHandler) EnqueueUnreferencedChunks(chunkIDs []string, now time.Time) error {
 	if len(chunkIDs) == 0 {
 		return nil
 	}
-	nowNano := time.Now().UnixNano()
+	nowNano := now.UnixNano()
 	return h.update(func(tx *bbolt.Tx) error {
 		refs, err := tx.CreateBucketIfNotExists(chunkRefIndex)
 		if err != nil {
