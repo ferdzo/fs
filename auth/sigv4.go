@@ -232,18 +232,9 @@ func validatePayloadSigningMode(r *http.Request, input *sigV4Input) error {
 	return nil
 }
 
-func signatureMatches(secret string, r *http.Request, input *sigV4Input) (bool, error) {
-	key, ok, err := signatureMatchsWithKey(secret, r, input)
-	if err != nil {
-		return false, err
-	}
-	_ = key
-	return ok, nil
-}
-
-// signatureMatchsWithKey verifies the envelope signature and additionally
+// signatureMatchesWithKey verifies the envelope signature and additionally
 // returns the derived signing key so streamed-chunk signatures can be chained.
-func signatureMatchsWithKey(secret string, r *http.Request, input *sigV4Input) ([]byte, bool, error) {
+func signatureMatchesWithKey(secret string, r *http.Request, input *sigV4Input) ([]byte, bool, error) {
 	payloadHash := resolvePayloadHash(r, input.Presigned)
 	canonicalRequest, err := buildCanonicalRequest(r, input.SignedHeaders, payloadHash, input.Presigned)
 	if err != nil {

@@ -101,13 +101,9 @@ type Registry struct {
 	lockWait map[string]*histogram
 	lockHold map[string]*histogram
 
-	cacheHits   map[string]uint64
-	cacheMisses map[string]uint64
-
 	batchSize *histogram
 
-	retries map[string]uint64
-	errors  map[string]uint64
+	errors map[string]uint64
 
 	gcRuns          map[string]uint64
 	gcDuration      *histogram
@@ -135,10 +131,7 @@ func NewRegistry() *Registry {
 		blobDuration:           make(map[string]*histogram),
 		lockWait:               make(map[string]*histogram),
 		lockHold:               make(map[string]*histogram),
-		cacheHits:              make(map[string]uint64),
-		cacheMisses:            make(map[string]uint64),
 		batchSize:              newHistogram(batchBuckets),
-		retries:                make(map[string]uint64),
 		errors:                 make(map[string]uint64),
 		gcRuns:                 make(map[string]uint64),
 		gcDuration:             newHistogram(defaultBuckets),
@@ -188,14 +181,6 @@ func normalizeOp(op string) string {
 	return op
 }
 
-func (r *Registry) IncHTTPInFlight() {
-	r.httpInFlight.Add(1)
-}
-
-func (r *Registry) DecHTTPInFlight() {
-	r.httpInFlight.Add(-1)
-}
-
 func (r *Registry) IncHTTPInFlightOp(op string) {
 	r.httpInFlight.Add(1)
 	op = normalizeOp(op)
@@ -213,11 +198,6 @@ func (r *Registry) DecHTTPInFlightOp(op string) {
 		r.httpInFlightOp[op] = 0
 	}
 	r.mu.Unlock()
-}
-
-func (r *Registry) ObserveHTTPRequest(method, route string, status int, d time.Duration, responseBytes int) {
-	op := NormalizeHTTPOperation(method, false)
-	r.ObserveHTTPRequestDetailed(method, route, op, status, d, responseBytes)
 }
 
 func (r *Registry) ObserveHTTPRequestDetailed(method, route, op string, status int, d time.Duration, responseBytes int) {
@@ -392,44 +372,12 @@ func (r *Registry) ObserveLockHold(lockName string, d time.Duration) {
 	r.mu.Unlock()
 }
 
-func (r *Registry) ObserveCacheHit(cache string) {
-	cache = strings.TrimSpace(cache)
-	if cache == "" {
-		cache = "unknown"
-	}
-	r.mu.Lock()
-	r.cacheHits[cache]++
-	r.mu.Unlock()
-}
-
-func (r *Registry) ObserveCacheMiss(cache string) {
-	cache = strings.TrimSpace(cache)
-	if cache == "" {
-		cache = "unknown"
-	}
-	r.mu.Lock()
-	r.cacheMisses[cache]++
-	r.mu.Unlock()
-}
-
 func (r *Registry) ObserveBatchSize(size int) {
 	if size < 0 {
 		size = 0
 	}
 	r.mu.Lock()
 	r.batchSize.observe(float64(size))
-	r.mu.Unlock()
-}
-
-func (r *Registry) ObserveRetry(op, reason string) {
-	op = normalizeOp(op)
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "unknown"
-	}
-	key := op + "|" + reason
-	r.mu.Lock()
-	r.retries[key]++
 	r.mu.Unlock()
 }
 
@@ -487,10 +435,7 @@ func (r *Registry) RenderPrometheus() string {
 	blobDur := copyHistogramMap(r.blobDuration)
 	lockWait := copyHistogramMap(r.lockWait)
 	lockHold := copyHistogramMap(r.lockHold)
-	cacheHits := copyCounterMap(r.cacheHits)
-	cacheMisses := copyCounterMap(r.cacheMisses)
 	batchBounds, batchCounts, batchSum, batchCount := r.batchSize.snapshot()
-	retries := copyCounterMap(r.retries)
 	errorsTotal := copyCounterMap(r.errors)
 	gcRuns := copyCounterMap(r.gcRuns)
 	gcDurBounds, gcDurCounts, gcDurSum, gcDurCount := r.gcDuration.snapshot()
@@ -539,12 +484,8 @@ func (r *Registry) RenderPrometheus() string {
 	writeHistogramVecKV(&b, "fs_lock_wait_seconds", "Time spent waiting for locks.", lockWait, []string{"lock_name"})
 	writeHistogramVecKV(&b, "fs_lock_hold_seconds", "Time locks were held.", lockHold, []string{"lock_name"})
 
-	writeCounterVecKV(&b, "fs_cache_hits_total", "Cache hits by cache name.", cacheHits, []string{"cache"})
-	writeCounterVecKV(&b, "fs_cache_misses_total", "Cache misses by cache name.", cacheMisses, []string{"cache"})
-
 	writeHistogram(&b, "fs_batch_size_histogram", "Observed batch sizes.", nil, batchBounds, batchCounts, batchSum, batchCount)
 
-	writeCounterVecKV(&b, "fs_retries_total", "Retries by operation and reason.", retries, []string{"op", "reason"})
 	writeCounterVecKV(&b, "fs_errors_total", "Errors by operation and reason.", errorsTotal, []string{"op", "reason"})
 
 	writeCounterVecKV(&b, "fs_gc_runs_total", "Garbage collection runs.", gcRuns, []string{"result"})

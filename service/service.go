@@ -755,21 +755,6 @@ func (s *ObjectService) ForEachObjectKeyFrom(bucket, startKey string, fn func(ke
 	return err
 }
 
-// ForEachObjectFrom is the eager compatibility wrapper: it decodes every
-// visited manifest before invoking fn.
-func (s *ObjectService) ForEachObjectFrom(bucket, startKey string, fn func(*models.ObjectManifest) error) error {
-	if fn == nil {
-		return errors.New("object callback is required")
-	}
-	return s.ForEachObjectKeyFrom(bucket, startKey, func(_ string, decode func() (*models.ObjectManifest, error)) error {
-		object, err := decode()
-		if err != nil {
-			return err
-		}
-		return fn(object)
-	})
-}
-
 func (s *ObjectService) CreateBucket(bucket string) error {
 	start := time.Now()
 	success := false
@@ -807,10 +792,6 @@ func (s *ObjectService) ListBuckets() ([]string, error) {
 	buckets, err := s.metadata.ListBuckets()
 	success = err == nil
 	return buckets, err
-}
-
-func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, error) {
-	return s.metadata.DeleteManifests(bucket, keys, time.Now().UTC())
 }
 
 func (s *ObjectService) CreateMultipartUpload(bucket, key string, contentType ...string) (*models.MultipartUpload, error) {
