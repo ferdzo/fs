@@ -36,11 +36,11 @@ const multipartKeyIndexSeparator = "\x00"
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
 var (
-	ErrInvalidBucketName    = errors.New("invalid bucket name")
-	ErrBucketAlreadyExists  = errors.New("bucket already exists")
-	ErrBucketNotFound       = errors.New("bucket not found")
-	ErrBucketNotEmpty       = errors.New("bucket not empty")
-	ErrObjectNotFound       = errors.New("object not found")
+	ErrInvalidBucketName         = errors.New("invalid bucket name")
+	ErrBucketAlreadyExists       = errors.New("bucket already exists")
+	ErrBucketNotFound            = errors.New("bucket not found")
+	ErrBucketNotEmpty            = errors.New("bucket not empty")
+	ErrObjectNotFound            = errors.New("object not found")
 	ErrMultipartNotFound         = errors.New("multipart upload not found")
 	ErrMultipartNotPending       = errors.New("multipart upload is not pending")
 	ErrAuthIdentityNotFound      = errors.New("auth identity not found")
