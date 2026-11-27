@@ -40,6 +40,8 @@ func RunServer(ctx context.Context) error {
 		"log_format", logConfig.Format,
 		"audit_log", logConfig.Audit,
 		"data_path", config.DataPath,
+		"gc_interval_seconds", int(config.GcInterval/time.Second),
+		"gc_grace_seconds", int(config.GcGrace/time.Second),
 		"multipart_retention_hours", int(config.MultipartCleanupRetention/time.Hour),
 		"max_object_upload_bytes", config.MaxObjectUploadBytes,
 		"auth_enabled", authConfig.Enabled,
@@ -69,6 +71,7 @@ func RunServer(ctx context.Context) error {
 	}
 
 	objectService := service.NewObjectService(metadataHandler, blobHandler, config.MultipartCleanupRetention, config.MaxObjectUploadBytes)
+	objectService.SetGCGrace(config.GcGrace)
 	authService, err := auth.NewService(authConfig, metadataHandler)
 	if err != nil {
 		_ = metadataHandler.Close()

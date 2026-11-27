@@ -64,6 +64,7 @@ type adminUserResponse struct {
 
 func (h *Handler) registerAdminRoutes() {
 	h.router.Route("/_admin/v1", func(r chi.Router) {
+		r.Post("/gc", h.handleAdminRunGC)
 		r.Post("/users", h.handleAdminCreateUser)
 		r.Get("/users", h.handleAdminListUsers)
 		r.Get("/users/{accessKeyId}", h.handleAdminGetUser)
@@ -71,6 +72,21 @@ func (h *Handler) registerAdminRoutes() {
 		r.Put("/users/{accessKeyId}/status", h.handleAdminSetUserStatus)
 		r.Delete("/users/{accessKeyId}", h.handleAdminDeleteUser)
 	})
+}
+
+func (h *Handler) handleAdminRunGC(w http.ResponseWriter, r *http.Request) {
+	if !h.requireBootstrapAdmin(w, r) {
+		return
+	}
+	if h.svc == nil {
+		writeAdminError(w, r, http.StatusServiceUnavailable, "ServiceUnavailable", "object service is unavailable")
+		return
+	}
+	if err := h.svc.GarbageCollect(); err != nil {
+		writeAdminError(w, r, http.StatusInternalServerError, "InternalError", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (h *Handler) handleAdminCreateUser(w http.ResponseWriter, r *http.Request) {

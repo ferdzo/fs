@@ -1,6 +1,9 @@
 package utils
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestEnvInt64Range(t *testing.T) {
 	t.Setenv("TEST_INT64_RANGE", "42")
@@ -47,5 +50,39 @@ func TestNewConfigMetricsDefaultsAndDisable(t *testing.T) {
 	}
 	if cfgDisabled.MetricsPort != 0 {
 		t.Fatalf("MetricsPort = %d, want 0", cfgDisabled.MetricsPort)
+	}
+}
+
+func TestNewConfigGCSettings(t *testing.T) {
+	t.Setenv("GC_INTERVAL", "")
+	t.Setenv("GC_INTERVAL_SECONDS", "")
+	t.Setenv("GC_GRACE_SECONDS", "")
+	cfgDefault := NewConfig()
+	if cfgDefault.GcInterval != 10*time.Minute {
+		t.Fatalf("default GcInterval = %v, want 10m", cfgDefault.GcInterval)
+	}
+	if cfgDefault.GcGrace != 15*time.Minute {
+		t.Fatalf("default GcGrace = %v, want 15m", cfgDefault.GcGrace)
+	}
+
+	t.Setenv("GC_INTERVAL", "5")
+	t.Setenv("GC_INTERVAL_SECONDS", "7")
+	t.Setenv("GC_GRACE_SECONDS", "0")
+	cfgOverride := NewConfig()
+	if cfgOverride.GcInterval != 7*time.Second {
+		t.Fatalf("override GcInterval = %v, want 7s", cfgOverride.GcInterval)
+	}
+	if cfgOverride.GcGrace != 0 {
+		t.Fatalf("override GcGrace = %v, want 0s", cfgOverride.GcGrace)
+	}
+
+	t.Setenv("GC_INTERVAL_SECONDS", "invalid")
+	t.Setenv("GC_GRACE_SECONDS", "30")
+	cfgFallback := NewConfig()
+	if cfgFallback.GcInterval != 5*time.Minute {
+		t.Fatalf("fallback GcInterval = %v, want 5m", cfgFallback.GcInterval)
+	}
+	if cfgFallback.GcGrace != 30*time.Second {
+		t.Fatalf("GcGrace = %v, want 30s", cfgFallback.GcGrace)
 	}
 }

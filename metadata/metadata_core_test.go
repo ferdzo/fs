@@ -2,10 +2,12 @@ package metadata
 
 import (
 	"errors"
+	"fmt"
 	"fs/models"
 	"path/filepath"
 	"slices"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1123,5 +1125,80 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	want := []string{"persist-object-chunk", "persist-part-chunk"}
 	if got := sortedStrings(chunks); !slices.Equal(got, want) {
 		t.Fatalf("GetReferencedChunks = %v, want %v", got, want)
+	}
+}
+
+func TestConcurrentUpdatesBatchRetrySafety(t *testing.T) {
+	h, _ := newTestStore(t)
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	mustCreateBucket(t, h, "batch-bucket")
+	mustCreateBucket(t, h, "ver-batch")
+	if err := h.SetBucketVersioning("ver-batch", versioningEnabled); err != nil {
+		t.Fatalf("SetBucketVersioning: %v", err)
+	}
+
+	const workers = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*4)
+
+	for i := 0; i < workers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := fmt.Sprintf("k-%02d", i)
+			if err := h.PutManifest(&models.ObjectManifest{
+				Bucket: "batch-bucket", Key: key, Size: 1, ETag: fmt.Sprintf("e-%d", i), CreatedAt: now.Unix(),
+			}, now); err != nil {
+				errs <- fmt.Errorf("put %s: %w", key, err)
+				return
+			}
+			// Inject guaranteed errors alongside concurrent writes to trigger
+			// bbolt.Batch rollback and individual retries.
+			if err := h.PutManifest(&models.ObjectManifest{Bucket: "no-such-bucket", Key: key}, now); !errors.Is(err, ErrBucketNotFound) {
+				errs <- fmt.Errorf("missing bucket put = %v, want ErrBucketNotFound", err)
+				return
+			}
+			delKey := fmt.Sprintf("del-%02d", i)
+			if err := h.PutManifest(&models.ObjectManifest{Bucket: "batch-bucket", Key: delKey, CreatedAt: now.Unix()}, now); err != nil {
+				errs <- err
+				return
+			}
+			deleted, err := h.DeleteManifests("batch-bucket", []string{delKey}, now)
+			if err != nil {
+				errs <- fmt.Errorf("DeleteManifests %s: %w", delKey, err)
+				return
+			}
+			if !slices.Equal(deleted, []string{delKey}) {
+				errs <- fmt.Errorf("DeleteManifests(%s) returned %v, want single [%s] without duplicates", delKey, deleted, delKey)
+				return
+			}
+
+			verRes, err := h.DeleteObjects("ver-batch", []DeleteObjectSpec{{
+				Key: fmt.Sprintf("vk-%02d", i), DeleteMarkerID: fmt.Sprintf("dm-%02d", i),
+			}}, now)
+			if err != nil {
+				errs <- fmt.Errorf("DeleteObjects %d: %w", i, err)
+				return
+			}
+			if len(verRes) != 1 || verRes[0].VersionID != fmt.Sprintf("dm-%02d", i) {
+				errs <- fmt.Errorf("DeleteObjects(%d) returned %+v", i, verRes)
+				return
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	objects, err := h.ListObjects("batch-bucket", "")
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(objects) != workers {
+		t.Fatalf("remaining objects = %d, want %d", len(objects), workers)
 	}
 }

@@ -537,6 +537,7 @@ type BatchDeleteResult struct {
 func (h *MetadataHandler) DeleteObjects(bucket string, specs []DeleteObjectSpec, now time.Time) ([]BatchDeleteResult, error) {
 	results := make([]BatchDeleteResult, 0, len(specs))
 	err := h.update(func(tx *bbolt.Tx) error {
+		results = results[:0]
 		if _, err := bucketVersioningTx(tx, bucket); err != nil {
 			return err
 		}

@@ -23,6 +23,7 @@ type Config struct {
 	AuditLog                  bool
 	BodyReadTimeoutSeconds    int64
 	GcInterval                time.Duration
+	GcGrace                   time.Duration
 	GcEnabled                 bool
 	MultipartCleanupRetention time.Duration
 	AuthEnabled               bool
@@ -51,7 +52,8 @@ func NewConfig() *Config {
 		LogLevel:             strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_LEVEL")), "info")),
 		LogFormat:            strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("LOG_FORMAT")), strings.TrimSpace(os.Getenv("LOG_TYPE")), "text")),
 		AuditLog:             envBool("AUDIT_LOG", true),
-		GcInterval:           time.Duration(envIntRange("GC_INTERVAL", 10, 1, 60)) * time.Minute,
+		GcInterval:           gcIntervalFromEnv(),
+		GcGrace:              time.Duration(envIntRange("GC_GRACE_SECONDS", 900, 0, 86400)) * time.Second,
 		GcEnabled:            envBool("GC_ENABLED", true),
 		MultipartCleanupRetention: time.Duration(
 			envIntRange("MULTIPART_RETENTION_HOURS", 24, 1, 24*30),
@@ -75,6 +77,15 @@ func NewConfig() *Config {
 
 	return config
 
+}
+
+func gcIntervalFromEnv() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("GC_INTERVAL_SECONDS")); raw != "" {
+		if secs, err := strconv.Atoi(raw); err == nil && secs >= 1 && secs <= 86400 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return time.Duration(envIntRange("GC_INTERVAL", 10, 1, 60)) * time.Minute
 }
 
 func envIntRange(key string, defaultValue, minValue, maxValue int) int {
