@@ -42,7 +42,7 @@ func newBulkListHandler(tb testing.TB, bucket string, manifests []models.ObjectM
 	if err != nil {
 		tb.Fatalf("new metadata handler: %v", err)
 	}
-	if err := md.CreateBucket(bucket); err != nil {
+	if err := md.CreateBucket(bucket, time.Now().UTC()); err != nil {
 		tb.Fatalf("create bucket: %v", err)
 	}
 	if err := md.Close(); err != nil {

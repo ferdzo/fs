@@ -12,19 +12,20 @@ import (
 
 func TestCleanupMultipartUploadsDeletesExpiredPendingUpload(t *testing.T) {
 	h := newTestMetadataHandler(t)
-	if err := h.CreateBucket("test-bucket"); err != nil {
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	if err := h.CreateBucket("test-bucket", now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	upload, err := h.CreateMultipartUpload("test-bucket", "object.txt")
+	upload, err := h.CreateMultipartUpload("test-bucket", "object.txt", "upload-expired", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
-	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, ETag: "etag", Size: 4, Chunks: []string{"chunk-id"}}); err != nil {
+	if err := h.PutMultipartPart(upload.UploadID, models.UploadedPart{PartNumber: 1, ETag: "etag", Size: 4, Chunks: []string{"chunk-id"}}, now); err != nil {
 		t.Fatalf("PutMultipartPart: %v", err)
 	}
-	setMultipartUploadCreatedAt(t, h, upload.UploadID, time.Now().Add(-2*time.Hour))
+	setMultipartUploadCreatedAt(t, h, upload.UploadID, now.Add(-2*time.Hour))
 
-	cleaned, err := h.CleanupMultipartUploads(time.Hour)
+	cleaned, err := h.CleanupMultipartUploads(time.Hour, now)
 	if err != nil {
 		t.Fatalf("CleanupMultipartUploads: %v", err)
 	}
@@ -41,15 +42,16 @@ func TestCleanupMultipartUploadsDeletesExpiredPendingUpload(t *testing.T) {
 
 func TestCleanupMultipartUploadsKeepsRecentPendingUpload(t *testing.T) {
 	h := newTestMetadataHandler(t)
-	if err := h.CreateBucket("test-bucket"); err != nil {
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	if err := h.CreateBucket("test-bucket", now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	upload, err := h.CreateMultipartUpload("test-bucket", "object.txt")
+	upload, err := h.CreateMultipartUpload("test-bucket", "object.txt", "upload-recent", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
 
-	cleaned, err := h.CleanupMultipartUploads(time.Hour)
+	cleaned, err := h.CleanupMultipartUploads(time.Hour, now)
 	if err != nil {
 		t.Fatalf("CleanupMultipartUploads: %v", err)
 	}
@@ -63,7 +65,7 @@ func TestCleanupMultipartUploadsKeepsRecentPendingUpload(t *testing.T) {
 
 func TestCleanupMultipartUploadsDisabledForNonPositiveRetention(t *testing.T) {
 	h := newTestMetadataHandler(t)
-	cleaned, err := h.CleanupMultipartUploads(0)
+	cleaned, err := h.CleanupMultipartUploads(0, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("CleanupMultipartUploads: %v", err)
 	}

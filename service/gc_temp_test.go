@@ -71,7 +71,7 @@ func TestGarbageCollectRemovesStaleTempFilesAndPreservesChunkSweep(t *testing.T)
 	stalePath := writeGCTempFile(t, root, staleName, 2*time.Hour)
 	freshPath := writeGCTempFile(t, root, freshName, 0)
 
-	before, err := svc.blob.ListChunks()
+	before, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks before: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestGarbageCollectRemovesStaleTempFilesAndPreservesChunkSweep(t *testing.T)
 		t.Fatalf("fresh temp file was removed: %v", err)
 	}
 
-	after, err := svc.blob.ListChunks()
+	after, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks after: %v", err)
 	}

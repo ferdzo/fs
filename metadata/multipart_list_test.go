@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"fs/models"
 
@@ -16,15 +17,16 @@ func TestListMultipartUploadsBackfillsKeyIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMetadataHandler: %v", err)
 	}
+	now := time.Now().UTC()
 	const bucket = "backfill-bucket"
-	if err := handler.CreateBucket(bucket); err != nil {
+	if err := handler.CreateBucket(bucket, now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	first, err := handler.CreateMultipartUpload(bucket, "a/one.bin")
+	first, err := handler.CreateMultipartUpload(bucket, "a/one.bin", "upload-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload first: %v", err)
 	}
-	second, err := handler.CreateMultipartUpload(bucket, "a/two.bin")
+	second, err := handler.CreateMultipartUpload(bucket, "a/two.bin", "upload-2", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload second: %v", err)
 	}
@@ -65,7 +67,7 @@ func TestListMultipartUploadsOrdersByInitiationThenUploadID(t *testing.T) {
 	}
 	defer handler.Close()
 	const bucket = "order-bucket"
-	if err := handler.CreateBucket(bucket); err != nil {
+	if err := handler.CreateBucket(bucket, time.Now().UTC()); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 

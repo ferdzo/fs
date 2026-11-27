@@ -96,14 +96,14 @@ func TestGCSweepsUnreferencedChunks(t *testing.T) {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	before, err := svc.blob.ListChunks()
+	before, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks: %v", err)
 	}
 	if err := svc.GarbageCollect(); err != nil {
 		t.Fatalf("GarbageCollect: %v", err)
 	}
-	after, err := svc.blob.ListChunks()
+	after, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks after: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestFailedIngestEnqueuesOrphanChunksForGC(t *testing.T) {
 	if _, err := svc.PutObject("no-such-bucket", "k", "text/plain", strings.NewReader("orphan-on-fail")); err == nil {
 		t.Fatal("expected PutObject into missing bucket to fail")
 	}
-	chunksBefore, err := svc.blob.ListChunks()
+	chunksBefore, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks before: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestFailedIngestEnqueuesOrphanChunksForGC(t *testing.T) {
 	if err := svc.GarbageCollect(); err != nil {
 		t.Fatalf("GarbageCollect: %v", err)
 	}
-	chunksAfter, err := svc.blob.ListChunks()
+	chunksAfter, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks after: %v", err)
 	}

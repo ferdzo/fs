@@ -77,7 +77,7 @@ func TestGarbageCollectRemovesExpiredPendingMultipartChunks(t *testing.T) {
 	if _, err := svc.UploadPart("test-bucket", "object.txt", upload.UploadID, 1, strings.NewReader("part-data")); err != nil {
 		t.Fatalf("UploadPart: %v", err)
 	}
-	chunks, err := svc.blob.ListChunks()
+	chunks, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks before GC: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestGarbageCollectRemovesExpiredPendingMultipartChunks(t *testing.T) {
 	if _, err := svc.metadata.GetMultipartUpload(upload.UploadID); !errors.Is(err, metadata.ErrMultipartNotFound) {
 		t.Fatalf("GetMultipartUpload error = %v, want ErrMultipartNotFound", err)
 	}
-	chunks, err = svc.blob.ListChunks()
+	chunks, err = listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks after GC: %v", err)
 	}

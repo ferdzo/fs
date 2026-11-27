@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"fs/models"
 
@@ -21,8 +22,9 @@ func TestForEachObjectKeyFromIsLazyAndStopsNormally(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Close() })
 
+	now := time.Now().UTC()
 	const bucket = "lazy-bucket"
-	if err := h.CreateBucket(bucket); err != nil {
+	if err := h.CreateBucket(bucket, now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 	for _, key := range []string{"a", "b", "c", "d"} {
@@ -31,7 +33,7 @@ func TestForEachObjectKeyFromIsLazyAndStopsNormally(t *testing.T) {
 			Key:    key,
 			ETag:   "etag-" + key,
 			Size:   int64(len(key)),
-		}); err != nil {
+		}, now); err != nil {
 			t.Fatalf("PutManifest(%q): %v", key, err)
 		}
 	}
@@ -154,12 +156,13 @@ func TestForEachObjectKeyFromRecordsStopAsSuccess(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Close() })
 
+	now := time.Now().UTC()
 	const bucket = "metrics-bucket"
-	if err := h.CreateBucket(bucket); err != nil {
+	if err := h.CreateBucket(bucket, now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 	for _, key := range []string{"a", "b", "c"} {
-		if err := h.PutManifest(&models.ObjectManifest{Bucket: bucket, Key: key}); err != nil {
+		if err := h.PutManifest(&models.ObjectManifest{Bucket: bucket, Key: key}, now); err != nil {
 			t.Fatalf("PutManifest(%q): %v", key, err)
 		}
 	}
@@ -203,12 +206,13 @@ func TestForEachObjectKeyFromSkipPrefixAndSuccessor(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Close() })
 
+	now := time.Now().UTC()
 	const bucket = "skip-bucket"
-	if err := h.CreateBucket(bucket); err != nil {
+	if err := h.CreateBucket(bucket, now); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 	for _, key := range []string{"a/1", "a/2", "a/99", "b/1", "c"} {
-		if err := h.PutManifest(&models.ObjectManifest{Bucket: bucket, Key: key}); err != nil {
+		if err := h.PutManifest(&models.ObjectManifest{Bucket: bucket, Key: key}, now); err != nil {
 			t.Fatalf("PutManifest(%q): %v", key, err)
 		}
 	}

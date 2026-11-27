@@ -134,7 +134,7 @@ func BenchmarkListObjects(b *testing.B) {
 					ETag:        fmt.Sprintf("%032x", i+1),
 					CreatedAt:   time.Now().Unix(),
 				}
-				if err := svc.metadata.PutManifest(manifest); err != nil {
+				if err := svc.metadata.(*metadata.MetadataHandler).PutManifest(manifest, time.Now().UTC()); err != nil {
 					b.Fatalf("seed manifest %d: %v", i, err)
 				}
 			}
@@ -194,7 +194,7 @@ func BenchmarkCompleteMultipartUpload(b *testing.B) {
 				Size:       size,
 				CreatedAt:  time.Now().Unix(),
 			}
-			if err := svc.metadata.PutMultipartPart(upload.UploadID, part); err != nil {
+			if err := svc.metadata.PutMultipartPart(upload.UploadID, part, time.Now().UTC()); err != nil {
 				b.Fatalf("PutMultipartPart: %v", err)
 			}
 		}

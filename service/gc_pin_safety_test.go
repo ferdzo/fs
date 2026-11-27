@@ -121,7 +121,7 @@ func TestGarbageCollectCompletesWithUnreadMultiChunkStream(t *testing.T) {
 	if err := svc.GarbageCollect(); err != nil {
 		t.Fatalf("GarbageCollect after close: %v", err)
 	}
-	chunks, err := svc.blob.ListChunks()
+	chunks, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks: %v", err)
 	}

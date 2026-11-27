@@ -290,7 +290,7 @@ func TestGetObjectRangePinnedChunksSurviveGC(t *testing.T) {
 	if err := svc.GarbageCollect(); err != nil {
 		t.Fatalf("GarbageCollect after close: %v", err)
 	}
-	remaining, err := svc.blob.ListChunks()
+	remaining, err := listTestChunks(t, svc.blob)
 	if err != nil {
 		t.Fatalf("ListChunks: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestGetObjectRangeLegacyManifestFallsBack(t *testing.T) {
 	// Simulate an object persisted before per-chunk sizes existed.
 	legacy := *manifest
 	legacy.ChunkSizes = nil
-	if err := svc.metadata.PutManifest(&legacy); err != nil {
+	if err := svc.metadata.(*metadata.MetadataHandler).PutManifest(&legacy, time.Now().UTC()); err != nil {
 		t.Fatalf("PutManifest legacy: %v", err)
 	}
 	head, err := svc.HeadObject(bucket, "legacy.bin")
@@ -529,7 +529,7 @@ func TestCompleteMultipartUploadLegacyPartFallsBack(t *testing.T) {
 	}
 	for i := range parts {
 		parts[i].ChunkSizes = nil
-		if err := svc.metadata.PutMultipartPart(upload.UploadID, parts[i]); err != nil {
+		if err := svc.metadata.PutMultipartPart(upload.UploadID, parts[i], time.Now().UTC()); err != nil {
 			t.Fatalf("PutMultipartPart %d: %v", i+1, err)
 		}
 	}

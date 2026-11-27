@@ -5,7 +5,10 @@ import (
 	"fs/metadata"
 	"fs/metrics"
 	"fs/models"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ErrDeleteMarker reports that a version resolves to a delete marker.
@@ -63,7 +66,14 @@ func (s *ObjectService) DeleteObjectsVersioned(bucket string, specs []metadata.D
 		metrics.Default.ObserveService("delete_objects", time.Since(start), success)
 	}()
 
-	results, err := s.metadata.DeleteObjects(bucket, specs)
+	prepared := make([]metadata.DeleteObjectSpec, len(specs))
+	copy(prepared, specs)
+	for i := range prepared {
+		if strings.TrimSpace(prepared[i].VersionID) == "" && strings.TrimSpace(prepared[i].DeleteMarkerID) == "" {
+			prepared[i].DeleteMarkerID = uuid.NewString()
+		}
+	}
+	results, err := s.metadata.DeleteObjects(bucket, prepared, time.Now().UTC())
 	success = err == nil
 	return results, err
 }

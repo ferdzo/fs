@@ -18,11 +18,12 @@ func TestChunkRefCountsAndGCQueueLifecycle(t *testing.T) {
 		t.Fatalf("SetBucketVersioning: %v", err)
 	}
 
+	now := time.Now().UTC()
 	// Duplicate chunk inside a single manifest counts twice; shared chunk across
 	// objects counts independently.
 	if err := h.PutManifest(&models.ObjectManifest{
 		Bucket: "unver", Key: "k1", Chunks: []string{"c1", "c1", "c2"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutManifest k1: %v", err)
 	}
 	assertRefCount(t, h, "c1", 2)
@@ -32,7 +33,7 @@ func TestChunkRefCountsAndGCQueueLifecycle(t *testing.T) {
 	// from 2 to 1; c3 rises to 1.
 	if err := h.PutManifest(&models.ObjectManifest{
 		Bucket: "unver", Key: "k1", Chunks: []string{"c1", "c3"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutManifest overwrite: %v", err)
 	}
 	assertRefCount(t, h, "c1", 1)
@@ -43,14 +44,14 @@ func TestChunkRefCountsAndGCQueueLifecycle(t *testing.T) {
 	// Reviving c2 removes it from the GC queue immediately.
 	if err := h.PutManifest(&models.ObjectManifest{
 		Bucket: "unver", Key: "k2", Chunks: []string{"c2"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutManifest revive: %v", err)
 	}
 	assertRefCount(t, h, "c2", 1)
 	assertGCQueueContains(t, h, "c2", false)
 
 	// Deleting unversioned object enqueues its chunks.
-	if err := h.DeleteManifest("unver", "k2"); err != nil {
+	if err := h.DeleteManifest("unver", "k2", now); err != nil {
 		t.Fatalf("DeleteManifest k2: %v", err)
 	}
 	assertRefCount(t, h, "c2", 0)
@@ -64,40 +65,40 @@ func TestChunkRefCountsAndGCQueueLifecycle(t *testing.T) {
 	assertRefCount(t, h, "vc2", 1)
 
 	// Soft delete creates a delete marker and preserves both versions.
-	if _, err := h.DeleteObject("ver", "vk", ""); err != nil {
+	if _, err := h.DeleteObject("ver", "vk", "", "dm-vk-1", now); err != nil {
 		t.Fatalf("soft delete: %v", err)
 	}
 	assertRefCount(t, h, "vc1", 1)
 	assertRefCount(t, h, "vc2", 1)
 
-	if _, err := h.DeleteObject("ver", "vk", v1); err != nil {
+	if _, err := h.DeleteObject("ver", "vk", v1, "", now); err != nil {
 		t.Fatalf("delete v1: %v", err)
 	}
 	assertRefCount(t, h, "vc1", 0)
 	assertRefCount(t, h, "vc2", 1)
 	assertGCQueueContains(t, h, "vc1", true)
 
-	if _, err := h.DeleteObject("ver", "vk", v2); err != nil {
+	if _, err := h.DeleteObject("ver", "vk", v2, "", now); err != nil {
 		t.Fatalf("delete v2: %v", err)
 	}
 	assertRefCount(t, h, "vc2", 0)
 	assertGCQueueContains(t, h, "vc2", true)
 
 	// Multipart upload part overwrite, completion, and abort.
-	up, err := h.CreateMultipartUpload("unver", "mp")
+	up, err := h.CreateMultipartUpload("unver", "mp", "up-mp-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
 	if err := h.PutMultipartPart(up.UploadID, models.UploadedPart{
 		PartNumber: 1, ETag: "e1", Size: 5, Chunks: []string{"mp-old"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutMultipartPart old: %v", err)
 	}
 	assertRefCount(t, h, "mp-old", 1)
 
 	if err := h.PutMultipartPart(up.UploadID, models.UploadedPart{
 		PartNumber: 1, ETag: "e2", Size: 5, Chunks: []string{"mp-new"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutMultipartPart overwrite: %v", err)
 	}
 	assertRefCount(t, h, "mp-old", 0)
@@ -106,22 +107,22 @@ func TestChunkRefCountsAndGCQueueLifecycle(t *testing.T) {
 
 	if err := h.CompleteMultipartUpload(up.UploadID, &models.ObjectManifest{
 		Size: 5, ETag: "e2-1", Chunks: []string{"mp-new"},
-	}); err != nil {
+	}, "", now); err != nil {
 		t.Fatalf("CompleteMultipartUpload: %v", err)
 	}
 	assertRefCount(t, h, "mp-new", 1)
 
-	upAbort, err := h.CreateMultipartUpload("unver", "mp-abort")
+	upAbort, err := h.CreateMultipartUpload("unver", "mp-abort", "up-abort-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload abort: %v", err)
 	}
 	if err := h.PutMultipartPart(upAbort.UploadID, models.UploadedPart{
 		PartNumber: 1, ETag: "ea", Size: 5, Chunks: []string{"mp-aborted"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutMultipartPart abort: %v", err)
 	}
 	assertRefCount(t, h, "mp-aborted", 1)
-	if err := h.AbortMultipartUpload(upAbort.UploadID); err != nil {
+	if err := h.AbortMultipartUpload(upAbort.UploadID, now); err != nil {
 		t.Fatalf("AbortMultipartUpload: %v", err)
 	}
 	assertRefCount(t, h, "mp-aborted", 0)
@@ -149,13 +150,14 @@ func TestChunkRefBackfillOnReopenAvoidsDoubleCountingVersionedLatest(t *testing.
 	mustPutManifest(t, h, versionedObject("legacy", "k", "el", "chunk-legacy"))
 	mustPutVersion(t, h, versionedObject("versioned", "k", "ev1", "chunk-v1"))
 	mustPutVersion(t, h, versionedObject("versioned", "k", "ev2", "chunk-v2"))
-	up, err := h.CreateMultipartUpload("legacy", "mp")
+	now := time.Now().UTC()
+	up, err := h.CreateMultipartUpload("legacy", "mp", "up-backfill-1", "", now)
 	if err != nil {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
 	if err := h.PutMultipartPart(up.UploadID, models.UploadedPart{
 		PartNumber: 1, ETag: "ep", Size: 4, Chunks: []string{"chunk-mp"},
-	}); err != nil {
+	}, now); err != nil {
 		t.Fatalf("PutMultipartPart: %v", err)
 	}
 	if err := h.Close(); err != nil {

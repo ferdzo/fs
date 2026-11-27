@@ -17,11 +17,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type ObjectService struct {
-	metadata           *metadata.MetadataHandler
-	blob               *storage.BlobStore
+	metadata           MetadataStore
+	blob               ChunkStore
 	multipartRetention time.Duration
 	maxUploadSize      int64
 	chunkPins          *chunkPinRegistry
@@ -58,7 +60,7 @@ var errRangeChunkMismatch = errors.New("range chunk mapping mismatch")
 
 const DefaultMaxUploadSize int64 = 5 * 1024 * 1024 * 1024
 
-func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *storage.BlobStore, multipartRetention time.Duration, maxUploadSize ...int64) *ObjectService {
+func NewObjectService(metadataStore MetadataStore, chunkStore ChunkStore, multipartRetention time.Duration, maxUploadSize ...int64) *ObjectService {
 	if multipartRetention <= 0 {
 		multipartRetention = 24 * time.Hour
 	}
@@ -67,8 +69,8 @@ func NewObjectService(metadataHandler *metadata.MetadataHandler, blobHandler *st
 		limit = maxUploadSize[0]
 	}
 	return &ObjectService{
-		metadata:           metadataHandler,
-		blob:               blobHandler,
+		metadata:           metadataStore,
+		blob:               chunkStore,
 		multipartRetention: multipartRetention,
 		maxUploadSize:      limit,
 		chunkPins:          newChunkPinRegistry(),
@@ -243,11 +245,11 @@ func (s *ObjectService) PutObjectConditional(bucket, key, contentType, ifNoneMat
 	})
 	if err != nil {
 		if len(ingested) > 0 {
-			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested, time.Now().UTC())
 		}
 		return nil, err
 	}
-	timestamp := time.Now().Unix()
+	now := time.Now().UTC()
 
 	manifest := &models.ObjectManifest{
 		Bucket:      bucket,
@@ -257,7 +259,7 @@ func (s *ObjectService) PutObjectConditional(bucket, key, contentType, ifNoneMat
 		ETag:        etag,
 		Chunks:      chunks,
 		ChunkSizes:  chunkSizes,
-		CreatedAt:   timestamp,
+		CreatedAt:   now.Unix(),
 	}
 	slog.Debug("object_written_manifest",
 		"bucket", manifest.Bucket,
@@ -266,9 +268,9 @@ func (s *ObjectService) PutObjectConditional(bucket, key, contentType, ifNoneMat
 		"chunk_count", len(manifest.Chunks),
 		"etag", manifest.ETag,
 	)
-	if _, err = s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch); err != nil {
+	if _, err = s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch, uuid.NewString(), now); err != nil {
 		if len(ingested) > 0 {
-			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested, time.Now().UTC())
 		}
 		return nil, err
 	}
@@ -311,6 +313,7 @@ func (s *ObjectService) CopyObjectVersionConditional(srcBucket, srcKey, srcVersi
 		s.testHookCopyAfterPin()
 	}
 
+	now := time.Now().UTC()
 	manifest := &models.ObjectManifest{
 		Bucket:      dstBucket,
 		Key:         dstKey,
@@ -319,9 +322,9 @@ func (s *ObjectService) CopyObjectVersionConditional(srcBucket, srcKey, srcVersi
 		ETag:        source.ETag,
 		Chunks:      append([]string(nil), source.Chunks...),
 		ChunkSizes:  append([]int64(nil), source.ChunkSizes...),
-		CreatedAt:   time.Now().Unix(),
+		CreatedAt:   now.Unix(),
 	}
-	if _, err := s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch); err != nil {
+	if _, err := s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch, uuid.NewString(), now); err != nil {
 		return nil, err
 	}
 
@@ -722,7 +725,11 @@ func (s *ObjectService) DeleteObjectVersion(bucket, key, versionID string) (meta
 		metrics.Default.ObserveService("delete_object", time.Since(start), success)
 	}()
 
-	result, err := s.metadata.DeleteObject(bucket, key, versionID)
+	markerID := ""
+	if versionID == "" {
+		markerID = uuid.NewString()
+	}
+	result, err := s.metadata.DeleteObject(bucket, key, versionID, markerID, time.Now().UTC())
 	success = err == nil
 	return result, err
 }
@@ -769,7 +776,7 @@ func (s *ObjectService) CreateBucket(bucket string) error {
 		metrics.Default.ObserveService("create_bucket", time.Since(start), success)
 	}()
 
-	err := s.metadata.CreateBucket(bucket)
+	err := s.metadata.CreateBucket(bucket, time.Now().UTC())
 	success = err == nil
 	return err
 }
@@ -802,11 +809,15 @@ func (s *ObjectService) ListBuckets() ([]string, error) {
 }
 
 func (s *ObjectService) DeleteObjects(bucket string, keys []string) ([]string, error) {
-	return s.metadata.DeleteManifests(bucket, keys)
+	return s.metadata.DeleteManifests(bucket, keys, time.Now().UTC())
 }
 
 func (s *ObjectService) CreateMultipartUpload(bucket, key string, contentType ...string) (*models.MultipartUpload, error) {
-	return s.metadata.CreateMultipartUpload(bucket, key, contentType...)
+	ct := ""
+	if len(contentType) > 0 {
+		ct = contentType[0]
+	}
+	return s.metadata.CreateMultipartUpload(bucket, key, uuid.NewString(), ct, time.Now().UTC())
 }
 
 // pendingMultipartUpload resolves an upload that can still be mutated. Aborted
@@ -861,22 +872,23 @@ func (s *ObjectService) UploadPart(bucket, key, uploadId string, partNumber int,
 	})
 	if err != nil {
 		if len(ingested) > 0 {
-			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested, time.Now().UTC())
 		}
 		return "", err
 	}
+	now := time.Now().UTC()
 	uploadedPart = models.UploadedPart{
 		PartNumber: partNumber,
 		ETag:       etag,
 		Size:       totalSize,
 		Chunks:     chunkIds,
 		ChunkSizes: chunkSizes,
-		CreatedAt:  time.Now().Unix(),
+		CreatedAt:  now.Unix(),
 	}
-	err = s.metadata.PutMultipartPart(uploadId, uploadedPart)
+	err = s.metadata.PutMultipartPart(uploadId, uploadedPart, now)
 	if err != nil {
 		if len(ingested) > 0 {
-			_ = s.metadata.EnqueueUnreferencedChunks(ingested)
+			_ = s.metadata.EnqueueUnreferencedChunks(ingested, time.Now().UTC())
 		}
 		return "", multipartLifecycleError(err)
 	}
@@ -992,6 +1004,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	now := time.Now().UTC()
 	manifest := &models.ObjectManifest{
 		Bucket:      bucket,
 		Key:         key,
@@ -999,7 +1012,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		ContentType: contentType,
 		ETag:        finalETag,
 		Chunks:      chunks,
-		CreatedAt:   time.Now().Unix(),
+		CreatedAt:   now.Unix(),
 	}
 	if layoutComplete && len(chunkSizes) == len(chunks) {
 		if layoutSize, ok := chunkLayoutSize(chunkSizes, totalSize); ok && layoutSize == totalSize {
@@ -1007,7 +1020,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		}
 	}
 
-	if err := s.metadata.CompleteMultipartUpload(uploadID, manifest); err != nil {
+	if err := s.metadata.CompleteMultipartUpload(uploadID, manifest, uuid.NewString(), now); err != nil {
 		return nil, multipartLifecycleError(err)
 	}
 
@@ -1019,7 +1032,7 @@ func (s *ObjectService) AbortMultipartUpload(bucket, key, uploadID string) error
 	if _, err := s.pendingMultipartUpload(bucket, key, uploadID); err != nil {
 		return err
 	}
-	if err := s.metadata.AbortMultipartUpload(uploadID); err != nil {
+	if err := s.metadata.AbortMultipartUpload(uploadID, time.Now().UTC()); err != nil {
 		return multipartLifecycleError(err)
 	}
 	return nil
@@ -1103,7 +1116,7 @@ func (s *ObjectService) GarbageCollect() error {
 	defer s.gcRunMu.Unlock()
 
 	var err error
-	if cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention); err != nil {
+	if cleanedUploads, err = s.metadata.CleanupMultipartUploads(s.multipartRetention, time.Now().UTC()); err != nil {
 		return err
 	}
 
