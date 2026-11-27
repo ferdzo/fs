@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestAdminCreateListGetUser(t *testing.T) {
@@ -239,6 +240,64 @@ func TestListUsersCursorPaginatesWithoutGaps(t *testing.T) {
 	}
 	if pages != 3 {
 		t.Fatalf("pages = %d, want 3", pages)
+	}
+}
+
+func TestAtomicAuthUserMutationsAndBootstrapPreservesCreatedAt(t *testing.T) {
+	meta, svc := newTestAuthService(t)
+
+	if err := svc.EnsureBootstrap(); err != nil {
+		t.Fatalf("first EnsureBootstrap: %v", err)
+	}
+	firstRoot, err := meta.GetAuthIdentity("root-user")
+	if err != nil {
+		t.Fatalf("GetAuthIdentity root: %v", err)
+	}
+
+	// Re-running EnsureBootstrap updates UpdatedAt while preserving CreatedAt.
+	svc.now = func() time.Time { return time.Unix(firstRoot.CreatedAt+100, 0).UTC() }
+	if err := svc.EnsureBootstrap(); err != nil {
+		t.Fatalf("second EnsureBootstrap: %v", err)
+	}
+	secondRoot, err := meta.GetAuthIdentity("root-user")
+	if err != nil {
+		t.Fatalf("GetAuthIdentity root after rerun: %v", err)
+	}
+	if secondRoot.CreatedAt != firstRoot.CreatedAt {
+		t.Fatalf("CreatedAt changed across EnsureBootstrap: got %d, want %d", secondRoot.CreatedAt, firstRoot.CreatedAt)
+	}
+	if secondRoot.UpdatedAt != firstRoot.CreatedAt+100 {
+		t.Fatalf("UpdatedAt = %d, want %d", secondRoot.UpdatedAt, firstRoot.CreatedAt+100)
+	}
+
+	// SetUserPolicy on missing user returns ErrUserNotFound, DeleteUser removes
+	// both identity and policy atomically.
+	if _, err := svc.SetUserPolicy("missing-user", models.AuthPolicy{
+		Statements: []models.AuthPolicyStatement{{Effect: "allow", Actions: []string{"s3:*"}, Bucket: "*", Prefix: "*"}},
+	}); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("SetUserPolicy missing = %v, want ErrUserNotFound", err)
+	}
+	if err := svc.DeleteUser("missing-user"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("DeleteUser missing = %v, want ErrUserNotFound", err)
+	}
+
+	if _, err := svc.CreateUser(CreateUserInput{
+		AccessKeyID: "atomic-user",
+		SecretKey:   "atomic-secret-1",
+		Policy: models.AuthPolicy{
+			Statements: []models.AuthPolicyStatement{{Effect: "allow", Actions: []string{"s3:GetObject"}, Bucket: "*", Prefix: "*"}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := svc.DeleteUser("atomic-user"); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if _, err := meta.GetAuthIdentity("atomic-user"); !errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+		t.Fatalf("identity survived DeleteUser: %v", err)
+	}
+	if _, err := meta.GetAuthPolicy("atomic-user"); !errors.Is(err, metadata.ErrAuthPolicyNotFound) {
+		t.Fatalf("policy survived DeleteUser: %v", err)
 	}
 }
 

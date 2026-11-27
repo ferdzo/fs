@@ -23,6 +23,10 @@ type Store interface {
 	GetAuthPolicy(accessKeyID string) (*models.AuthPolicy, error)
 	PutAuthPolicy(policy *models.AuthPolicy) error
 	DeleteAuthPolicy(accessKeyID string) error
+	CreateAuthUser(identity *models.AuthIdentity, policy *models.AuthPolicy) error
+	UpsertAuthUser(identity *models.AuthIdentity, policy *models.AuthPolicy) error
+	UpdateAuthUserPolicy(accessKeyID string, policy *models.AuthPolicy, updatedAt int64) (*models.AuthIdentity, error)
+	DeleteAuthUser(accessKeyID string) error
 }
 
 type CreateUserInput struct {
@@ -130,12 +134,6 @@ func (s *Service) EnsureBootstrap() error {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
-	if existing, err := s.store.GetAuthIdentity(accessKey); err == nil && existing != nil {
-		identity.CreatedAt = existing.CreatedAt
-	}
-	if err := s.store.PutAuthIdentity(identity); err != nil {
-		return err
-	}
 
 	policy := defaultBootstrapPolicy(accessKey)
 	if strings.TrimSpace(s.cfg.BootstrapPolicy) != "" {
@@ -146,7 +144,7 @@ func (s *Service) EnsureBootstrap() error {
 		policy = parsed
 		policy.Principal = accessKey
 	}
-	return s.store.PutAuthPolicy(policy)
+	return s.store.UpsertAuthUser(identity, policy)
 }
 
 func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
@@ -427,14 +425,6 @@ func (s *Service) CreateUser(input CreateUserInput) (*CreateUserResult, error) {
 		return nil, err
 	}
 
-	existing, err := s.store.GetAuthIdentity(accessKeyID)
-	if err == nil && existing != nil {
-		return nil, ErrUserAlreadyExists
-	}
-	if err != nil && !errors.Is(err, metadata.ErrAuthIdentityNotFound) {
-		return nil, err
-	}
-
 	now := s.now().Unix()
 	ciphertext, nonce, err := encryptSecret(s.masterKey, accessKeyID, secretKey)
 	if err != nil {
@@ -450,10 +440,10 @@ func (s *Service) CreateUser(input CreateUserInput) (*CreateUserResult, error) {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
-	if err := s.store.PutAuthIdentity(identity); err != nil {
-		return nil, err
-	}
-	if err := s.store.PutAuthPolicy(&policy); err != nil {
+	if err := s.store.CreateAuthUser(identity, &policy); err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityAlreadyExists) {
+			return nil, ErrUserAlreadyExists
+		}
 		return nil, err
 	}
 
@@ -543,21 +533,10 @@ func (s *Service) DeleteUser(accessKeyID string) error {
 		return fmt.Errorf("%w: bootstrap user cannot be deleted", ErrInvalidUserInput)
 	}
 
-	if _, err := s.store.GetAuthIdentity(accessKeyID); err != nil {
+	if err := s.store.DeleteAuthUser(accessKeyID); err != nil {
 		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
 			return ErrUserNotFound
 		}
-		return err
-	}
-
-	if err := s.store.DeleteAuthIdentity(accessKeyID); err != nil {
-		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
-			return ErrUserNotFound
-		}
-		return err
-	}
-
-	if err := s.store.DeleteAuthPolicy(accessKeyID); err != nil && !errors.Is(err, metadata.ErrAuthPolicyNotFound) {
 		return err
 	}
 	return nil
@@ -572,24 +551,15 @@ func (s *Service) SetUserPolicy(accessKeyID string, policy models.AuthPolicy) (*
 		return nil, fmt.Errorf("%w: invalid access key id", ErrInvalidUserInput)
 	}
 
-	identity, err := s.store.GetAuthIdentity(accessKeyID)
-	if err != nil {
-		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
-			return nil, ErrUserNotFound
-		}
-		return nil, err
-	}
-
 	normalizedPolicy, err := normalizePolicy(policy, accessKeyID)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.PutAuthPolicy(&normalizedPolicy); err != nil {
-		return nil, err
-	}
-
-	identity.UpdatedAt = s.now().Unix()
-	if err := s.store.PutAuthIdentity(identity); err != nil {
+	identity, err := s.store.UpdateAuthUserPolicy(accessKeyID, &normalizedPolicy, s.now().Unix())
+	if err != nil {
+		if errors.Is(err, metadata.ErrAuthIdentityNotFound) {
+			return nil, ErrUserNotFound
+		}
 		return nil, err
 	}
 

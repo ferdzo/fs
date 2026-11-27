@@ -695,3 +695,57 @@ func TestMultipartLifecycleListMultipartUploads(t *testing.T) {
 		t.Fatalf("Initiated = %q, want RFC3339: %v", upload.Initiated, err)
 	}
 }
+
+func TestMultipartPreservesInitiateContentType(t *testing.T) {
+	handler, svc := newTestObjectHandler(t)
+	const bucket = "test-bucket"
+	if err := svc.CreateBucket(bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/"+bucket+"/img.png?uploads", nil)
+	req.Header.Set("Content-Type", "image/png")
+	rec := httptest.NewRecorder()
+	handler.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initiate status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var initRes models.InitiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("unmarshal initiate: %v", err)
+	}
+
+	etag := multipartLifeUploadPart(t, handler, bucket, "img.png", initRes.UploadID, 1, []byte("png-bytes"))
+	compRec := multipartLifeComplete(t, handler, bucket, "img.png", initRes.UploadID, []models.CompletedPart{
+		{PartNumber: 1, ETag: `"` + etag + `"`},
+	})
+	if compRec.Code != http.StatusOK {
+		t.Fatalf("complete status = %d body=%s", compRec.Code, compRec.Body.String())
+	}
+
+	headRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(headRec, httptest.NewRequest(http.MethodHead, "/"+bucket+"/img.png", nil))
+	if headRec.Code != http.StatusOK || headRec.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("HEAD Content-Type = %q (status %d), want image/png", headRec.Header().Get("Content-Type"), headRec.Code)
+	}
+
+	getRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/"+bucket+"/img.png", nil))
+	if getRec.Code != http.StatusOK || getRec.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("GET Content-Type = %q (status %d), want image/png", getRec.Header().Get("Content-Type"), getRec.Code)
+	}
+
+	// When Content-Type is omitted at initiate, default remains application/octet-stream.
+	defaultUploadID := multipartLifeInit(t, handler, bucket, "raw.bin")
+	defaultETag := multipartLifeUploadPart(t, handler, bucket, "raw.bin", defaultUploadID, 1, []byte("raw"))
+	if rec := multipartLifeComplete(t, handler, bucket, "raw.bin", defaultUploadID, []models.CompletedPart{
+		{PartNumber: 1, ETag: `"` + defaultETag + `"`},
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("default complete status = %d", rec.Code)
+	}
+	rawHead := httptest.NewRecorder()
+	handler.router.ServeHTTP(rawHead, httptest.NewRequest(http.MethodHead, "/"+bucket+"/raw.bin", nil))
+	if rawHead.Header().Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("default Content-Type = %q, want application/octet-stream", rawHead.Header().Get("Content-Type"))
+	}
+}

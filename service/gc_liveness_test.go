@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -107,5 +109,54 @@ func TestGCSweepsUnreferencedChunks(t *testing.T) {
 	}
 	if len(after) >= len(before) {
 		t.Fatalf("orphan not swept: before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestFailedIngestEnqueuesOrphanChunksForGC(t *testing.T) {
+	svc := newTestObjectService(t, 0)
+	svc.gcGrace = time.Nanosecond
+	if err := svc.CreateBucket("test-bucket"); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	// PutObject into a nonexistent bucket fails at metadata commit after writing
+	// chunks to disk; those chunks must be enqueued and swept by GC.
+	if _, err := svc.PutObject("no-such-bucket", "k", "text/plain", strings.NewReader("orphan-on-fail")); err == nil {
+		t.Fatal("expected PutObject into missing bucket to fail")
+	}
+	chunksBefore, err := svc.blob.ListChunks()
+	if err != nil {
+		t.Fatalf("ListChunks before: %v", err)
+	}
+	if len(chunksBefore) == 0 {
+		t.Fatal("expected orphan chunk written before metadata failure")
+	}
+
+	if err := svc.GarbageCollect(); err != nil {
+		t.Fatalf("GarbageCollect: %v", err)
+	}
+	chunksAfter, err := svc.blob.ListChunks()
+	if err != nil {
+		t.Fatalf("ListChunks after: %v", err)
+	}
+	if len(chunksAfter) != 0 {
+		t.Fatalf("orphan chunks after GC = %d, want 0", len(chunksAfter))
+	}
+}
+
+func TestCloseWaitsForActiveRunGC(t *testing.T) {
+	svc := newTestObjectService(t, 0)
+	if err := svc.CreateBucket("test-bucket"); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go svc.RunGC(ctx, 5*time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+
+	if err := svc.Close(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close: %v", err)
 	}
 }

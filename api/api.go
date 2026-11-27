@@ -396,7 +396,8 @@ func (h *Handler) handlePostObject(w http.ResponseWriter, r *http.Request) {
 			writeMappedS3Error(w, r, err)
 			return
 		}
-		upload, err := h.svc.CreateMultipartUpload(bucket, key)
+		contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
+		upload, err := h.svc.CreateMultipartUpload(bucket, key, contentType)
 		if err != nil {
 			writeMappedS3Error(w, r, err)
 			return
@@ -1171,7 +1172,9 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 
 type limitedListener struct {
 	net.Listener
-	slots chan struct{}
+	slots     chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func newLimitedListener(inner net.Listener, maxConns int) net.Listener {
@@ -1182,17 +1185,32 @@ func newLimitedListener(inner net.Listener, maxConns int) net.Listener {
 	return &limitedListener{
 		Listener: inner,
 		slots:    make(chan struct{}, maxConns),
+		closed:   make(chan struct{}),
 	}
+}
+
+func (l *limitedListener) Close() error {
+	l.closeOnce.Do(func() {
+		close(l.closed)
+	})
+	return l.Listener.Close()
 }
 
 func (l *limitedListener) Accept() (net.Conn, error) {
 	select {
+	case <-l.closed:
+		return nil, net.ErrClosed
 	case l.slots <- struct{}{}:
 	default:
 		metrics.Default.IncConnectionPoolWait()
 		metrics.Default.IncRequestQueueLength()
-		l.slots <- struct{}{}
-		metrics.Default.DecRequestQueueLength()
+		select {
+		case l.slots <- struct{}{}:
+			metrics.Default.DecRequestQueueLength()
+		case <-l.closed:
+			metrics.Default.DecRequestQueueLength()
+			return nil, net.ErrClosed
+		}
 	}
 	conn, err := l.Listener.Accept()
 	if err != nil {
@@ -1282,6 +1300,10 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if query.Has("location") {
+		if err := h.svc.HeadBucket(bucket); err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
 		region := "us-east-1"
 		if h.authSvc != nil {
 			candidate := strings.TrimSpace(h.authSvc.Config().Region)
@@ -1289,13 +1311,25 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request) {
 				region = candidate
 			}
 		}
-		xmlResponse := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s</LocationConstraint>`, region)
+		type locationConstraint struct {
+			XMLName xml.Name `xml:"LocationConstraint"`
+			Xmlns   string   `xml:"xmlns,attr"`
+			Region  string   `xml:",chardata"`
+		}
+		payload, err := xml.Marshal(locationConstraint{
+			Xmlns:  "http://s3.amazonaws.com/doc/2006-03-01/",
+			Region: region,
+		})
+		if err != nil {
+			writeMappedS3Error(w, r, err)
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-		w.Header().Set("Content-Length", strconv.Itoa(len(xmlResponse)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(payload)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(xmlResponse))
+		_, _ = w.Write([]byte(xml.Header))
+		_, _ = w.Write(payload)
 		return
 	}
 
@@ -1537,10 +1571,10 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 				if idx := strings.Index(relative, delimiter); idx >= 0 {
 					commonPrefix := prefix + relative[:idx+len(delimiter)]
 					if marker != "" && commonPrefix <= marker {
-						return nil
+						return metadata.SkipPrefix(commonPrefix)
 					}
 					if _, exists := seenCommonPrefixes[commonPrefix]; exists {
-						return nil
+						return metadata.SkipPrefix(commonPrefix)
 					}
 					seenCommonPrefixes[commonPrefix] = struct{}{}
 					if len(entries) >= maxKeys {
@@ -1550,7 +1584,7 @@ func (h *Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bu
 					entries = append(entries, pageEntry{
 						CommonPrefix: commonPrefix,
 					})
-					return nil
+					return metadata.SkipPrefix(commonPrefix)
 				}
 			}
 
@@ -1707,7 +1741,7 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 					return nil
 				}
 				if continuationType == "C" && strings.HasPrefix(key, continuationValue) {
-					return nil
+					return metadata.SkipPrefix(continuationValue)
 				}
 			} else if startAfter != "" && key <= startAfter {
 				return nil
@@ -1730,10 +1764,10 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 				if idx := strings.Index(relative, delimiter); idx >= 0 {
 					commonPrefix := prefix + relative[:idx+len(delimiter)]
 					if continuationToken == "" && startAfter != "" && commonPrefix <= startAfter {
-						return nil
+						return metadata.SkipPrefix(commonPrefix)
 					}
 					if _, exists := seenCommonPrefixes[commonPrefix]; exists {
-						return nil
+						return metadata.SkipPrefix(commonPrefix)
 					}
 					seenCommonPrefixes[commonPrefix] = struct{}{}
 					if len(entries) >= maxKeys {
@@ -1744,7 +1778,7 @@ func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 						Marker:       "C:" + commonPrefix,
 						CommonPrefix: commonPrefix,
 					})
-					return nil
+					return metadata.SkipPrefix(commonPrefix)
 				}
 			}
 
@@ -1916,13 +1950,19 @@ func (h *Handler) Start(ctx context.Context, address string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
-		h.logger.Error("server_shutdown_failed", "error", err)
-		return err
+	shutdownErr := server.Shutdown(ctx)
+	if shutdownErr != nil {
+		h.logger.Error("server_shutdown_failed", "error", shutdownErr)
 	}
-	if err := h.svc.Close(); err != nil {
-		h.logger.Error("service_close_failed", "error", err)
-		return err
+	closeErr := h.svc.Close()
+	if closeErr != nil {
+		h.logger.Error("service_close_failed", "error", closeErr)
+	}
+	if shutdownErr != nil {
+		return shutdownErr
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 
 	h.logger.Info("server_stopped")

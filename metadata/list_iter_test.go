@@ -195,3 +195,45 @@ func TestForEachObjectKeyFromRecordsStopAsSuccess(t *testing.T) {
 		t.Fatalf("ok view tx count = %v, want %v (callback error must not count as success)", got, okBefore)
 	}
 }
+
+func TestForEachObjectKeyFromSkipPrefixAndSuccessor(t *testing.T) {
+	h, err := NewMetadataHandler(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatalf("NewMetadataHandler: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	const bucket = "skip-bucket"
+	if err := h.CreateBucket(bucket); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	for _, key := range []string{"a/1", "a/2", "a/99", "b/1", "c"} {
+		if err := h.PutManifest(&models.ObjectManifest{Bucket: bucket, Key: key}); err != nil {
+			t.Fatalf("PutManifest(%q): %v", key, err)
+		}
+	}
+
+	var visited []string
+	if err := h.ForEachObjectKeyFrom(bucket, "", func(key string, _ func() (*models.ObjectManifest, error)) error {
+		visited = append(visited, key)
+		if strings.HasPrefix(key, "a/") {
+			return SkipPrefix("a/")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ForEachObjectKeyFrom: %v", err)
+	}
+	if want := []string{"a/1", "b/1", "c"}; !slices.Equal(visited, want) {
+		t.Fatalf("visited = %v, want %v", visited, want)
+	}
+
+	if next, ok := prefixSuccessor("a/"); !ok || string(next) != "a0" {
+		t.Fatalf("prefixSuccessor(\"a/\") = (%q, %v), want (\"a0\", true)", next, ok)
+	}
+	if next, ok := prefixSuccessor("a\xff"); !ok || string(next) != "b" {
+		t.Fatalf("prefixSuccessor(\"a\\xff\") = (%q, %v), want (\"b\", true)", next, ok)
+	}
+	if _, ok := prefixSuccessor("\xff\xff"); ok {
+		t.Fatal("prefixSuccessor(\"\\xff\\xff\") = true, want false")
+	}
+}

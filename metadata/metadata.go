@@ -36,15 +36,16 @@ const multipartKeyIndexSeparator = "\x00"
 var validBucketName = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
 var (
-	ErrInvalidBucketName    = errors.New("invalid bucket name")
-	ErrBucketAlreadyExists  = errors.New("bucket already exists")
-	ErrBucketNotFound       = errors.New("bucket not found")
-	ErrBucketNotEmpty       = errors.New("bucket not empty")
-	ErrObjectNotFound       = errors.New("object not found")
-	ErrMultipartNotFound    = errors.New("multipart upload not found")
-	ErrMultipartNotPending  = errors.New("multipart upload is not pending")
-	ErrAuthIdentityNotFound = errors.New("auth identity not found")
-	ErrAuthPolicyNotFound   = errors.New("auth policy not found")
+	ErrInvalidBucketName         = errors.New("invalid bucket name")
+	ErrBucketAlreadyExists       = errors.New("bucket already exists")
+	ErrBucketNotFound            = errors.New("bucket not found")
+	ErrBucketNotEmpty            = errors.New("bucket not empty")
+	ErrObjectNotFound            = errors.New("object not found")
+	ErrMultipartNotFound         = errors.New("multipart upload not found")
+	ErrMultipartNotPending       = errors.New("multipart upload is not pending")
+	ErrAuthIdentityNotFound      = errors.New("auth identity not found")
+	ErrAuthIdentityAlreadyExists = errors.New("auth identity already exists")
+	ErrAuthPolicyNotFound        = errors.New("auth policy not found")
 )
 
 // errIterationStopped is an unexported sentinel used by iteration callbacks to
@@ -62,6 +63,35 @@ func StopIteration() error {
 // IsIterationStopped reports whether err is the normal early-stop sentinel.
 func IsIterationStopped(err error) bool {
 	return errors.Is(err, errIterationStopped)
+}
+
+type skipPrefixError struct {
+	prefix string
+}
+
+func (e *skipPrefixError) Error() string {
+	return "skip prefix"
+}
+
+// SkipPrefix asks ForEachObjectKeyFrom to advance the cursor past all keys
+// starting with prefix, avoiding a linear scan over collapsed delimiter
+// groups. If prefix is empty, iteration continues normally.
+func SkipPrefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	return &skipPrefixError{prefix: prefix}
+}
+
+func prefixSuccessor(prefix string) ([]byte, bool) {
+	buf := []byte(prefix)
+	for i := len(buf) - 1; i >= 0; i-- {
+		if buf[i] < 0xff {
+			buf[i]++
+			return buf[:i+1], true
+		}
+	}
+	return nil, false
 }
 
 func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
@@ -153,6 +183,10 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		})
 	})
 	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = h.update(initChunkRefsTx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -306,6 +340,156 @@ func (h *MetadataHandler) DeleteAuthPolicy(accessKeyID string) error {
 			return fmt.Errorf("%w: %s", ErrAuthPolicyNotFound, accessKeyID)
 		}
 		return bucket.Delete([]byte(accessKeyID))
+	})
+}
+
+// CreateAuthUser atomically creates an auth identity and its policy in a
+// single transaction, failing with ErrAuthIdentityAlreadyExists if the
+// identity already exists.
+func (h *MetadataHandler) CreateAuthUser(identity *models.AuthIdentity, policy *models.AuthPolicy) error {
+	if identity == nil || strings.TrimSpace(identity.AccessKeyID) == "" {
+		return errors.New("auth identity with access key id is required")
+	}
+	if policy == nil {
+		return errors.New("auth policy is required")
+	}
+	key := strings.TrimSpace(identity.AccessKeyID)
+	policy.Principal = key
+	return h.update(func(tx *bbolt.Tx) error {
+		identities := tx.Bucket(authIdentitiesIndex)
+		policies := tx.Bucket(authPoliciesIndex)
+		if identities == nil || policies == nil {
+			return errors.New("auth indexes not found")
+		}
+		if identities.Get([]byte(key)) != nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityAlreadyExists, key)
+		}
+		idPayload, err := json.Marshal(identity)
+		if err != nil {
+			return err
+		}
+		policyPayload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		if err := identities.Put([]byte(key), idPayload); err != nil {
+			return err
+		}
+		return policies.Put([]byte(key), policyPayload)
+	})
+}
+
+// UpsertAuthUser atomically stores or updates an auth identity and its policy,
+// preserving the original CreatedAt timestamp if the identity already exists.
+func (h *MetadataHandler) UpsertAuthUser(identity *models.AuthIdentity, policy *models.AuthPolicy) error {
+	if identity == nil || strings.TrimSpace(identity.AccessKeyID) == "" {
+		return errors.New("auth identity with access key id is required")
+	}
+	if policy == nil {
+		return errors.New("auth policy is required")
+	}
+	key := strings.TrimSpace(identity.AccessKeyID)
+	policy.Principal = key
+	return h.update(func(tx *bbolt.Tx) error {
+		identities := tx.Bucket(authIdentitiesIndex)
+		policies := tx.Bucket(authPoliciesIndex)
+		if identities == nil || policies == nil {
+			return errors.New("auth indexes not found")
+		}
+		record := *identity
+		if raw := identities.Get([]byte(key)); raw != nil {
+			existing := models.AuthIdentity{}
+			if err := json.Unmarshal(raw, &existing); err == nil && existing.CreatedAt > 0 {
+				record.CreatedAt = existing.CreatedAt
+			}
+		}
+		idPayload, err := json.Marshal(&record)
+		if err != nil {
+			return err
+		}
+		policyPayload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		if err := identities.Put([]byte(key), idPayload); err != nil {
+			return err
+		}
+		return policies.Put([]byte(key), policyPayload)
+	})
+}
+
+// UpdateAuthUserPolicy atomically updates a user's policy and identity
+// UpdatedAt timestamp in a single transaction.
+func (h *MetadataHandler) UpdateAuthUserPolicy(accessKeyID string, policy *models.AuthPolicy, updatedAt int64) (*models.AuthIdentity, error) {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return nil, errors.New("access key id is required")
+	}
+	if policy == nil {
+		return nil, errors.New("auth policy is required")
+	}
+	policy.Principal = accessKeyID
+	var updated *models.AuthIdentity
+	err := h.update(func(tx *bbolt.Tx) error {
+		identities := tx.Bucket(authIdentitiesIndex)
+		policies := tx.Bucket(authPoliciesIndex)
+		if identities == nil || policies == nil {
+			return errors.New("auth indexes not found")
+		}
+		raw := identities.Get([]byte(accessKeyID))
+		if raw == nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityNotFound, accessKeyID)
+		}
+		record := models.AuthIdentity{}
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return err
+		}
+		record.UpdatedAt = updatedAt
+		idPayload, err := json.Marshal(&record)
+		if err != nil {
+			return err
+		}
+		policyPayload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		if err := policies.Put([]byte(accessKeyID), policyPayload); err != nil {
+			return err
+		}
+		if err := identities.Put([]byte(accessKeyID), idPayload); err != nil {
+			return err
+		}
+		updated = &record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// DeleteAuthUser atomically deletes both the identity and its policy.
+func (h *MetadataHandler) DeleteAuthUser(accessKeyID string) error {
+	accessKeyID = strings.TrimSpace(accessKeyID)
+	if accessKeyID == "" {
+		return errors.New("access key id is required")
+	}
+	return h.update(func(tx *bbolt.Tx) error {
+		identities := tx.Bucket(authIdentitiesIndex)
+		policies := tx.Bucket(authPoliciesIndex)
+		if identities == nil || policies == nil {
+			return errors.New("auth indexes not found")
+		}
+		if identities.Get([]byte(accessKeyID)) == nil {
+			return fmt.Errorf("%w: %s", ErrAuthIdentityNotFound, accessKeyID)
+		}
+		if err := identities.Delete([]byte(accessKeyID)); err != nil {
+			return err
+		}
+		if policies.Get([]byte(accessKeyID)) != nil {
+			return policies.Delete([]byte(accessKeyID))
+		}
+		return nil
 	})
 }
 
@@ -561,6 +745,18 @@ func (h *MetadataHandler) PutManifest(manifest *models.ObjectManifest) error {
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
+		if existing := metadataBucket.Get([]byte(key)); existing != nil {
+			old := models.ObjectManifest{}
+			if err := json.Unmarshal(existing, &old); err != nil {
+				return err
+			}
+			if err := removeChunkRefsTx(tx, old.Chunks, time.Now().UnixNano()); err != nil {
+				return err
+			}
+		}
+		if err := addChunkRefsTx(tx, manifest.Chunks); err != nil {
+			return err
+		}
 		return metadataBucket.Put([]byte(key), data)
 	})
 	if err != nil {
@@ -687,11 +883,21 @@ func (h *MetadataHandler) ForEachObjectKeyFrom(bucket, startKey string, fn func(
 			return &object, nil
 		}
 
-		for ; k != nil; k, v = cursor.Next() {
+		for k != nil {
 			value = v
 			if err := fn(string(k), decode); err != nil {
+				var skipErr *skipPrefixError
+				if errors.As(err, &skipErr) {
+					next, ok := prefixSuccessor(skipErr.prefix)
+					if !ok {
+						return nil
+					}
+					k, v = cursor.Seek(next)
+					continue
+				}
 				return err
 			}
+			k, v = cursor.Next()
 		}
 		return nil
 	})
@@ -723,6 +929,15 @@ func (h *MetadataHandler) DeleteManifest(bucket, key string) error {
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
+		if existing := metadataBucket.Get([]byte(key)); existing != nil {
+			old := models.ObjectManifest{}
+			if err := json.Unmarshal(existing, &old); err != nil {
+				return err
+			}
+			if err := removeChunkRefsTx(tx, old.Chunks, time.Now().UnixNano()); err != nil {
+				return err
+			}
+		}
 		return metadataBucket.Delete([]byte(key))
 	})
 	if err != nil {
@@ -741,11 +956,19 @@ func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]strin
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
 
+		nowNano := time.Now().UnixNano()
 		for _, key := range keys {
 			if key == "" {
 				continue
 			}
-			if metadataBucket.Get([]byte(key)) != nil {
+			if existing := metadataBucket.Get([]byte(key)); existing != nil {
+				old := models.ObjectManifest{}
+				if err := json.Unmarshal(existing, &old); err != nil {
+					return err
+				}
+				if err := removeChunkRefsTx(tx, old.Chunks, nowNano); err != nil {
+					return err
+				}
 				if err := metadataBucket.Delete([]byte(key)); err != nil {
 					return err
 				}
@@ -760,7 +983,7 @@ func (h *MetadataHandler) DeleteManifests(bucket string, keys []string) ([]strin
 	return deleted, nil
 }
 
-func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.MultipartUpload, error) {
+func (h *MetadataHandler) CreateMultipartUpload(bucket, key string, contentType ...string) (*models.MultipartUpload, error) {
 	var upload *models.MultipartUpload
 
 	err := h.view(func(tx *bbolt.Tx) error {
@@ -776,14 +999,19 @@ func (h *MetadataHandler) CreateMultipartUpload(bucket, key string) (*models.Mul
 	if err != nil {
 		return nil, err
 	}
+	ct := ""
+	if len(contentType) > 0 {
+		ct = strings.TrimSpace(contentType[0])
+	}
 	uploadId := uuid.New().String()
 	createdAt := time.Now().UTC().Format(time.RFC3339)
 	upload = &models.MultipartUpload{
-		Bucket:    bucket,
-		Key:       key,
-		UploadID:  uploadId,
-		CreatedAt: createdAt,
-		State:     "pending",
+		Bucket:      bucket,
+		Key:         key,
+		ContentType: ct,
+		UploadID:    uploadId,
+		CreatedAt:   createdAt,
+		State:       "pending",
 	}
 
 	err = h.update(func(tx *bbolt.Tx) error {
@@ -901,9 +1129,16 @@ func deleteMultipartPartsByUploadID(tx *bbolt.Tx, uploadID string) error {
 	}
 
 	prefix := uploadID + ":"
+	nowNano := time.Now().UnixNano()
 	cursor := multipartPartsBucket.Cursor()
 	keysToDelete := make([][]byte, 0)
-	for k, _ := cursor.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix); k, _ = cursor.Next() {
+	for k, v := cursor.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix); k, v = cursor.Next() {
+		part := models.UploadedPart{}
+		if err := json.Unmarshal(v, &part); err == nil {
+			if err := removeChunkRefsTx(tx, part.Chunks, nowNano); err != nil {
+				return err
+			}
+		}
 		keyCopy := make([]byte, len(k))
 		copy(keyCopy, k)
 		keysToDelete = append(keysToDelete, keyCopy)
@@ -951,6 +1186,18 @@ func (h *MetadataHandler) PutMultipartPart(uploadID string, part models.Uploaded
 		}
 
 		key := fmt.Sprintf("%s:%05d", uploadID, part.PartNumber)
+		if existing := multipartPartsBucket.Get([]byte(key)); existing != nil {
+			oldPart := models.UploadedPart{}
+			if err := json.Unmarshal(existing, &oldPart); err != nil {
+				return err
+			}
+			if err := removeChunkRefsTx(tx, oldPart.Chunks, time.Now().UnixNano()); err != nil {
+				return err
+			}
+		}
+		if err := addChunkRefsTx(tx, part.Chunks); err != nil {
+			return err
+		}
 		payload, err := json.Marshal(part)
 		if err != nil {
 			return err

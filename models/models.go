@@ -135,11 +135,12 @@ type CommonPrefixes struct {
 }
 
 type MultipartUpload struct {
-	UploadID  string `json:"upload_id" xml:"UploadId"`
-	Bucket    string `json:"bucket" xml:"Bucket"`
-	Key       string `json:"key" xml:"Key"`
-	CreatedAt string `json:"created_at" xml:"CreatedAt"`
-	State     string `json:"state" xml:"State"`
+	UploadID    string `json:"upload_id" xml:"UploadId"`
+	Bucket      string `json:"bucket" xml:"Bucket"`
+	Key         string `json:"key" xml:"Key"`
+	ContentType string `json:"content_type,omitempty" xml:"-"`
+	CreatedAt   string `json:"created_at" xml:"CreatedAt"`
+	State       string `json:"state" xml:"State"`
 }
 
 type InitiateMultipartUploadResult struct {
