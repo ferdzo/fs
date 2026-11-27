@@ -749,3 +749,125 @@ func TestMultipartPreservesInitiateContentType(t *testing.T) {
 		t.Fatalf("default Content-Type = %q, want application/octet-stream", rawHead.Header().Get("Content-Type"))
 	}
 }
+
+func TestMultipartGetAndHeadPartNumber(t *testing.T) {
+	handler, svc := newTestObjectHandler(t)
+	const bucket = "test-bucket"
+	if err := svc.CreateBucket(bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	const key = "multipart/parts-read.bin"
+	part1 := bytes.Repeat([]byte("1"), multipartLifeMinPartSize)
+	part2 := bytes.Repeat([]byte("2"), multipartLifeMinPartSize+123)
+	part3 := []byte("tail-part-3")
+
+	uploadID := multipartLifeInit(t, handler, bucket, key)
+	etag1 := multipartLifeUploadPart(t, handler, bucket, key, uploadID, 1, part1)
+	etag2 := multipartLifeUploadPart(t, handler, bucket, key, uploadID, 2, part2)
+	etag3 := multipartLifeUploadPart(t, handler, bucket, key, uploadID, 3, part3)
+
+	compRec := multipartLifeComplete(t, handler, bucket, key, uploadID, []models.CompletedPart{
+		{PartNumber: 1, ETag: `"` + etag1 + `"`},
+		{PartNumber: 2, ETag: `"` + etag2 + `"`},
+		{PartNumber: 3, ETag: `"` + etag3 + `"`},
+	})
+	if compRec.Code != http.StatusOK {
+		t.Fatalf("complete status = %d body=%s", compRec.Code, compRec.Body.String())
+	}
+
+	totalSize := int64(len(part1) + len(part2) + len(part3))
+	parts := []struct {
+		num   int
+		start int64
+		data  []byte
+	}{
+		{1, 0, part1},
+		{2, int64(len(part1)), part2},
+		{3, int64(len(part1) + len(part2)), part3},
+	}
+
+	for _, p := range parts {
+		wantRange := fmt.Sprintf("bytes %d-%d/%d", p.start, p.start+int64(len(p.data))-1, totalSize)
+		target := fmt.Sprintf("/%s/%s?partNumber=%d", bucket, key, p.num)
+
+		headRec := httptest.NewRecorder()
+		handler.router.ServeHTTP(headRec, httptest.NewRequest(http.MethodHead, target, nil))
+		if headRec.Code != http.StatusPartialContent {
+			t.Fatalf("HEAD part %d status = %d, want 206", p.num, headRec.Code)
+		}
+		if got := headRec.Header().Get("x-amz-mp-parts-count"); got != "3" {
+			t.Fatalf("HEAD part %d x-amz-mp-parts-count = %q, want 3", p.num, got)
+		}
+		if got := headRec.Header().Get("Content-Range"); got != wantRange {
+			t.Fatalf("HEAD part %d Content-Range = %q, want %q", p.num, got, wantRange)
+		}
+		if got := headRec.Header().Get("Content-Length"); got != strconv.Itoa(len(p.data)) {
+			t.Fatalf("HEAD part %d Content-Length = %q, want %d", p.num, got, len(p.data))
+		}
+
+		getRec := httptest.NewRecorder()
+		handler.router.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, target, nil))
+		if getRec.Code != http.StatusPartialContent {
+			t.Fatalf("GET part %d status = %d, want 206 (body: %s)", p.num, getRec.Code, getRec.Body.String())
+		}
+		if got := getRec.Header().Get("x-amz-mp-parts-count"); got != "3" {
+			t.Fatalf("GET part %d x-amz-mp-parts-count = %q, want 3", p.num, got)
+		}
+		if got := getRec.Header().Get("Content-Range"); got != wantRange {
+			t.Fatalf("GET part %d Content-Range = %q, want %q", p.num, got, wantRange)
+		}
+		if !bytes.Equal(getRec.Body.Bytes(), p.data) {
+			t.Fatalf("GET part %d body len = %d, want %d", p.num, getRec.Body.Len(), len(p.data))
+		}
+	}
+
+	// Out-of-range part number returns 416 InvalidRange.
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec := httptest.NewRecorder()
+		handler.router.ServeHTTP(rec, httptest.NewRequest(method, "/"+bucket+"/"+key+"?partNumber=4", nil))
+		if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+			t.Fatalf("%s partNumber=4 status = %d, want 416", method, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Range"); got != fmt.Sprintf("bytes */%d", totalSize) {
+			t.Fatalf("%s partNumber=4 Content-Range = %q, want bytes */%d", method, got, totalSize)
+		}
+	}
+
+	// Invalid partNumber values and conflicting Range+partNumber return 400 InvalidArgument.
+	for _, raw := range []string{"0", "-1", "10001", "abc", ""} {
+		rec := httptest.NewRecorder()
+		handler.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key+"?partNumber="+raw, nil))
+		multipartLifeAssertError(t, rec, http.StatusBadRequest, "InvalidArgument")
+	}
+	conflictReq := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key+"?partNumber=1", nil)
+	conflictReq.Header.Set("Range", "bytes=0-10")
+	conflictRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(conflictRec, conflictReq)
+	multipartLifeAssertError(t, conflictRec, http.StatusBadRequest, "InvalidArgument")
+
+	// Single-part and empty objects support partNumber=1 and reject partNumber=2.
+	if _, err := svc.PutObject(bucket, "single.txt", "text/plain", strings.NewReader("hello")); err != nil {
+		t.Fatalf("PutObject single: %v", err)
+	}
+	singleRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(singleRec, httptest.NewRequest(http.MethodGet, "/"+bucket+"/single.txt?partNumber=1", nil))
+	if singleRec.Code != http.StatusPartialContent || singleRec.Body.String() != "hello" {
+		t.Fatalf("single part 1 = %d/%q, want 206/hello", singleRec.Code, singleRec.Body.String())
+	}
+	singleOOB := httptest.NewRecorder()
+	handler.router.ServeHTTP(singleOOB, httptest.NewRequest(http.MethodGet, "/"+bucket+"/single.txt?partNumber=2", nil))
+	if singleOOB.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("single part 2 = %d, want 416", singleOOB.Code)
+	}
+
+	if _, err := svc.PutObject(bucket, "empty.txt", "text/plain", bytes.NewReader(nil)); err != nil {
+		t.Fatalf("PutObject empty: %v", err)
+	}
+	emptyRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(emptyRec, httptest.NewRequest(http.MethodGet, "/"+bucket+"/empty.txt?partNumber=1", nil))
+	if emptyRec.Code != http.StatusOK || emptyRec.Header().Get("Content-Length") != "0" || emptyRec.Body.Len() != 0 {
+		t.Fatalf("empty part 1 = %d len=%q body=%d, want 200/'0'/0",
+			emptyRec.Code, emptyRec.Header().Get("Content-Length"), emptyRec.Body.Len())
+	}
+}

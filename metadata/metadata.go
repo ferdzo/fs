@@ -97,9 +97,10 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.MaxBatchDelay = 2 * time.Millisecond
 	h := &MetadataHandler{db: db}
 
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(systemIndex)
 		return err
 	})
@@ -107,7 +108,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(multipartUploadIndex)
 		return err
 	})
@@ -115,7 +116,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(multipartUploadPartsIndex)
 		return err
 	})
@@ -123,7 +124,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(authIdentitiesIndex)
 		return err
 	})
@@ -131,7 +132,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(authPoliciesIndex)
 		return err
 	})
@@ -139,7 +140,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(multipartUploadKeyIndex)
 		return err
 	})
@@ -147,7 +148,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		for _, name := range [][]byte{versionIndex, versionOrderIndex, bucketStateIndex} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
@@ -163,7 +164,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	// Only pending uploads are listed, so only those need indexing. This runs
 	// once per handler start over the (retention-bounded) upload set and is
 	// idempotent for already-indexed records.
-	err = h.update(func(tx *bbolt.Tx) error {
+	err = h.updateDirect(func(tx *bbolt.Tx) error {
 		uploadsBucket := tx.Bucket(multipartUploadIndex)
 		keyIndexBucket := tx.Bucket(multipartUploadKeyIndex)
 		if uploadsBucket == nil || keyIndexBucket == nil {
@@ -184,7 +185,7 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if err = h.update(initChunkRefsTx); err != nil {
+	if err = h.updateDirect(initChunkRefsTx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -230,6 +231,13 @@ func (h *MetadataHandler) view(fn func(tx *bbolt.Tx) error) error {
 }
 
 func (h *MetadataHandler) update(fn func(tx *bbolt.Tx) error) error {
+	start := time.Now()
+	err := h.db.Batch(fn)
+	metrics.Default.ObserveMetadataTx("update", time.Since(start), err == nil)
+	return err
+}
+
+func (h *MetadataHandler) updateDirect(fn func(tx *bbolt.Tx) error) error {
 	start := time.Now()
 	err := h.db.Update(fn)
 	metrics.Default.ObserveMetadataTx("update", time.Since(start), err == nil)
@@ -943,6 +951,7 @@ func (h *MetadataHandler) DeleteManifests(bucket string, keys []string, now time
 	deleted := make([]string, 0, len(keys))
 
 	err := h.update(func(tx *bbolt.Tx) error {
+		deleted = deleted[:0]
 		metadataBucket := tx.Bucket([]byte(bucket))
 		if metadataBucket == nil {
 			return fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
@@ -1463,6 +1472,7 @@ func (h *MetadataHandler) CleanupMultipartUploads(retention time.Duration, now t
 
 	cleaned := 0
 	err := h.update(func(tx *bbolt.Tx) error {
+		cleaned = 0
 		uploadsBucket, err := getMultipartUploadBucket(tx)
 		if err != nil {
 			return err

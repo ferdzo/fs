@@ -533,3 +533,95 @@ func TestLimitedListenerCloseUnblocksAccept(t *testing.T) {
 		t.Fatal("blocked Accept did not unblock on Close")
 	}
 }
+
+func TestAdminRunGC(t *testing.T) {
+	root := t.TempDir()
+	md, err := metadata.NewMetadataHandler(root + "/metadata.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := storage.NewBlobStore(root, 1024)
+	if err != nil {
+		_ = md.Close()
+		t.Fatal(err)
+	}
+	objSvc := service.NewObjectService(md, blob, time.Hour)
+	objSvc.SetGCGrace(0)
+	t.Cleanup(func() { _ = objSvc.Close() })
+
+	masterKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	authSvc, err := auth.NewService(auth.ConfigFromValues(
+		true, "us-east-1", 0, 0, masterKey,
+		"boot-admin", "boot-secret-12345678", "",
+		0,
+	), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authSvc.EnsureBootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authSvc.CreateUser(auth.CreateUserInput{
+		AccessKeyID: "regular-user",
+		SecretKey:   "regular-secret-123456",
+		Status:      "active",
+		Policy: models.AuthPolicy{
+			Statements: []models.AuthPolicyStatement{{Effect: "allow", Actions: []string{"s3:*"}, Bucket: "*"}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := NewHandler(objSvc, logger, logging.Config{}, authSvc, true, time.Minute)
+	handler.setupRoutes()
+
+	if err := objSvc.CreateBucket("gc-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := objSvc.PutObject("gc-bucket", "temp.bin", "text/plain", strings.NewReader("gc-sweep-payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := objSvc.DeleteObject("gc-bucket", "temp.bin"); err != nil {
+		t.Fatal(err)
+	}
+	chunksBefore, err := blob.ListChunks()
+	if err != nil || len(chunksBefore) == 0 {
+		t.Fatalf("expected queued orphan chunk before GC, got %d err=%v", len(chunksBefore), err)
+	}
+
+	// Unauthenticated request rejected.
+	unauthRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(unauthRec, httptest.NewRequest(http.MethodPost, "/_admin/v1/gc", nil))
+	if unauthRec.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated POST /_admin/v1/gc = %d, want 403", unauthRec.Code)
+	}
+
+	// Non-bootstrap user rejected even with wildcard S3 permissions.
+	userReq := httptest.NewRequest(http.MethodPost, "/_admin/v1/gc", nil)
+	signTestSigV4Request(t, userReq, "regular-user", "regular-secret-123456")
+	userRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(userRec, userReq)
+	if userRec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin POST /_admin/v1/gc = %d, want 403 body=%s", userRec.Code, userRec.Body.String())
+	}
+
+	// Bootstrap admin succeeds and sweeps unreferenced chunks immediately.
+	adminReq := httptest.NewRequest(http.MethodPost, "/_admin/v1/gc", nil)
+	signTestSigV4Request(t, adminReq, "boot-admin", "boot-secret-12345678")
+	adminRec := httptest.NewRecorder()
+	handler.router.ServeHTTP(adminRec, adminReq)
+	if adminRec.Code != http.StatusOK {
+		t.Fatalf("admin POST /_admin/v1/gc = %d, want 200 body=%s", adminRec.Code, adminRec.Body.String())
+	}
+	if !strings.Contains(adminRec.Body.String(), `"ok"`) {
+		t.Fatalf("unexpected admin GC response: %s", adminRec.Body.String())
+	}
+	chunksAfter, err := blob.ListChunks()
+	if err != nil {
+		t.Fatalf("ListChunks after admin GC: %v", err)
+	}
+	if len(chunksAfter) != 0 {
+		t.Fatalf("chunks remaining after admin GC = %d, want 0", len(chunksAfter))
+	}
+}

@@ -290,7 +290,21 @@ func (h *Handler) handleGetObject(w http.ResponseWriter, r *http.Request) {
 
 	versionID := versionIDFromRequest(r)
 
+	partNum, hasPartNumber, partErr := parsePartNumberQuery(r)
+	if partErr != nil {
+		writeS3Error(w, r, *partErr, r.URL.Path)
+		return
+	}
+
 	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+	if hasPartNumber {
+		if rangeHeader != "" {
+			writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+			return
+		}
+		h.handleGetObjectPart(w, r, bucket, key, versionID, partNum)
+		return
+	}
 	if rangeHeader != "" {
 		// Resolve and validate the range before opening the object stream so a
 		// suffix or mid-object range never reads the prefix, and an invalid
@@ -379,6 +393,109 @@ func (h *Handler) handleGetObjectRange(w http.ResponseWriter, r *http.Request, b
 			"key", key,
 			"error", err,
 		)
+	}
+}
+
+func parsePartNumberQuery(r *http.Request) (int, bool, *s3APIError) {
+	if !r.URL.Query().Has("partNumber") {
+		return 0, false, nil
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("partNumber"))
+	partNum, err := strconv.Atoi(raw)
+	if err != nil || partNum < 1 || partNum > 10000 {
+		return 0, true, &s3ErrInvalidArgument
+	}
+	return partNum, true, nil
+}
+
+func resolvePartRange(manifest *models.ObjectManifest, partNum int) (start, length int64, partsCount int, ok bool) {
+	if manifest == nil {
+		return 0, 0, 0, false
+	}
+	if len(manifest.PartSizes) > 0 {
+		partsCount = len(manifest.PartSizes)
+		if partNum < 1 || partNum > partsCount {
+			return 0, 0, partsCount, false
+		}
+		for i := 0; i < partNum-1; i++ {
+			start += manifest.PartSizes[i]
+		}
+		length = manifest.PartSizes[partNum-1]
+		if start < 0 || length < 0 || start+length > manifest.Size {
+			return 0, 0, partsCount, false
+		}
+		return start, length, partsCount, true
+	}
+	if partNum != 1 {
+		return 0, 0, 0, false
+	}
+	return 0, manifest.Size, 0, true
+}
+
+func writeObjectPartHeaders(w http.ResponseWriter, manifest *models.ObjectManifest, start, length int64, partsCount int) int {
+	if partsCount > 0 {
+		w.Header().Set("x-amz-mp-parts-count", strconv.Itoa(partsCount))
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	if length > 0 {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, manifest.Size))
+		return http.StatusPartialContent
+	}
+	return http.StatusOK
+}
+
+// handleGetObjectPart serves GET /{bucket}/{key}?partNumber=N by mapping the
+// requested part onto its persisted byte interval.
+func (h *Handler) handleGetObjectPart(w http.ResponseWriter, r *http.Request, bucket, key, versionID string, partNum int) {
+	head, err := h.svc.HeadObjectVersion(bucket, key, versionID)
+	if err != nil {
+		if errors.Is(err, service.ErrDeleteMarker) {
+			h.writeDeleteMarkerResponse(w, r, bucket, key, versionID, versionID != "")
+			return
+		}
+		writeMappedS3Error(w, r, err)
+		return
+	}
+
+	start, length, partsCount, ok := resolvePartRange(&head, partNum)
+	if !ok {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", head.Size))
+		writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
+		return
+	}
+
+	stream, manifest, err := h.svc.GetObjectRangeVersion(bucket, key, versionID, start, length)
+	if err != nil {
+		if errors.Is(err, service.ErrDeleteMarker) {
+			h.writeDeleteMarkerResponse(w, r, bucket, key, versionID, versionID != "")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidRange) {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", head.Size))
+			writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
+			return
+		}
+		writeMappedS3Error(w, r, err)
+		return
+	}
+	defer stream.Close()
+
+	setObjectVersionHeaders(w, manifest)
+	w.Header().Set("Content-Type", manifest.ContentType)
+	w.Header().Set("ETag", `"`+manifest.ETag+`"`)
+	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
+	w.Header().Set("Accept-Ranges", "bytes")
+	status := writeObjectPartHeaders(w, manifest, start, length, partsCount)
+	w.WriteHeader(status)
+	if length > 0 {
+		if _, err := io.CopyN(w, stream, length); err != nil && !errors.Is(err, context.Canceled) {
+			h.logger.Warn("get_object_part_stream_failed",
+				"bucket", bucket,
+				"key", key,
+				"part_number", partNum,
+				"error", err,
+			)
+		}
 	}
 }
 
@@ -1144,6 +1261,16 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	partNum, hasPartNumber, partErr := parsePartNumberQuery(r)
+	if partErr != nil {
+		writeS3Error(w, r, *partErr, r.URL.Path)
+		return
+	}
+	if hasPartNumber && strings.TrimSpace(r.Header.Get("Range")) != "" {
+		writeS3Error(w, r, s3ErrInvalidArgument, r.URL.Path)
+		return
+	}
+
 	versionID := versionIDFromRequest(r)
 	manifest, err := h.svc.HeadObjectVersion(bucket, key, versionID)
 	if err != nil {
@@ -1156,7 +1283,6 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 	}
 	setObjectVersionHeaders(w, &manifest)
 	etag := manifest.ETag
-	size := strconv.FormatInt(manifest.Size, 10)
 
 	contentType := manifest.ContentType
 	if contentType == "" {
@@ -1165,8 +1291,21 @@ func (h *Handler) handleHeadObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Length", size)
 	w.Header().Set("Last-Modified", time.Unix(manifest.CreatedAt, 0).UTC().Format(http.TimeFormat))
+
+	if hasPartNumber {
+		start, length, partsCount, ok := resolvePartRange(&manifest, partNum)
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.Size))
+			writeS3Error(w, r, s3ErrInvalidRange, r.URL.Path)
+			return
+		}
+		status := writeObjectPartHeaders(w, &manifest, start, length, partsCount)
+		w.WriteHeader(status)
+		return
+	}
+
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.Size, 10))
 	w.WriteHeader(http.StatusOK)
 }
 

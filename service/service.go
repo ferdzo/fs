@@ -322,6 +322,7 @@ func (s *ObjectService) CopyObjectVersionConditional(srcBucket, srcKey, srcVersi
 		ETag:        source.ETag,
 		Chunks:      append([]string(nil), source.Chunks...),
 		ChunkSizes:  append([]int64(nil), source.ChunkSizes...),
+		PartSizes:   append([]int64(nil), source.PartSizes...),
 		CreatedAt:   now.Unix(),
 	}
 	if _, err := s.metadata.PutObjectVersionConditional(manifest, ifNoneMatch, uuid.NewString(), now); err != nil {
@@ -1004,6 +1005,10 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	partSizes := make([]int64, 0, len(orderedParts))
+	for _, storedPart := range orderedParts {
+		partSizes = append(partSizes, storedPart.Size)
+	}
 	now := time.Now().UTC()
 	manifest := &models.ObjectManifest{
 		Bucket:      bucket,
@@ -1012,6 +1017,7 @@ func (s *ObjectService) CompleteMultipartUpload(bucket, key, uploadID string, co
 		ContentType: contentType,
 		ETag:        finalETag,
 		Chunks:      chunks,
+		PartSizes:   partSizes,
 		CreatedAt:   now.Unix(),
 	}
 	if layoutComplete && len(chunkSizes) == len(chunks) {
@@ -1098,6 +1104,17 @@ func (s *ObjectService) Close() error {
 	s.gcStateMu.Unlock()
 	s.gcWg.Wait()
 	return s.metadata.Close()
+}
+
+// SetGCGrace overrides the minimum age an unreferenced chunk must reach before
+// GarbageCollect deletes it from the blob store.
+func (s *ObjectService) SetGCGrace(grace time.Duration) {
+	if grace < 0 {
+		grace = 0
+	}
+	s.gcRunMu.Lock()
+	s.gcGrace = grace
+	s.gcRunMu.Unlock()
 }
 
 func (s *ObjectService) GarbageCollect() error {

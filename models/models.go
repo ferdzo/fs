@@ -17,7 +17,10 @@ type ObjectManifest struct {
 	// persisted (legacy objects); readers must fall back to a prefix-reading
 	// path in that case rather than assuming a fixed chunk size.
 	ChunkSizes []int64 `json:"chunk_sizes,omitempty"`
-	CreatedAt  int64   `json:"created_at"`
+	// PartSizes records per-part byte sizes in order for completed multipart
+	// uploads so GET/HEAD ?partNumber=N can resolve exact part byte ranges.
+	PartSizes []int64 `json:"part_sizes,omitempty"`
+	CreatedAt int64   `json:"created_at"`
 	// VersionID is empty for legacy (pre-versioning) records and "null" for the
 	// null version. VersionSeq orders versions within a key, newest highest.
 	VersionID    string `json:"version_id,omitempty"`
