@@ -175,7 +175,7 @@ func (s *Service) AuthenticateRequest(r *http.Request) (RequestContext, error) {
 	if err != nil {
 		return RequestContext{}, ErrSignatureDoesNotMatch
 	}
-	signingKey, ok, err := signatureMatchsWithKey(secret, r, input)
+	signingKey, ok, err := signatureMatchesWithKey(secret, r, input)
 	if err != nil {
 		return RequestContext{}, err
 	}

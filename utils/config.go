@@ -150,5 +150,3 @@ func sanitizeDataPath(raw string) string {
 	}
 	return cleaned
 }
-
-// fallback: parsed in LoadConfig caller

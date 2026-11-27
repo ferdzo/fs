@@ -174,5 +174,5 @@ func TestZombiePutCannotExhaustSlots(t *testing.T) {
 		t.Fatalf("healthz after reap failed: err=%v code=%v", err, resp2.StatusCode)
 	}
 	resp2.Body.Close()
-	fmt.Println("all zombies reaped, listener healthy")
+	t.Log("all zombies reaped, listener healthy")
 }

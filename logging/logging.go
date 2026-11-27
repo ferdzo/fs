@@ -23,12 +23,6 @@ type Config struct {
 	DebugMode bool
 }
 
-func ConfigFromEnv() Config {
-	levelName := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
-	format := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_FORMAT")))
-	return ConfigFromValues(levelName, format, envBool("AUDIT_LOG", true))
-}
-
 func ConfigFromValues(levelName, format string, audit bool) Config {
 	levelName = strings.ToLower(strings.TrimSpace(levelName))
 	if levelName == "" {
@@ -179,18 +173,6 @@ func metricOperationLabel(r *http.Request) string {
 		_, isDeletePost = r.URL.Query()["delete"]
 	}
 	return metrics.NormalizeHTTPOperation(r.Method, isDeletePost)
-}
-
-func envBool(key string, defaultValue bool) bool {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return defaultValue
-	}
-	value, err := strconv.ParseBool(raw)
-	if err != nil {
-		return defaultValue
-	}
-	return value
 }
 
 func parseLevel(levelName string) slog.Level {

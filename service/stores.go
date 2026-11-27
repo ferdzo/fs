@@ -22,7 +22,6 @@ type MetadataStore interface {
 	PutObjectVersionConditional(manifest *models.ObjectManifest, ifNoneMatch, versionID string, now time.Time) (string, error)
 	DeleteObject(bucket, key, versionID, deleteMarkerID string, now time.Time) (metadata.DeleteResult, error)
 	DeleteObjects(bucket string, specs []metadata.DeleteObjectSpec, now time.Time) ([]metadata.BatchDeleteResult, error)
-	DeleteManifests(bucket string, keys []string, now time.Time) ([]string, error)
 	ListObjects(bucket, prefix string) ([]*models.ObjectManifest, error)
 	ForEachObjectKeyFrom(bucket, startKey string, fn func(key string, decode func() (*models.ObjectManifest, error)) error) error
 	ListObjectVersions(bucket, prefix, delimiter, keyMarker, versionIDMarker string, maxKeys int) (*metadata.ObjectVersionsPage, error)

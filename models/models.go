@@ -75,20 +75,6 @@ type S3ErrorResponse struct {
 	HostID    string   `xml:"HostId,omitempty"`
 }
 
-type ListBucketResult struct {
-	XMLName xml.Name `xml:"ListBucketResult"`
-	Xmlns   string   `xml:"xmlns,attr"`
-
-	Name        string `xml:"Name"`
-	Prefix      string `xml:"Prefix"`
-	KeyCount    int    `xml:"KeyCount"`
-	MaxKeys     int    `xml:"MaxKeys"`
-	IsTruncated bool   `xml:"IsTruncated"`
-
-	Contents       []Contents       `xml:"Contents"`
-	CommonPrefixes []CommonPrefixes `xml:"CommonPrefixes,omitempty"`
-}
-
 type ListBucketResultV1 struct {
 	XMLName xml.Name `xml:"ListBucketResult"`
 	Xmlns   string   `xml:"xmlns,attr"`

@@ -78,10 +78,6 @@ func objectVersionKey(bucket, key, versionID string) []byte {
 	return []byte(bucket + versionSeparator + key + versionSeparator + versionID)
 }
 
-func objectVersionPrefix(bucket, key string) []byte {
-	return []byte(bucket + versionSeparator + key + versionSeparator)
-}
-
 // objectVersionOrderKey inverts the sequence so ascending byte order yields
 // newest versions first without in-memory sorting.
 func objectVersionOrderKey(bucket, key string, seq uint64) []byte {

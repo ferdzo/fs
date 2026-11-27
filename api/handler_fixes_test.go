@@ -341,8 +341,7 @@ func TestPutObjectAcceptsVerifiedSignedStreamingChunks(t *testing.T) {
 	payload := bytes.Repeat([]byte("streamed-payload-"), 100)
 	chunks := [][]byte{payload[:700], payload[700:1400], payload[1400:]}
 
-	req := httptest.NewRequest(http.MethodPost, "/test-bucket/big.bin?uploads&delete=1", nil) // bypass attempt shape
-	req = httptest.NewRequest(http.MethodPut, "/test-bucket/streamed.bin", nil)
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket/streamed.bin", nil)
 	req.Host = "127.0.0.1"
 	signChunkedPutRequest(t, req, "delete-secret-1", chunks, false)
 	rec := httptest.NewRecorder()
