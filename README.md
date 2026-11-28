@@ -123,6 +123,9 @@ Admin CLI:
 - `fs admin snapshot create --data-path /var/lib/fs --out /backup/fs-20260311.tar.gz`
 - `fs admin snapshot inspect --file /backup/fs-20260311.tar.gz`
 - `fs admin snapshot restore --file /backup/fs-20260311.tar.gz --data-path /var/lib/fs --force`
+- `fs admin erasure status --paths /mnt/d0,/mnt/d1,... --metadata-db /var/lib/fs/metadata.db`
+- `fs admin erasure heal --paths /mnt/d0,/mnt/d1,...`
+- `fs admin erasure recover --paths /mnt/d0,/mnt/d4,... --metadata-db /var/lib/fs/metadata.db --bucket <b> --key <k> --out <file>`
 - `fs admin diag health`
 - `fs admin diag version`
 
@@ -142,6 +145,7 @@ Reference: `auth/README.md`
 Additional docs:
 - Admin OpenAPI spec: `docs/admin-api-openapi.yaml`
 - S3 compatibility matrix: `docs/s3-compatibility.md`
+- Erasure coding & recovery guide: `docs/erasure-coding.md`
 
 CLI credential/env resolution for `fs admin`:
 - Flags: `--access-key`, `--secret-key`, `--endpoint`, `--region`

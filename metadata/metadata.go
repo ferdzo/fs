@@ -193,6 +193,20 @@ func NewMetadataHandler(dbPath string) (*MetadataHandler, error) {
 	return h, nil
 }
 
+// NewReadOnlyMetadataHandler opens an existing metadata database in read-only
+// mode without creating buckets or running schema backfills. Intended for
+// offline inspection and disaster recovery tooling.
+func NewReadOnlyMetadataHandler(dbPath string) (*MetadataHandler, error) {
+	db, err := bbolt.Open(dbPath, 0400, &bbolt.Options{
+		ReadOnly: true,
+		Timeout:  2 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &MetadataHandler{db: db}, nil
+}
+
 func isValidBucketName(bucketName string) bool {
 	if len(bucketName) < 3 || len(bucketName) > 63 {
 		return false

@@ -36,6 +36,12 @@ type Config struct {
 	AuthBootstrapSecretKey    string
 	AuthBootstrapPolicy       string
 	AdminAPIEnabled           bool
+	StorageBackend            string
+	ErasurePaths              []string
+	ErasureDataShards         int
+	ErasureParityShards       int
+	ErasureAutoHeal           bool
+	ErasureStrictWrite        bool
 }
 
 func NewConfig() *Config {
@@ -69,6 +75,12 @@ func NewConfig() *Config {
 		AuthBootstrapPolicy:    strings.TrimSpace(os.Getenv("FS_ROOT_POLICY_JSON")),
 		AdminAPIEnabled:        envBool("ADMIN_API_ENABLED", true),
 		BodyReadTimeoutSeconds: envInt64Range("FS_BODY_READ_TIMEOUT_SECONDS", 60, 0, 86400),
+		StorageBackend:         strings.ToLower(firstNonEmpty(strings.TrimSpace(os.Getenv("FS_STORAGE_BACKEND")), "disk")),
+		ErasurePaths:           parsePathList(os.Getenv("FS_ERASURE_PATHS")),
+		ErasureDataShards:      envIntRange("FS_ERASURE_DATA_SHARDS", 4, 1, 254),
+		ErasureParityShards:    envIntRange("FS_ERASURE_PARITY_SHARDS", 2, 1, 254),
+		ErasureAutoHeal:        envBool("FS_ERASURE_AUTO_HEAL", true),
+		ErasureStrictWrite:     envBool("FS_ERASURE_STRICT_WRITE", false),
 	}
 
 	if config.LogFormat != "json" && config.LogFormat != "text" {
@@ -149,6 +161,26 @@ func sanitizeDataPath(raw string) string {
 		return abs
 	}
 	return cleaned
+}
+
+func parsePathList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		cleaned := filepath.Clean(trimmed)
+		if abs, err := filepath.Abs(cleaned); err == nil {
+			cleaned = abs
+		}
+		out = append(out, cleaned)
+	}
+	return out
 }
 
 // fallback: parsed in LoadConfig caller

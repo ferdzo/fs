@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"fs/api"
 	"fs/auth"
 	"fs/logging"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -49,6 +51,7 @@ func RunServer(ctx context.Context) error {
 		"admin_api_enabled", config.AdminAPIEnabled,
 		"metrics_address", config.MetricsAddress,
 		"metrics_port", config.MetricsPort,
+		"storage_backend", config.StorageBackend,
 	)
 
 	if err := os.MkdirAll(config.DataPath, 0o755); err != nil {
@@ -63,10 +66,32 @@ func RunServer(ctx context.Context) error {
 		return err
 	}
 
-	blobHandler, err := storage.NewBlobStore(config.DataPath, config.ChunkSize)
+	var blobHandler service.ChunkStore
+	switch strings.ToLower(strings.TrimSpace(config.StorageBackend)) {
+	case "", "disk":
+		blobHandler, err = storage.NewBlobStore(config.DataPath, config.ChunkSize)
+	case "erasure":
+		logger.Info("erasure_storage_config",
+			"data_shards", config.ErasureDataShards,
+			"parity_shards", config.ErasureParityShards,
+			"paths_count", len(config.ErasurePaths),
+			"auto_heal", config.ErasureAutoHeal,
+			"strict_write", config.ErasureStrictWrite,
+		)
+		blobHandler, err = storage.NewErasureStore(storage.ErasureConfig{
+			Paths:        config.ErasurePaths,
+			DataShards:   config.ErasureDataShards,
+			ParityShards: config.ErasureParityShards,
+			ChunkSize:    config.ChunkSize,
+			AutoHeal:     config.ErasureAutoHeal,
+			StrictWrite:  config.ErasureStrictWrite,
+		})
+	default:
+		err = fmt.Errorf("unsupported FS_STORAGE_BACKEND %q (expected disk or erasure)", config.StorageBackend)
+	}
 	if err != nil {
 		_ = metadataHandler.Close()
-		logger.Error("failed_to_initialize_blob_store", "error", err)
+		logger.Error("failed_to_initialize_blob_store", "backend", config.StorageBackend, "error", err)
 		return err
 	}
 

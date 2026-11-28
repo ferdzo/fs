@@ -56,4 +56,5 @@ type ChunkStore interface {
 var (
 	_ MetadataStore = (*metadata.MetadataHandler)(nil)
 	_ ChunkStore    = (*storage.BlobStore)(nil)
+	_ ChunkStore    = (*storage.ErasureStore)(nil)
 )

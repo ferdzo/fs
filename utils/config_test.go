@@ -86,3 +86,44 @@ func TestNewConfigGCSettings(t *testing.T) {
 		t.Fatalf("GcGrace = %v, want 30s", cfgFallback.GcGrace)
 	}
 }
+
+func TestNewConfigErasureSettings(t *testing.T) {
+	t.Setenv("FS_STORAGE_BACKEND", "")
+	t.Setenv("FS_ERASURE_PATHS", "")
+	t.Setenv("FS_ERASURE_DATA_SHARDS", "")
+	t.Setenv("FS_ERASURE_PARITY_SHARDS", "")
+	t.Setenv("FS_ERASURE_AUTO_HEAL", "")
+	t.Setenv("FS_ERASURE_STRICT_WRITE", "")
+
+	def := NewConfig()
+	if def.StorageBackend != "disk" {
+		t.Fatalf("default StorageBackend = %q, want disk", def.StorageBackend)
+	}
+	if def.ErasureDataShards != 4 || def.ErasureParityShards != 2 {
+		t.Fatalf("default K/M = %d/%d, want 4/2", def.ErasureDataShards, def.ErasureParityShards)
+	}
+	if !def.ErasureAutoHeal || def.ErasureStrictWrite {
+		t.Fatalf("default AutoHeal/StrictWrite = %v/%v, want true/false", def.ErasureAutoHeal, def.ErasureStrictWrite)
+	}
+
+	t.Setenv("FS_STORAGE_BACKEND", "ERASURE")
+	t.Setenv("FS_ERASURE_PATHS", " /tmp/d0 , /tmp/d1, /tmp/d2 ,, /tmp/d3 ")
+	t.Setenv("FS_ERASURE_DATA_SHARDS", "2")
+	t.Setenv("FS_ERASURE_PARITY_SHARDS", "2")
+	t.Setenv("FS_ERASURE_AUTO_HEAL", "false")
+	t.Setenv("FS_ERASURE_STRICT_WRITE", "true")
+
+	cfg := NewConfig()
+	if cfg.StorageBackend != "erasure" {
+		t.Fatalf("StorageBackend = %q, want erasure", cfg.StorageBackend)
+	}
+	if len(cfg.ErasurePaths) != 4 {
+		t.Fatalf("len(ErasurePaths) = %d, want 4 (%v)", len(cfg.ErasurePaths), cfg.ErasurePaths)
+	}
+	if cfg.ErasureDataShards != 2 || cfg.ErasureParityShards != 2 {
+		t.Fatalf("K/M = %d/%d, want 2/2", cfg.ErasureDataShards, cfg.ErasureParityShards)
+	}
+	if cfg.ErasureAutoHeal || !cfg.ErasureStrictWrite {
+		t.Fatalf("AutoHeal/StrictWrite = %v/%v, want false/true", cfg.ErasureAutoHeal, cfg.ErasureStrictWrite)
+	}
+}
